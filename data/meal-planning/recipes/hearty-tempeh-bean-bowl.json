@@ -1,0 +1,110 @@
+{
+  "slug": "hearty-tempeh-bean-bowl",
+  "name": "Hearty tempeh and black bean bowl",
+  "description": "Browned tempeh and black beans spooned hot over crisp shredded cabbage, red bell pepper and tomato, with chili powder and lime — a large, filling bowl that needs one hot pan and nothing else.",
+  "iconKey": "salad",
+  "instructions": [
+    "Cube the tempeh and brown it in a dry non-stick pan over medium-high heat for 5 minutes, turning once.",
+    "Add the chili powder and the salt, then stir in the drained black beans and heat for 3 minutes.",
+    "Shred the cabbage and slice the red bell pepper and the tomato while the pan works.",
+    "Put the raw cabbage, bell pepper and tomato in a large bowl, spoon the hot tempeh and black beans over them and squeeze the lime on top."
+  ],
+  "yieldServings": 1,
+  "servingDescription": "1 large bowl",
+  "prepMinutes": 6,
+  "cookMinutes": 8,
+  "mealSlots": [
+    "lunch",
+    "dinner"
+  ],
+  "dietTags": [
+    "pescatarian",
+    "vegan",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "soy"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": [
+    "high_protein",
+    "dairy_free",
+    "vegan",
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:174272",
+      "quantity": 230,
+      "unit": "g",
+      "gramWeight": 230,
+      "displayText": "230 g, cubed",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:175238",
+      "quantity": 1.25,
+      "unit": "cup",
+      "gramWeight": 300,
+      "displayText": "1¼ cups, drained",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169975",
+      "quantity": 1,
+      "unit": "cup",
+      "gramWeight": 89,
+      "displayText": "1 cup, shredded",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170108",
+      "quantity": 0.75,
+      "unit": "cup",
+      "gramWeight": 112,
+      "displayText": "¾ cup, sliced",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170457",
+      "quantity": 1,
+      "unit": "each",
+      "gramWeight": 123,
+      "displayText": "1 medium, sliced",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168155",
+      "quantity": 0.25,
+      "unit": "each",
+      "gramWeight": 17,
+      "displayText": "¼ lime",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171319",
+      "quantity": 1,
+      "unit": "tsp",
+      "gramWeight": 2.7,
+      "displayText": "1 tsp",
+      "sortOrder": 6,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 3,
+      "displayText": "½ tsp",
+      "sortOrder": 7,
+      "isOptional": false
+    }
+  ]
+}

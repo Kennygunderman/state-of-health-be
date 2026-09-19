@@ -96,6 +96,7 @@ import './lib/bootstrap';
 import './lib/dbGuard';
 
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 // The payload digest is taken the same way the import stage takes it, so the
@@ -155,12 +156,16 @@ import {
 import type { CatalogFoodState, CoveragePlan, EvidenceAllowlist } from './lib/manifest';
 import {
     CATALOG_ALLERGEN_TAGS,
+    CATALOG_ARTIFACT_TARGET_IDENTITY_KEY,
     CATALOG_CHECK_NAMES,
     CATALOG_DIET_TAGS,
     CATALOG_FOOD_STATES,
+    CatalogArtifactTargetError,
     PER_100G_BASIS_AMOUNT,
+    assertCatalogArtifactTarget,
     buildSearchText,
     buildSourceKey,
+    catalogArtifactTargetIdentity,
     catalogCheckTier,
     classifyCatalogTagSets,
     computeCoverageShortfall,
@@ -1169,7 +1174,15 @@ export interface GenerationDeps {
     readonly model: string;
     readonly batchSize: number;
     readonly budgetLimit: number;
-    readonly writeReport: (report: unknown) => void;
+    /**
+     * Publishes one report, to the destination the run names.
+     *
+     * The destination is part of the contract rather than a decision the writer
+     * infers, because the two destinations are not the same artefact: only a
+     * real run may touch `import-report.json`, and a dry run's figures are
+     * hypotheses (see {@link GENERATION_REPORT_DESTINATIONS}).
+     */
+    readonly writeReport: (report: unknown, destination: GenerationReportDestination) => void;
 }
 
 /**
@@ -2734,6 +2747,79 @@ export const buildGenerationValidationRecord = (
  */
 export const GENERATION_REPORT_NOTE_KEY = 'generationStageWrite';
 
+/** The canonical evidence artefact this stage writes its half of. */
+export const GENERATION_REPORT_FILE = 'import-report.json';
+
+/**
+ * WHERE A REPORT MAY LAND, AND WHY A DRY RUN MAY NOT LAND IN THE EVIDENCE.
+ *
+ * `canonical` is `data/meal-planning/reports/latest/import-report.json` — a
+ * committed artefact a reviewer reads as the record of what this pipeline
+ * measured, and the file `catalog-report.ts` aggregates into.
+ *
+ * `dry_run_preview` exists because a dry run reports what a generation run
+ * WOULD do: it opens no run row, makes no model call and writes no candidate,
+ * so every outcome counter in its report is zero by construction. Publishing
+ * that into the canonical artefact replaced a real run's measurements with
+ * hypothetical zeros — QA measured the committed file's hash moving from
+ * `7ba8c860…` to `2237329e…` on a single `--dry-run` invocation — and it did so
+ * while holding no lock of any kind, because `main()` deliberately takes no
+ * catalog stage lock for a dry run (see THE GENERATION STAGE'S CLAIM) so an
+ * operator can ask what a run would cost while one is in progress. A dry run
+ * could therefore overwrite the report of the generation running beside it.
+ *
+ * `catalog-validate.ts` states the same principle for its own artefact:
+ * "reports/latest is a committed artefact the release reconciles against, and a
+ * preview must not overwrite the record of the pass that actually judged the
+ * catalog."
+ *
+ * So a dry run publishes to a distinct, non-canonical preview file outside the
+ * data tree and the run logs its absolute path. The preview is disposable
+ * output for the operator who asked, never evidence, and it can never be
+ * mistaken for — or committed as — the artefact. This is the same two-member
+ * destination contract `catalog-import-usda.ts` carries
+ * (`IMPORT_REPORT_DESTINATIONS`), deliberately spelled the same way: the two
+ * stages write ONE file, so a reviewer comparing their dry-run behaviour has to
+ * be reading one rule stated twice rather than two rules.
+ */
+export const GENERATION_REPORT_DESTINATIONS = ['canonical', 'dry_run_preview'] as const;
+export type GenerationReportDestination = (typeof GENERATION_REPORT_DESTINATIONS)[number];
+
+/**
+ * The destination a set of options may publish to: a dry run gets the preview,
+ * everything else the artefact.
+ *
+ * Exported and argument-driven so the RULE — rather than its consequence — is
+ * what the suite pins (Rule backend-architecture §11).
+ */
+export const generationReportDestination = (options: GenerateOptions): GenerationReportDestination =>
+    options.dryRun ? 'dry_run_preview' : 'canonical';
+
+/**
+ * The absolute path a destination resolves to.
+ *
+ * The preview path carries the process id so two operators previewing at once
+ * do not overwrite each other's file, and it sits under the OS temporary
+ * directory so it is outside the repository and outside every path
+ * `scripts/lib/manifest.ts` will build inside the data tree.
+ */
+export const generationReportTarget = (destination: GenerationReportDestination): string =>
+    destination === 'canonical'
+        ? reportPath(GENERATION_REPORT_FILE)
+        : path.join(os.tmpdir(), `soh-catalog-generate-dry-run-${process.pid}.json`);
+
+/**
+ * Stamps a report with the identity of the database it was made against.
+ *
+ * Applied to BOTH destinations. A preview is disposable, but "which database
+ * did this preview read" is the first question an operator comparing two
+ * previews has, and the field costs one line.
+ */
+export const withArtifactTargetIdentity = (report: unknown, targetDigest: string): Record<string, unknown> => ({
+    ...(report as Record<string, unknown>),
+    [CATALOG_ARTIFACT_TARGET_IDENTITY_KEY]: catalogArtifactTargetIdentity(targetDigest),
+});
+
 /**
  * Writes the generation half of the report file, MERGING rather than
  * clobbering.
@@ -2742,17 +2828,34 @@ export const GENERATION_REPORT_NOTE_KEY = 'generationStageWrite';
  * so: merging into a half-written file would carry unreadable content forward
  * under this run's name, and failing the run over a stale report file would
  * throw away work already committed to the database.
+ *
+ * A DOCUMENT DESCRIBING ANOTHER DATABASE IS NEITHER. It is refused, because a
+ * report is the evidence for one catalog and this merge would leave one file
+ * whose sections describe two — which is what QA observed when an import on one
+ * database, a generation on a second and a report on a third all landed in the
+ * committed artefact with nothing able to say so. An artefact recording no
+ * identity at all is adopted (see `catalog.logic.ts`, EVIDENCE ARTEFACTS).
  */
-export const writeGenerationReport = (target: string, report: unknown, log: ScriptLogger): void => {
+export const writeGenerationReport = (
+    target: string,
+    report: unknown,
+    targetDigest: string,
+    log: ScriptLogger,
+): void => {
     // The merge below is a read-modify-write of a committed evidence artefact,
     // so it runs under the artefact directory's publication lock: two stages
     // interleaving lose one of them entirely, however atomic each write is.
     withArtifactPublicationLockSync(path.dirname(target), `${STAGE}:report`, () =>
-        mergeAndWriteGenerationReport(target, report, log),
+        mergeAndWriteGenerationReport(target, report, targetDigest, log),
     );
 };
 
-const mergeAndWriteGenerationReport = (target: string, report: unknown, log: ScriptLogger): void => {
+const mergeAndWriteGenerationReport = (
+    target: string,
+    report: unknown,
+    targetDigest: string,
+    log: ScriptLogger,
+): void => {
     let existing: Record<string, unknown> = {};
     if (fs.existsSync(target)) {
         try {
@@ -2776,6 +2879,39 @@ const mergeAndWriteGenerationReport = (target: string, report: unknown, log: Scr
         }
     }
 
+    // WHICH DATABASE THE DOCUMENT ON DISK DESCRIBES, decided before anything is
+    // merged into it. `existing` is `{}` for a path that holds nothing or a
+    // document this run could not parse — both of which the rule reads as
+    // "records no identity", which is the adoption path and not a refusal.
+    const targetDecision = assertCatalogArtifactTarget({
+        file: path.basename(target),
+        existing,
+        runDigest: targetDigest,
+    });
+
+    if (targetDecision.verdict === 'adopted') {
+        log.warn('artefact_target_adopted', {
+            stage: STAGE,
+            file: path.basename(target),
+            verdict: targetDecision.verdict,
+            recordedDigest: 'none',
+            targetDigest: targetDecision.runDigest,
+            basis:
+                'The artefact records no database identity, so this run cannot tell whether it describes the ' +
+                'database this run wrote to. It is adopted rather than refused \u2014 every artefact published ' +
+                'before this field existed records none \u2014 and this write stamps its own digest, so the next ' +
+                'write against a different database is refused instead of merged.',
+        });
+    } else {
+        log.info('artefact_target_checked', {
+            stage: STAGE,
+            file: path.basename(target),
+            verdict: targetDecision.verdict,
+            recordedDigest: targetDecision.recordedDigest ?? 'none',
+            targetDigest: targetDecision.runDigest,
+        });
+    }
+
     // THE SHARED MERGE, NOT A TOP-LEVEL SPREAD. `duplicatesRemoved` and
     // `failuresByCheck` are co-written by this stage, the import stage and the
     // report stage, one sub-key each; spreading at the top level replaced the
@@ -2784,7 +2920,7 @@ const mergeAndWriteGenerationReport = (target: string, report: unknown, log: Scr
     // `generationStage`. mergeStageReport (scripts/lib/manifest.ts, CROSS-STAGE
     // REPORT MERGING) is the one place that knows which blocks merge by
     // sub-key, and it is the same function the import stage's writer uses.
-    const written = report as Record<string, unknown>;
+    const written = withArtifactTargetIdentity(report, targetDigest);
     const merged = mergeStageReport(existing, written, {
         noteKey: GENERATION_REPORT_NOTE_KEY,
         stage: STAGE,
@@ -4000,30 +4136,61 @@ export const runGeneration = async (deps: GenerationDeps): Promise<GenerationSum
         throw asGenerationFailure(error, 'budget_misconfigured');
     }
 
-    // A DRY RUN OPENS NO RUN ROW, MAKES NO MODEL CALL AND WRITES NOTHING.
+    // A DRY RUN OPENS NO RUN ROW, MAKES NO MODEL CALL AND WRITES NO CANDIDATE.
     // openOrResumeRun claims (kind, manifestVersion) and a completed claim is a
     // permanent no-op for that pair, so a dry run claiming the canonical key
     // would stop the real generation from ever running. It does READ the
     // catalog — the AI volume is `candidateVolume − imported`, which is a count
     // of rows and cannot be assumed — and reporting the plan and its cost is
     // the whole job here.
+    //
+    // THE ONE FILE IT DOES WRITE IS NOT THE EVIDENCE. The report goes to the
+    // PREVIEW destination, never to the committed artefact: every outcome
+    // counter below is a hypothesis about a run that has not happened, and this
+    // invocation holds no stage lock (see GENERATION_REPORT_DESTINATIONS).
     if (options.dryRun) {
         const dryRunTally = newTally(plan.batches.length, aiCandidatesPlanned);
         const publishedByCategory = await readPublishedByCategory(deps.prisma);
+        const previewDestination = generationReportDestination(options);
+
+        log.info('dry_run_planned', {
+            stage: STAGE,
+            batches: plan.batches.length,
+            aiCandidates: aiCandidatesPlanned,
+            planFingerprint: plan.fingerprint.slice(0, 16),
+            note: 'no run row, cursor, batch ledger row or model-call reservation was written, so the canonical generation is unaffected',
+            previewReport: generationReportTarget(previewDestination),
+        });
+
         deps.writeReport(
-            buildGenerationReport(deps, plan, dryRunTally, publishedByCategory, {
-                runId: null,
-                resumed: false,
-                stopReason: 'dry_run',
-                stoppedAtBatchKey: null,
-                runComplete: false,
-                remainingBatches: plan.canonicalBatches.length,
-                budgetScope,
-                // Read, not assumed: "what would this cost" is only answerable
-                // beside what the shared cap has already consumed, and a dry run
-                // already reads the catalog for the same reason.
-                budgetScopeReserved: await deps.budget.scopeReserved(budgetScope),
-            }),
+            {
+                ...buildGenerationReport(deps, plan, dryRunTally, publishedByCategory, {
+                    runId: null,
+                    resumed: false,
+                    stopReason: 'dry_run',
+                    stoppedAtBatchKey: null,
+                    runComplete: false,
+                    remainingBatches: plan.canonicalBatches.length,
+                    budgetScope,
+                    // Read, not assumed: "what would this cost" is only answerable
+                    // beside what the shared cap has already consumed, and a dry run
+                    // already reads the catalog for the same reason.
+                    budgetScopeReserved: await deps.budget.scopeReserved(budgetScope),
+                }),
+                // The preview NAMES ITSELF, because the document is otherwise
+                // shaped exactly like the canonical one and a file copied out of
+                // TMPDIR would read as evidence of a generation run. Stated in
+                // the payload rather than only in the log for the same reason
+                // the import stage states it: the log is not what gets pasted
+                // into a review.
+                reportKind: 'dry_run_preview',
+                reportKindBasis:
+                    'A preview of the plan, not evidence of a generation run: every outcome counter above is zero ' +
+                    'because no batch was executed, no model call was made and no candidate was written or judged, ' +
+                    'and this invocation held no catalog stage lock. The canonical import-report.json was not ' +
+                    'touched.',
+            },
+            previewDestination,
         );
 
         return {
@@ -4625,6 +4792,10 @@ export const runGeneration = async (deps: GenerationDeps): Promise<GenerationSum
         );
 
         const publishedByCategory = await readPublishedByCategory(deps.prisma);
+        // The CANONICAL destination, and the only call site that names it: this
+        // invocation opened a run row, executed batches under the catalog stage
+        // lock and wrote what it measured, which is exactly the run the
+        // committed artefact is the record of.
         deps.writeReport(
             buildGenerationReport(deps, plan, tally, publishedByCategory, {
                 runId,
@@ -4636,6 +4807,7 @@ export const runGeneration = async (deps: GenerationDeps): Promise<GenerationSum
                 budgetScope,
                 budgetScopeReserved: scopeReserved,
             }),
+            'canonical',
         );
 
         // A RUN IS CLOSED ONLY WHEN THE COVERAGE PLAN IS GENERATED, DELIBERATELY.
@@ -5610,6 +5782,13 @@ export const describeFailure = (
     if (isThrownInstanceOf(error, ModelBudgetError)) {
         return { code: error.code, error: safeError(error) };
     }
+    // A committed artefact this run must not merge into, because it describes a
+    // different database. Its own code rather than `unexpected_error`: the
+    // remedy is an operator decision about which database this run should have
+    // addressed, not a defect report.
+    if (isThrownInstanceOf(error, CatalogArtifactTargetError)) {
+        return { code: error.code, error: safeError(error) };
+    }
     // The one branch that reports TYPED CONTEXT beside the code. A stage-lock
     // refusal names the stage holding the catalog graph and the mode it asked
     // for, and those are what an operator acts on — see checkpointErrorFields
@@ -5728,8 +5907,32 @@ const main = async (): Promise<number> => {
         model,
         batchSize,
         budgetLimit,
-        writeReport: (report) => {
-            writeGenerationReport(reportPath('import-report.json'), report, logger);
+        writeReport: (report, destination) => {
+            const target = generationReportTarget(destination);
+            // Read once, from the origin classified at the top of main(), so
+            // the identity this write records cannot differ from the one the
+            // database guard admitted (Rule backend-architecture §9).
+            const targetDigest = String(originLogFields(origin).targetDigest);
+
+            if (destination === 'canonical') {
+                writeGenerationReport(target, report, targetDigest, logger);
+                return;
+            }
+
+            // A PREVIEW IS NOT MERGED AND NOT LOCKED, because it shares nothing
+            // with the evidence artefact: it is this invocation's own file,
+            // written whole (atomically, like every artefact this pipeline
+            // writes) and named in the line below so the operator who asked for
+            // it can read it. The canonical path is named too, and named as
+            // UNTOUCHED, because "the dry run wrote nothing here" is the fact a
+            // reviewer checking the repository is dirty needs stated.
+            writeJsonFile(target, withArtifactTargetIdentity(report, targetDigest));
+            logger.info('dry_run_preview_written', {
+                stage: STAGE,
+                file: target,
+                canonicalReportUntouched: generationReportTarget('canonical'),
+                basis: 'a dry run reports the plan only, so it never writes the committed evidence artefact',
+            });
         },
     };
 

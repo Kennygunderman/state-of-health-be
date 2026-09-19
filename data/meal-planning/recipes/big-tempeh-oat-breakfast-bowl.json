@@ -1,0 +1,110 @@
+{
+  "slug": "big-tempeh-oat-breakfast-bowl",
+  "name": "Big tempeh and savoury oat breakfast bowl",
+  "description": "Rolled oats simmered savoury in unsweetened soy milk, piled with browned tempeh, mushrooms, broccoli and spinach — a large protein-forward breakfast bowl built for a high morning calorie target on plants alone.",
+  "iconKey": "bowl",
+  "instructions": [
+    "Bring the soy milk to a simmer in a wide pan, stir in the rolled oats and the salt, and cook for 5 minutes until thick.",
+    "Meanwhile cube the tempeh and brown it in a dry non-stick pan over medium-high heat for 4 minutes, turning once.",
+    "Add the sliced mushrooms and the broccoli florets to the tempeh, cover the pan and cook for 4 minutes, until the broccoli is bright and just tender.",
+    "Fold the spinach through the pan off the heat and season with the black pepper.",
+    "Spoon the oats into a large bowl and pile the tempeh, mushrooms, broccoli and spinach on top."
+  ],
+  "yieldServings": 1,
+  "servingDescription": "1 large bowl",
+  "prepMinutes": 5,
+  "cookMinutes": 10,
+  "mealSlots": [
+    "breakfast"
+  ],
+  "dietTags": [
+    "pescatarian",
+    "vegan",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "soy"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 2,
+  "badges": [
+    "high_protein",
+    "dairy_free",
+    "vegan",
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:174272",
+      "quantity": 180,
+      "unit": "g",
+      "gramWeight": 180,
+      "displayText": "180 g, cubed",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173904",
+      "quantity": 0.75,
+      "unit": "cup",
+      "gramWeight": 61,
+      "displayText": "¾ cup",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:175215",
+      "quantity": 0.67,
+      "unit": "cup",
+      "gramWeight": 162,
+      "displayText": "⅔ cup",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169251",
+      "quantity": 4,
+      "unit": "cup",
+      "gramWeight": 280,
+      "displayText": "4 cups, sliced",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170379",
+      "quantity": 1.5,
+      "unit": "cup",
+      "gramWeight": 132,
+      "displayText": "1½ cups, chopped",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168462",
+      "quantity": 3,
+      "unit": "cup",
+      "gramWeight": 90,
+      "displayText": "3 cups",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 3,
+      "displayText": "½ tsp",
+      "sortOrder": 6,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170931",
+      "quantity": 0.25,
+      "unit": "tsp",
+      "gramWeight": 0.6,
+      "displayText": "¼ tsp",
+      "sortOrder": 7,
+      "isOptional": false
+    }
+  ]
+}

@@ -1,0 +1,117 @@
+{
+  "slug": "tempeh-cauliflower-sheet-pan",
+  "name": "Tempeh and cauliflower sheet pan",
+  "description": "Tempeh roasted on one tray with cauliflower, broccoli, mushrooms, peppers and diced potato — one pan, half a tablespoon of olive oil, and a full plate of protein.",
+  "iconKey": "cloche",
+  "instructions": [
+    "Heat the oven as high as it goes and cut the tempeh into slabs, the cauliflower and broccoli into small florets, and the potato into 1 cm dice.",
+    "Toss everything with the mushrooms, the bell pepper, the olive oil, the salt and the black pepper on a large tray, spreading it into one layer.",
+    "Roast for 18 minutes, turning the tray once, until the cauliflower is browned at the edges and the potato is tender.",
+    "Divide between two plates and serve hot from the tray."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 plate",
+  "prepMinutes": 10,
+  "cookMinutes": 18,
+  "mealSlots": [
+    "dinner"
+  ],
+  "dietTags": [
+    "pescatarian",
+    "vegan",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "soy"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 2,
+  "badges": [
+    "high_protein",
+    "dairy_free",
+    "vegan"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:174272",
+      "quantity": 220,
+      "unit": "g",
+      "gramWeight": 220,
+      "displayText": "220 g",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169986",
+      "quantity": 4,
+      "unit": "cup",
+      "gramWeight": 428,
+      "displayText": "4 cups, chopped",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170379",
+      "quantity": 3,
+      "unit": "cup",
+      "gramWeight": 264,
+      "displayText": "3 cups, chopped",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169251",
+      "quantity": 3,
+      "unit": "cup",
+      "gramWeight": 210,
+      "displayText": "3 cups, sliced",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170027",
+      "quantity": 1,
+      "unit": "each",
+      "gramWeight": 180,
+      "displayText": "1 medium potato",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170108",
+      "quantity": 1,
+      "unit": "cup",
+      "gramWeight": 149,
+      "displayText": "1 cup, chopped",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 0.5,
+      "unit": "tbsp",
+      "gramWeight": 6.75,
+      "displayText": "½ tbsp",
+      "sortOrder": 6,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 3,
+      "displayText": "½ tsp",
+      "sortOrder": 7,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170931",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 1.15,
+      "displayText": "½ tsp",
+      "sortOrder": 8,
+      "isOptional": false
+    }
+  ]
+}

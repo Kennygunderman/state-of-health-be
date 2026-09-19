@@ -974,6 +974,65 @@ export const parseConfirmTarget = (argv: readonly string[]): string | null => {
     return null;
 };
 
+/**
+ * The help tokens every entry script answers, spelled here because the
+ * module-load exemption below has to agree with the scripts EXACTLY.
+ *
+ * Each of the nine declares its own `HELP_FLAGS` with these two values and
+ * makes `if (argv.some((token) => HELP_FLAGS.includes(token)))` the FIRST
+ * statement of its `parseArgs`, over `process.argv.slice(2)`. This constant is
+ * a copy of that list rather than an import of it because the dependency only
+ * runs the other way — a script imports this module, and this module imports
+ * nothing but ./logger so it stays safe to load before any Prisma client
+ * exists (see the header). `catalogScriptFlags.test.ts` pins the two spellings
+ * against every script's own parser, so a divergence fails a test rather than
+ * quietly widening or narrowing the exemption.
+ */
+export const HELP_FLAGS: readonly string[] = ['--help', '-h'];
+
+/**
+ * Where a script's own arguments start in `process.argv`: index 0 is the node
+ * binary and index 1 the script, which is what every `parseArgs` call site
+ * expresses as `process.argv.slice(2)`. Scanning from here rather than from 0
+ * keeps a path that happens to contain `-h` out of the decision.
+ */
+const ARGUMENT_TAIL_START = 2;
+
+/**
+ * Whether this invocation is asking for the usage block — decided from argv
+ * alone, and the one thing that exempts a run from the module-load assertion
+ * below.
+ *
+ * It is exact-token equality against {@link HELP_FLAGS} and nothing more: no
+ * prefix matching, no `--help=value` handling, no case folding. That is not
+ * conservatism for its own sake, it is the requirement. The exemption may be
+ * neither wider nor narrower than the scripts' own predicate — wider and a
+ * token a script parses as an ordinary flag would skip the guard and reach the
+ * stage's work unguarded; narrower and the finding this exemption exists for
+ * comes back for the spelling that was left out. `--help=x` is NOT help to any
+ * script (its parser reports it as an unrecognised flag and exits 1), so it is
+ * not help here either.
+ *
+ * Total and side-effect-free by construction: it reads no environment, opens
+ * nothing, and returns `false` for an absent or too-short `argv` — the same
+ * tolerance {@link entryScriptName} has, because both run at module load on a
+ * path that may be about to refuse, and a throw from here would replace a
+ * refusal an operator can act on with a stack trace they cannot.
+ */
+export const isHelpInvocation = (argv: readonly string[] | undefined): boolean => {
+    if (argv === undefined) {
+        return false;
+    }
+
+    for (let index = ARGUMENT_TAIL_START; index < argv.length; index += 1) {
+        if (HELP_FLAGS.includes(argv[index])) {
+            return true;
+        }
+    }
+
+    return false;
+};
+
 export const entryScriptName = (argv: readonly string[]): string | null => {
     if (argv.length < 2) {
         return null;
@@ -1481,8 +1540,32 @@ export const assertScriptDatabase = (options: {
 // binary, and importing a module must never end a test run. Inside Jest the
 // database guard is jestSetup.ts's assertTestDatabase(), which is built on the
 // same exported rules.
+//
+// AND IT DOES NOTHING FOR A HELP INVOCATION, for the reason the guard exists at
+// all. Printing a usage block reads no database: every script answers
+// `--help`/`-h` in the first statement of its `parseArgs` — before a value is
+// consumed, before its prerequisite checks, and before the lazy
+// `await import('../src/prisma/client')` each stage defers its client behind —
+// and returns 0 from `main()` without touching a target. Asserting the origin
+// ahead of that made the usage block unreachable for exactly the operator who
+// needs it most, the one who has not pointed DATABASE_URL anywhere the policies
+// accept yet, and left `docs/meal-planning/README.md`'s claim that every CLI
+// prints its own usage true only on a guard-accepted database.
+//
+// The exemption is argv-only and is measured against the scripts' own
+// predicate, {@link isHelpInvocation} — so it cannot let real work run
+// unguarded: a help token anywhere on the line is a usage block and an exit,
+// whatever else is written beside it (`--confirm-target -h` included, which
+// every script also answers as help). Every OTHER invocation, including
+// `--help=x`, which no script reads as help, still takes the assertion below
+// and still refuses fatally with the same code, fields, remedy and exit 1.
+//
+// The skip is deliberately SILENT. Usage is the artefact this path produces and
+// the operator reads it on stdout, so nothing else may land there; a `debug`
+// line would be suppressed by the logger's default `info` threshold anyway, and
+// no caller can raise that threshold at module load.
 const entryScript = entryScriptName(process.argv);
-if (entryScript !== null) {
+if (entryScript !== null && !isHelpInvocation(process.argv)) {
     try {
         assertScriptDatabase({ script: entryScript });
     } catch (error) {

@@ -107,6 +107,38 @@ import type { MealSlot } from '../types/recipe';
  * It bounds the OFFER and not just the sheet: {@link selectSwapCandidate} picks
  * from these rows, so the preview and the commit are held to the same eight the
  * list showed.
+ *
+ * REACHABILITY — the cap is exercised by the shipped seed, and that is a
+ * property of the corpus rather than of this file. It was not always true: at 42
+ * recipes the most any slot of a generated week could offer was 6, so the
+ * truncation on the last line of {@link selectSwapCandidates} was dead code no
+ * profile could enter and the ranking that precedes it decided nothing a user
+ * would ever see. The seeded corpus is now 121 recipes
+ * (`data/meal-planning/recipes/`), measured over generated weeks for eight
+ * profiles through {@link selectSwapCandidates} itself: a main slot of a
+ * no-restriction week carries 26–47 admissible alternatives, a pescatarian week
+ * 20–31, a vegetarian week 17–23, a vegan week 10–17, and 168 of 182 measured
+ * slots hold more than eight — so the rows a user sees are genuinely the best
+ * eight of many, on every diet rather than only the unrestricted one. Snack
+ * slots are the one place that still sits under the cap (7 admissible against 11
+ * seeded snacks), which is honest and not a defect: the list simply shows all of
+ * them.
+ *
+ * HOW TO MEASURE IT AGAIN, because the obvious way does not work.
+ * {@link SwapSelectionContext.limit} cannot be widened past this constant —
+ * `resolveLimit` returns `Math.min(limit, MAX_SWAP_ALTERNATIVES)` — so a list of
+ * exactly eight rows is consistent with nine admissible alternatives and with
+ * nine hundred, and its length alone proves nothing about reachability. Count
+ * the admissible set independently instead, by reconstructing what
+ * `isAdmissibleAlternative` (private) tests, from the primitives it calls, each
+ * exported by the module that owns it: the recipe is not the version already in
+ * the slot, `recipe.logic.ts::evaluatePlanningEligibility` passes for the slot,
+ * `mealPlan.logic.ts::violatesRepetitionRule` does not fire for the week with
+ * this meal removed, and {@link selectSwapPortion} returns a portion. Then
+ * `selectSwapCandidates(context).length === min(admissible, 8)` is the invariant
+ * to assert, and `admissible >= 9` on any real slot is what shows the truncation
+ * ran. The end-to-end sweep over a plan's slots lives in
+ * `__tests__/api/swaps.test.ts`.
  */
 export const MAX_SWAP_ALTERNATIVES = 8;
 

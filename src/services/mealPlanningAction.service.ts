@@ -101,6 +101,11 @@ import {
     resolveCreatedIdColumns,
     shapeStoredResponse,
 } from './mealPlanningAction.logic';
+// The owner-existence guard every locked write shares. It lives in the user
+// domain rather than here because the condition predates meal planning — the
+// legacy diary and food services ask the same question — and it accepts the
+// transaction client precisely so this module can ask it INSIDE the lock.
+import { assertUserProvisioned } from './user.service';
 
 /* ---------------------------------------------------------------------------
  * The transaction boundary
@@ -394,6 +399,25 @@ const asJsonColumnValue = (body: KeyedActionResponseBody): Prisma.InputJsonValue
  * Step 1 — the per-user lock
  * ------------------------------------------------------------------------- */
 
+/** What a caller may say about the lock it is taking. See {@link withUserLock}. */
+export interface UserLockOptions {
+    /**
+     * Whether the caller requires the `users` row to already exist. Defaults to
+     * TRUE, which is what every request path wants: a write on behalf of an
+     * identity with no account is refused with `UserNotProvisionedError`
+     * (`404 user_not_found`) instead of reaching a foreign key and answering
+     * `500`.
+     *
+     * A transaction that CREATES that row passes `false` — the development seed
+     * is the only such caller, and it takes this lock precisely so its
+     * provisioning cannot interleave with the app's writes for the same user.
+     * Nothing else should: "the row may be missing" is not a property of a
+     * request, and an opt-out on a request path would restore the 500 this guard
+     * exists to remove.
+     */
+    readonly requireProvisionedUser?: boolean;
+}
+
 /**
  * Takes the per-user advisory lock, then runs `work` inside it.
  *
@@ -420,11 +444,60 @@ const asJsonColumnValue = (body: KeyedActionResponseBody): Prisma.InputJsonValue
  * `hashtext` narrows the user id to 32 bits, so two ids can in principle share
  * a lock. That costs those two users a little serialisation and nothing else: a
  * false share is still a correct mutex.
+ *
+ * THE OWNER-EXISTENCE GUARD IS PART OF THIS FUNCTION, and its position is the
+ * reason it is here rather than at each of the four call sites or at the HTTP
+ * edge.
+ *
+ * Every table a meal-planning write touches carries a foreign key to `users`,
+ * so a Firebase identity that authenticated but never completed
+ * `POST /api/user` cannot write anything: the first INSERT raises PostgreSQL
+ * 23503, which Prisma reports as P2003 (or P2010 when it comes from the raw
+ * reservation statement below), and an unmapped Prisma error is the residual
+ * `500 internal_error`. That answer is wrong twice over. `PUT /api/user/targets`
+ * has always answered `404 "User not found"` for exactly this caller, so the API
+ * contradicted itself route by route; and `internal_error` is not one of the
+ * five recognised 5xx machine codes (AAP §0.2.5), so the mobile client reads it
+ * as an UNKNOWN outcome, burns its single automatic same-key retry (§0.7.2) and
+ * then draws "We couldn't confirm that" over a condition that is permanent and
+ * wrote nothing.
+ *
+ * It runs AFTER the lock and BEFORE `work`. After the lock, because only inside
+ * the transaction that holds the lock can the answer not be overtaken — a check
+ * made before it could be invalidated by a concurrent write, and a check made
+ * on the global client would read outside this transaction's snapshot. Before
+ * `work`, because `work` is where the first FK-bound statement lives, including
+ * the ledger reservation in {@link runKeyedAction}, which for an unprovisioned
+ * caller is the statement that fails today.
+ *
+ * ONE guard covers all nine mutating meal-planning routes, because all nine
+ * reach this function: the two preference saves, the target save, the two
+ * grocery check-mark writes, and generate, regenerate, swap and log through
+ * `runKeyedAction`. The reads take no lock and are deliberately unaffected —
+ * reading must neither provision nor refuse, so `GET /meal-planning/preferences`
+ * and `GET /meal-planning/targets` keep answering their empty-state 200.
+ *
+ * It is an explicit typed check and NOT a branch on Prisma's error codes:
+ * pattern-matching a vendor's error shape is what Rule `backend-architecture`
+ * §9 forbids, and a P2003 arm would also answer for a foreign key that has
+ * nothing to do with the owner row. The cost is one primary-key lookup per
+ * locked write.
+ *
+ * ONE KIND OF CALLER MUST OPT OUT, and {@link UserLockOptions} is how. A
+ * transaction whose PURPOSE is to create the `users` row — the development seed
+ * in `scripts/seed-dev.ts`, which takes this very lock so that a developer
+ * seeding cannot interleave with the app writing for the same user — is
+ * provisioning rather than writing on behalf of an existing account, and for it
+ * the absent row is the starting state rather than a refusal. It passes
+ * `{ requireProvisionedUser: false }`. The default is the guard, because a new
+ * caller is far likelier to be a request path than a provisioner and the unsafe
+ * choice should be the one that has to be written down.
  */
 export const withUserLock = async <TResult>(
     tx: MealPlanningTransactionClient,
     userId: string,
     work: (tx: MealPlanningTransactionClient) => Promise<TResult>,
+    options: UserLockOptions = {},
 ): Promise<TResult> => {
     // Before the lock, not after: a lock taken on the autocommit client is
     // released as its own statement returns, so everything after it would run
@@ -434,6 +507,15 @@ export const withUserLock = async <TResult>(
     assertInteractiveTransactionClient(tx, 'withUserLock');
 
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext('meal-planning:' || ${userId}))`;
+
+    // Raises `UserNotProvisionedError`, which the controller maps to
+    // `404 user_not_found`. The rejection rolls this transaction back, so the
+    // lock is released and nothing — not even a reserved ledger row — survives.
+    // `!== false` rather than a truthiness test: an omitted option is the guard,
+    // and only the literal opt-out disables it.
+    if (options.requireProvisionedUser !== false) {
+        await assertUserProvisioned(userId, tx);
+    }
 
     return work(tx);
 };

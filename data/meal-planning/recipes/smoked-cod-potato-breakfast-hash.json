@@ -1,0 +1,98 @@
+{
+  "slug": "smoked-cod-potato-breakfast-hash",
+  "name": "Seared cod and potato hash",
+  "description": "Fresh cod fillet seared hard for a smoky edge, then flaked through a crisp potato, onion and bell pepper hash. No smoked fish needed — the colour comes from the pan.",
+  "iconKey": "bowl_dash",
+  "instructions": [
+    "Dice the potato small and cook it in a wide skillet with the olive oil over medium-high heat until crisp and tender, about 12 minutes.",
+    "Add the onion and bell pepper and cook until they soften and colour at the edges, about 4 minutes.",
+    "Season the cod fillet with the salt and the black pepper, lay it on the hash and cover the pan for 4 minutes, until the fish is opaque.",
+    "Flake the cod into large pieces, fold it gently through the hash and divide between two bowls."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 bowl",
+  "prepMinutes": 10,
+  "cookMinutes": 18,
+  "mealSlots": [
+    "breakfast"
+  ],
+  "dietTags": [
+    "gluten_free",
+    "pescatarian"
+  ],
+  "allergenTags": [
+    "fish"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 2,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "dairy_free"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:171955",
+      "quantity": 10,
+      "unit": "oz",
+      "gramWeight": 283.3,
+      "displayText": "10 oz",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170027",
+      "quantity": 1.5,
+      "unit": "each",
+      "gramWeight": 319.5,
+      "displayText": "1½ medium",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170000",
+      "quantity": 0.5,
+      "unit": "cup",
+      "gramWeight": 80,
+      "displayText": "½ cup, chopped",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170108",
+      "quantity": 1,
+      "unit": "cup",
+      "gramWeight": 149,
+      "displayText": "1 cup, chopped",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 1.25,
+      "unit": "tbsp",
+      "gramWeight": 16.875,
+      "displayText": "1¼ tbsp",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 3,
+      "displayText": "½ tsp",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170931",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 1.15,
+      "displayText": "½ tsp",
+      "sortOrder": 6,
+      "isOptional": false
+    }
+  ]
+}

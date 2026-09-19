@@ -264,9 +264,11 @@ to keep if the rest of the procedure is ever adapted.
    Firebase ID token it answers `401` rather than the status — unlike `/health`
    in step 3. And the benchmark that decides this gate is the report **this
    environment's** `search:benchmark` run wrote: the copy committed in the
-   repository records a failing verdict (see
-   [What a release loads](#what-a-release-loads)), so a pass here is something
-   to establish and read, never to inherit.
+   repository records a **passing** verdict, but it is a measurement of one
+   database at one moment under the conditions that run recorded (see
+   [What a release loads](#what-a-release-loads)), and it says nothing about
+   the release this database has loaded, so a pass here is something to
+   establish and read, never to inherit.
 
    Only then set `MEAL_PLANNING_ENABLED=true` and restart, and confirm
    `GET /api/meal-planning/preferences` answers 200 instead of 503.

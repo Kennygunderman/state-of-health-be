@@ -37,11 +37,24 @@
  *     neither can fail because the host was loaded.
  *  3. THAT A RERUN CHANGES NOTHING, asserted on the ROWS rather than on the log,
  *     and that `--reset-user` returns the user to the declared state.
+ *  4. THAT ITS USAGE BLOCK IS REACHABLE WHILE ITS POLICY REFUSES THE TARGET.
+ *     This is the strictest policy in the pipeline — `development_only`, with
+ *     no confirmation door — so it is the command most often run against a
+ *     database it will not write, and `--help` is what an operator reaches for
+ *     next. The guard used to assert the origin at module load, ahead of this
+ *     script's own `parseArgs`, which made the usage block unreachable exactly
+ *     then. The block at the foot of this file launches the real command
+ *     against a database this policy refuses and reads its status and streams:
+ *     with a help flag, usage and exit 0; without one, the same refusal and
+ *     exit 1 as before. The claim is about THIS command's reachability, not
+ *     about the policy — see below.
  *
  * WHAT THIS SUITE DELIBERATELY DOES NOT SETTLE. The database-origin policy
  * (`seed-dev` is `development_only`, `--confirm-target` is refused) belongs to
  * `scripts/lib/dbGuard`'s own coverage and to `recipes-seed.test.ts`'s policy
- * block, which spawns the real command; nothing here re-derives it. The catalog
+ * block, which spawns the real command; nothing here re-derives it — the
+ * refusal in (4) is read only for the code it reports, as the counterweight
+ * that makes the help case mean something. The catalog
  * and recipe corpora this stage deliberately does not seed are
  * `catalog-load.test.ts`'s and `recipes-seed.test.ts`'s subjects. The planner
  * behaviour the seeded user unlocks — that these preferences and targets really
@@ -66,7 +79,9 @@
  *     DATABASE_URL=postgresql://…@127.0.0.1:5433/<name>_test \
  *     npx jest --ci --runInBand src/__tests__/scripts/seed-dev.test.ts
  */
+import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import path from 'node:path';
 
 import { createFatalLogger } from '../../../scripts/lib/logger';
 import type { LogFields } from '../../../scripts/lib/logger';
@@ -1186,4 +1201,126 @@ describe('what it refuses', () => {
         expect((failure as SeedDevError).value).toBe('2026-02-30');
         expect(await prisma.users.count()).toBe(0);
     });
+});
+
+/* ---------------------------------------------------------------------------
+ * The usage block, under a database this policy refuses
+ * ------------------------------------------------------------------------- */
+
+// WHY THIS IS HERE AND NOT ONLY IN THE GUARD'S SUITE. `seed-dev` is the one
+// entry point with no confirmation door at all, so "point DATABASE_URL
+// somewhere this command accepts" is the only way past its refusal — and
+// `--help` is what tells an operator what this command does and which database
+// it requires. The guard asserted the origin at module load, before this
+// script's `parseArgs` ran, so that usage block was unreachable precisely for
+// the operator reading the refusal. `scripts/lib/dbGuard.ts` now skips its
+// assertion for a help invocation, decided from argv alone; these two cases are
+// this command's half of that claim, and the pair is what gives either one
+// meaning — the usage must be reachable AND the write must still be refused.
+describe('reaching the usage block while the origin is refused', () => {
+    /** `<repo>/backend`, three levels above this file. */
+    const BACKEND_ROOT = path.resolve(__dirname, '..', '..', '..');
+
+    const SCRIPT = path.join(BACKEND_ROOT, 'scripts', 'seed-dev.ts');
+
+    /**
+     * A local database this policy refuses, and one no server answers.
+     *
+     * `development_only` is the point of the fixture: a plain name on a
+     * loopback host classifies `development` BY ITS HOST ALONE, which is
+     * exactly what this script refuses — a deployment database reached over a
+     * tunnel or a published port looks like this. The name does not exist on
+     * the test container either, so a regression that let the run past the
+     * guard fails on a missing database rather than writing user-scoped rows
+     * anywhere real. The userinfo is a placeholder; nothing on either path
+     * opens a connection.
+     */
+    const REFUSED_URL = 'postgresql://seed_dev_fixture:fixture-only@127.0.0.1:5433/state_of_health';
+
+    /** ts-node compiles the whole stage in the child; a minute is generous. */
+    const CHILD_TIMEOUT_MS = 60_000;
+
+    interface CliOutcome {
+        readonly status: number | null;
+        readonly stdout: string;
+        readonly stderr: string;
+    }
+
+    /**
+     * The real command, as an operator runs it, against `REFUSED_URL`.
+     *
+     * `DATABASE_URL` is SET rather than inherited because `lib/bootstrap.ts`
+     * calls `dotenv.config()` without override: a child without one falls back
+     * to `backend/.env`, whose `_test` database this policy also refuses but
+     * for a different reason, and the case would stop being about the host arm.
+     * No vendor key is passed because neither path reads one — help returns
+     * before `preflight`, and the refusal never reaches `main()`.
+     */
+    const runCommand = (args: readonly string[]): CliOutcome => {
+        const child = spawnSync(
+            process.execPath,
+            ['--require', 'ts-node/register/transpile-only', SCRIPT, ...args],
+            {
+                cwd: BACKEND_ROOT,
+                encoding: 'utf8',
+                timeout: CHILD_TIMEOUT_MS,
+                env: {
+                    PATH: process.env.PATH,
+                    HOME: process.env.HOME,
+                    DATABASE_URL: REFUSED_URL,
+                    TS_NODE_PROJECT: 'tsconfig.scripts.json',
+                    TS_NODE_TRANSPILE_ONLY: '1',
+                },
+            },
+        );
+
+        expect(child.error).toBeUndefined();
+
+        return { status: child.status, stdout: child.stdout, stderr: child.stderr };
+    };
+
+    it.each([
+        ['--help', ['--help']],
+        ['-h', ['-h']],
+        ['--date beside the flag', ['--date', DAY_KEY, '--help']],
+        // `--confirm-target` is a flag this parser REJECTS (the case above
+        // pins that), and help still wins: the first statement of `parseArgs`
+        // answers help before any other token is read, so an operator who
+        // reached for the flag the refusal mentions and then asked for help
+        // gets the usage block rather than two errors.
+        ['-h after the --confirm-target this script refuses', ['--confirm-target', 'soh_test', '-h']],
+    ])('prints the usage block and exits 0 for %s', (_label, args) => {
+        const outcome = runCommand(args);
+
+        expect(outcome.status).toBe(0);
+        expect(outcome.stdout.split('\n')[0]).toBe('Usage: npm run db:seed:dev -- [options]   (seed-dev)');
+        // The usage block is the whole artefact of this path: the guard reports
+        // nothing, and nothing lands on the problem channel.
+        expect(outcome.stdout).not.toContain('database_origin_refused');
+        expect(outcome.stderr).toBe('');
+        // And it says which database it needs, which is what makes it the right
+        // answer to a refusal.
+        expect(outcome.stdout).toContain('development_only');
+    }, CHILD_TIMEOUT_MS);
+
+    it('still refuses the same database with development_only, and writes no usage, when no help flag is given', () => {
+        const outcome = runCommand([]);
+
+        expect(outcome.status).toBe(1);
+        expect(outcome.stderr).toContain('"event":"database_origin_refused"');
+        expect(outcome.stderr).toContain('"script":"seed-dev"');
+        // This script's own rule, not the generic one: the origin classified
+        // `development` on its host alone and there is no door.
+        expect(outcome.stderr).toContain('"code":"development_only"');
+        expect(outcome.stdout).toBe('');
+        expect(outcome.stderr).not.toContain('Usage: npm run');
+    }, CHILD_TIMEOUT_MS);
+
+    it('refuses --help=x, which this parser does not read as help either', () => {
+        const outcome = runCommand(['--help=x']);
+
+        expect(outcome.status).toBe(1);
+        expect(outcome.stderr).toContain('"event":"database_origin_refused"');
+        expect(outcome.stdout).toBe('');
+    }, CHILD_TIMEOUT_MS);
 });

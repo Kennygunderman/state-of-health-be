@@ -1,0 +1,85 @@
+{
+  "slug": "turkey-cottage-cheese-snack-plate",
+  "name": "Turkey and Greek yogurt snack plate",
+  "description": "Sliced turkey breast rolled beside peppered Greek yogurt, with carrot sticks, grapes and sunflower seeds — no cooking at all.",
+  "iconKey": "salad",
+  "instructions": [
+    "Spoon the Greek yogurt into the middle of two plates and grind the black pepper over it.",
+    "Cut the carrot into sticks and halve the grapes.",
+    "Roll the sliced turkey breast into loose bundles and set them beside the yogurt.",
+    "Scatter the sunflower seeds over the yogurt, then arrange the carrot sticks and the grapes alongside."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 plate",
+  "prepMinutes": 10,
+  "cookMinutes": 0,
+  "mealSlots": [
+    "snack"
+  ],
+  "dietTags": [],
+  "allergenTags": [
+    "milk"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 2,
+  "badges": [
+    "high_protein",
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:172941",
+      "quantity": 6,
+      "unit": "slice",
+      "gramWeight": 96.0,
+      "displayText": "6 slices",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:2705424",
+      "quantity": 0.5,
+      "unit": "cup",
+      "gramWeight": 122.5,
+      "displayText": "½ cup",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:174683",
+      "quantity": 120,
+      "unit": "g",
+      "gramWeight": 120,
+      "displayText": "120 g",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170393",
+      "quantity": 1,
+      "unit": "each",
+      "gramWeight": 61.0,
+      "displayText": "1",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170562",
+      "quantity": 10,
+      "unit": "g",
+      "gramWeight": 10,
+      "displayText": "10 g",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170931",
+      "quantity": 0.25,
+      "unit": "tsp",
+      "gramWeight": 0.575,
+      "displayText": "¼ tsp",
+      "sortOrder": 5,
+      "isOptional": false
+    }
+  ]
+}

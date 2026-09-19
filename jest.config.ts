@@ -173,6 +173,17 @@ const config: Config = {
     // `utils/firebase` and `middleware/auth` and leave every API suite unable
     // to import app.ts.
     clearMocks: true,
+    // Jest's default is 5,000 ms, which is not a budget for a hook that seeds
+    // a full plan week: fourteen API suites do exactly that, and on a host
+    // sharing its CPU the seed overruns, whereupon the hook's half-written
+    // rows fail the NEXT test with a unique-constraint error — a timeout that
+    // arrives disguised as a data-isolation defect. Sixty seconds is roughly
+    // forty times the measured cost of the slowest such hook, so contention
+    // cannot reach it, while a genuine hang still fails inside a minute rather
+    // than holding the run. Suites needing more (the deliberate races, the
+    // benchmark) keep declaring it themselves with `jest.setTimeout`, which
+    // overrides this.
+    testTimeout: 60_000,
     collectCoverageFrom: coveredPaths,
     // The one cast in this file. Jest's `CoverageThreshold` type declares
     // `global` as a REQUIRED key, so a derived per-path map cannot satisfy it

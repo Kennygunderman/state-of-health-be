@@ -63,6 +63,7 @@ import {
     deriveDislikedFoodGroups,
     evaluateMealAgainstPreferences,
     isClockTime,
+    isKnownFoodGroup,
     mealsPerDayForSchedule,
     nextSetupState,
     parsePreferencesUpdate,
@@ -1213,11 +1214,28 @@ interface DislikeSelection {
  *    resolves to nothing, so it could only store an exclusion that excludes
  *    nothing, and the read already drops it from the list the client holds.
  *
- * `knownFoodGroups` is deliberately not supplied: the controlled taxonomy lives
- * in `data/meal-planning/coverage-plan.v1.json`, which this module cannot import
- * (the production build's `rootDir` is `./src` and the image excludes `data/`),
- * and omitting it skips only the drift report — never which groups are
- * excluded.
+ * THE GROUPS HALF IS JUDGED THE SAME WAY, for the same reason. A group named by
+ * the REQUEST must be a term of the controlled taxonomy
+ * ({@link isKnownFoodGroup}) or already stored on this row; anything else is a
+ * new exclusion of a group no catalog food can carry, so storing it would keep
+ * ~100 characters of text per entry that excludes nothing, and it is refused
+ * with `unknown_value` naming the index. The stored half of that rule is not
+ * symmetry for its own sake: the read hands `dislikedFoodGroups` to the client,
+ * the client holds the list and re-sends it with every save of the step, and a
+ * group that entered storage by DERIVATION from a catalog row whose
+ * `food_group` the plan has since renamed would otherwise make the preferences
+ * screen unsavable — exactly the failure the ids half already documents.
+ *
+ * Groups DERIVED from a resolved catalog row are never checked against the
+ * vocabulary here: the catalog is the authority on what a food's group is, and
+ * refusing a save because a food carries a group the plan has not caught up
+ * with would under-exclude the very dislike the user asked for. Such drift is
+ * over-excluded and reported, which is the direction
+ * {@link deriveDislikedFoodGroups} states.
+ *
+ * `knownFoodGroups` is deliberately not supplied to the derivations: omitting it
+ * skips only the drift report — never which groups are excluded — and nothing
+ * currently reads that report.
  */
 const resolveDislikeWrites = async (
     selection: DislikeSelection,
@@ -1290,6 +1308,25 @@ const resolveDislikeWrites = async (
 
         writes.disliked_food_ids = requested.foodIds;
         derivedGroups = requested.foodGroups;
+    }
+
+    if (requestedFoodGroups !== null) {
+        // Selectable = a term of the taxonomy, OR already on this row — the same
+        // shape as the ids rule above, and refused for the same reason: a group
+        // that is neither names an exclusion no catalog food can match.
+        const retainedFoodGroups = new Set(storedFoodGroups);
+        const unselectable = requestedFoodGroups.filter(
+            (group) => !isKnownFoodGroup(group) && !retainedFoodGroups.has(group),
+        );
+
+        if (unselectable.length > 0) {
+            return invalidRequest(
+                unselectable.map((group) => ({
+                    field: `dislikedFoodGroups[${requestedFoodGroups.indexOf(group)}]`,
+                    code: PREFERENCE_FIELD_CODES.UNKNOWN_VALUE,
+                })),
+            );
+        }
     }
 
     const derivedFromStored = new Set(storedDerivation.foodGroups);

@@ -90,13 +90,14 @@ import { generatePlan, getAffectedMeals, getCurrentMealPlan, getMealPlanDay, reg
 import { parseLogPlannedMealCall } from '../../services/plannedMealLog.logic';
 import { logPlannedMeal } from '../../services/plannedMealLog.service';
 import { parsePreferencesUpdateRequest, parseSetupStepRequest } from '../../services/preferences.logic';
-import { savePreferences, saveSetupStep } from '../../services/preferences.service';
+import { getPreferences, savePreferences, saveSetupStep } from '../../services/preferences.service';
 import { parseSwapAlternativesPath, parseSwapCommitRequest, parseSwapPreviewPath } from '../../services/swap.logic';
 import { commitSwap, getSwapAlternatives, getSwapPreview } from '../../services/swap.service';
 import { parseSaveTargetsRequest } from '../../services/targets.logic';
 import { saveTargets } from '../../services/targets.service';
 import * as featureFlags from '../../utils/featureFlags';
 import { POST_COMMIT_ABORT_HEADER } from '../../utils/featureFlags';
+import { asUser, request } from '../setup/testApp';
 
 const USER_ID = 'boundary-suite-user';
 const PLAN_ID = 'b3c9f2e1-4d5a-4b6c-8d7e-9f0a1b2c3d4e';
@@ -1285,3 +1286,152 @@ describe('an unmapped failure', () => {
         expect(failure.line).not.toContain('secret');
     });
 });
+
+/* ---------------------------------------------------------------------------
+ * (vi) The two answers at this edge that no controller writes
+ * ------------------------------------------------------------------------- */
+
+/** A recognisable stand-in: this 200 exists to carry headers, so its body only has to be identifiable. */
+const PREFERENCES_ANSWER = { setupStatus: 'not_started', revision: 0 };
+
+/** The headers `app.ts` puts on every response, lowercased the way supertest reads them back. */
+const HARDENING_HEADERS: Readonly<Record<string, string>> = {
+    'x-content-type-options': 'nosniff',
+    'x-frame-options': 'DENY',
+    'referrer-policy': 'no-referrer',
+    'content-security-policy': "default-src 'none'; frame-ancestors 'none'",
+    'cache-control': 'no-store',
+};
+
+/** Six months, as `app.ts` states the policy — asserted as a literal so a silent weakening fails. */
+const HSTS_POLICY = 'max-age=15552000';
+
+/**
+ * Asserts one response carries the whole hardening set and no framework banner.
+ *
+ * `toBeUndefined` on `x-powered-by` rather than a negated `toContain`: the
+ * header is either absent because `app.disable('x-powered-by')` ran or present
+ * with Express's own value, and there is no third state to be lenient about.
+ */
+const expectHardened = (headers: Record<string, string>): void => {
+    for (const [name, value] of Object.entries(HARDENING_HEADERS)) {
+        expect(headers[name]).toBe(value);
+    }
+
+    expect(headers['x-powered-by']).toBeUndefined();
+};
+
+/** Starts a request against the mounted app, so an unrouted method is expressible. */
+const send = (method: 'get' | 'post' | 'put' | 'delete', path: string) => {
+    switch (method) {
+        case 'get':
+            return request.get(path);
+        case 'post':
+            return request.post(path);
+        case 'put':
+            return request.put(path);
+        case 'delete':
+            return request.delete(path);
+    }
+};
+
+describe('the answers no controller in this file produces', () => {
+    // Both of them belong to `app.ts` and neither is reachable from a handler
+    // double, so they are asserted over the mounted app — and the service mocks
+    // installed at the top of this file are what make that cheap: an unrouted
+    // path reaches no service at all, and a mocked `getPreferences` is an
+    // authenticated 200 to assert headers on with no database in the picture.
+    //
+    // What these cases would catch: an unrouted path used to answer Express's
+    // 173-byte `text/html` `Cannot PUT /api/…`, which the client's classifier
+    // reads as an UNKNOWN outcome (§0.2.5) — costing a keyed write one
+    // unnecessary retry and a vaguer message — rather than as the confirmed
+    // failure it is; and every response, on these routes and on the untouched
+    // legacy ones, carried `X-Powered-By: Express` and none of the five
+    // hardening headers.
+
+    it.each([
+        ['an empty :step segment', 'put', '/api/meal-planning/preferences/steps/'],
+        ['a trailing segment after :step', 'put', '/api/meal-planning/preferences/steps/goal/extra'],
+        ['a method the preferences route does not declare', 'post', '/api/meal-planning/preferences'],
+        ['a method the targets route does not declare', 'delete', '/api/meal-planning/targets'],
+        ['a path outside /api entirely', 'get', '/does-not-exist'],
+    ] as const)('answers 404 not_found as JSON for %s', async (_label, method, path) => {
+        const response = await asUser(send(method, path), { uid: USER_ID });
+
+        expect(response.status).toBe(404);
+        expect(response.body).toEqual({ error: 'not_found' });
+        expect(response.headers['content-type']).toMatch(/^application\/json/);
+        expect(response.text).toBe(JSON.stringify({ error: 'not_found' }));
+        expect(response.text).not.toContain('<');
+        expectHardened(response.headers);
+
+        // None of these paths matched a router, so nothing behind one may have
+        // run — the mocks are the proof that a 404 is an answer rather than a
+        // side effect.
+        expect(asMock(saveSetupStep)).not.toHaveBeenCalled();
+        expect(asMock(savePreferences)).not.toHaveBeenCalled();
+        expect(asMock(saveTargets)).not.toHaveBeenCalled();
+    });
+
+    it('answers 401 rather than 404 for an unrouted path with no token', async () => {
+        // The reason the terminal 404 is mounted BELOW
+        // `app.use(authenticateFirebaseToken)`: a caller holding no token must
+        // not be able to tell a path that exists from one that does not, which
+        // a 401/404 split answerable without credentials would hand them.
+        const response = await send('put', '/api/meal-planning/preferences/steps/');
+
+        expect(response.status).toBe(401);
+        expect(response.body).toEqual({ error: 'No token provided' });
+        expectHardened(response.headers);
+    });
+
+    it('hardens an authenticated 200, a 404 and a 401 identically', async () => {
+        // Set inside the test because `clearMocks` is on (jest.config.ts): a
+        // value installed in a `beforeAll` would be cleared before the first
+        // case ran.
+        asMock(getPreferences).mockResolvedValue(PREFERENCES_ANSWER);
+
+        const answered = await asUser(send('get', '/api/meal-planning/preferences'), { uid: USER_ID });
+        const notFound = await asUser(send('delete', '/api/meal-planning/targets'), { uid: USER_ID });
+        const unauthorized = await send('get', '/api/meal-planning/preferences');
+
+        expect(answered.status).toBe(200);
+        expect(answered.body).toEqual(PREFERENCES_ANSWER);
+        expect(notFound.status).toBe(404);
+        expect(unauthorized.status).toBe(401);
+
+        for (const response of [answered, notFound, unauthorized]) {
+            expectHardened(response.headers);
+            // Absent over plaintext, and that is the correct answer rather than
+            // a gap: RFC 6797 §7.2 requires a user agent to ignore an HSTS
+            // header received over a non-TLS connection.
+            expect(response.headers['strict-transport-security']).toBeUndefined();
+        }
+    });
+
+    it('sets HSTS for a request the proxy says arrived over TLS, and not for one that reached it in plaintext', async () => {
+        asMock(getPreferences).mockResolvedValue(PREFERENCES_ANSWER);
+
+        const overTls = await asUser(send('get', '/api/meal-planning/preferences'), { uid: USER_ID }).set(
+            'x-forwarded-proto',
+            'https',
+        );
+
+        expect(overTls.status).toBe(200);
+        expect(overTls.headers['strict-transport-security']).toBe(HSTS_POLICY);
+
+        // The FIRST value is the original client's scheme, so `http,https`
+        // describes a client that spoke plaintext to a proxy which then used
+        // TLS onwards — exactly the case the policy must not be sent for. A
+        // reading that took the last value would pass a plaintext client an
+        // HSTS pin it never earned.
+        const plaintextClient = await asUser(send('get', '/api/meal-planning/preferences'), {
+            uid: USER_ID,
+        }).set('x-forwarded-proto', 'http,https');
+
+        expect(plaintextClient.status).toBe(200);
+        expect(plaintextClient.headers['strict-transport-security']).toBeUndefined();
+    });
+});
+

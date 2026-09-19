@@ -1,0 +1,98 @@
+{
+  "slug": "hearty-turkey-quinoa-bowl",
+  "name": "Hearty turkey and quinoa bowl",
+  "description": "Seared turkey breast with mushrooms and wilted spinach over two full cups of warm quinoa — a large bowl built in under fifteen minutes.",
+  "iconKey": "bowl",
+  "instructions": [
+    "Slice the turkey breast into thin strips and slice the mushrooms.",
+    "Warm the olive oil in a large skillet over medium-high heat, add the turkey breast and cook for 5 minutes, turning once, until it is cooked through.",
+    "Add the mushrooms with the salt and the black pepper and cook for 3 minutes, until they have softened.",
+    "Stir in the spinach and cook for 1 minute, until it has wilted.",
+    "Spoon the warm quinoa into one large bowl and pile the turkey, mushrooms and spinach on top."
+  ],
+  "yieldServings": 1,
+  "servingDescription": "1 large bowl",
+  "prepMinutes": 5,
+  "cookMinutes": 9,
+  "mealSlots": [
+    "lunch",
+    "dinner"
+  ],
+  "dietTags": [
+    "gluten_free"
+  ],
+  "allergenTags": [],
+  "allergenStatus": "known",
+  "budgetTier": 2,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "dairy_free",
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:171098",
+      "quantity": 7.5,
+      "unit": "oz",
+      "gramWeight": 211.875,
+      "displayText": "7½ oz",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168917",
+      "quantity": 2,
+      "unit": "cup",
+      "gramWeight": 370.0,
+      "displayText": "2 cups",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169251",
+      "quantity": 1,
+      "unit": "cup",
+      "gramWeight": 70.0,
+      "displayText": "1 cup, sliced",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168462",
+      "quantity": 2,
+      "unit": "cup",
+      "gramWeight": 60.0,
+      "displayText": "2 cups",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 1.25,
+      "unit": "tbsp",
+      "gramWeight": 16.875,
+      "displayText": "1¼ tbsp",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170931",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 1.15,
+      "displayText": "½ tsp",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 3.0,
+      "displayText": "½ tsp",
+      "sortOrder": 6,
+      "isOptional": false
+    }
+  ]
+}

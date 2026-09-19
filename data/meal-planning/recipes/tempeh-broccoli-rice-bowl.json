@@ -1,0 +1,92 @@
+{
+  "slug": "tempeh-broccoli-rice-bowl",
+  "name": "Tempeh and broccoli rice bowl",
+  "description": "Garlicky crumbled tempeh and mushrooms over steamed broccoli and brown rice; the tempeh carries enough fat that the pan needs no cooking oil.",
+  "iconKey": "bowl_dash",
+  "instructions": [
+    "Crumble the tempeh into a dry nonstick pan and cook over medium heat for 5 minutes, until the edges are browned.",
+    "Add the mushrooms and garlic and cook for 4 minutes, until the mushrooms are golden and dry.",
+    "Steam the broccoli for 4 minutes, until bright green and just tender, then season it with the salt.",
+    "Warm the brown rice through and divide it between two bowls.",
+    "Top each bowl with the tempeh and mushrooms and the broccoli."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 bowl",
+  "prepMinutes": 8,
+  "cookMinutes": 14,
+  "mealSlots": [
+    "lunch",
+    "dinner"
+  ],
+  "dietTags": [
+    "pescatarian",
+    "vegan",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "soy"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": [
+    "high_protein",
+    "dairy_free",
+    "vegan"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:174272",
+      "quantity": 250,
+      "unit": "g",
+      "gramWeight": 250,
+      "displayText": "250 g",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170379",
+      "quantity": 4,
+      "unit": "cup",
+      "gramWeight": 352,
+      "displayText": "4 cups, chopped",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169704",
+      "quantity": 1,
+      "unit": "cup",
+      "gramWeight": 202,
+      "displayText": "1 cup",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169251",
+      "quantity": 2,
+      "unit": "cup",
+      "gramWeight": 140,
+      "displayText": "2 cups, sliced",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169230",
+      "quantity": 2,
+      "unit": "clove",
+      "gramWeight": 6,
+      "displayText": "2 cloves",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 3,
+      "displayText": "½ tsp",
+      "sortOrder": 5,
+      "isOptional": false
+    }
+  ]
+}

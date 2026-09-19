@@ -66,25 +66,33 @@ import os from 'os';
 import path from 'path';
 
 import {
+    CATALOG_ARTIFACT_TARGET_DIGEST_FIELD,
+    CATALOG_ARTIFACT_TARGET_IDENTITY_KEY,
     CATALOG_CHECK_NAMES,
     CATALOG_QUARANTINE_CHECK_NAMES,
     CATALOG_REJECT_CHECK_NAMES,
     CATALOG_REVIEW_CHECK_NAMES,
+    CatalogArtifactTargetError,
     computeCoverageShortfall,
     dedupeIdentity,
 } from '../../services/catalog.logic';
 import type { CatalogIdentityCandidate, CatalogValidationPolicy } from '../../services/catalog.logic';
 import {
     CatalogReportError,
+    REPORT_STAGE_NAME,
+    VALIDATION_REPORT_STALENESS_KEY,
     assertRecognisedStoredValues,
     buildCoverageRows,
     buildImportReportEntries,
     buildRequirementBlock,
+    buildValidationReportEntries,
     buildWithheldIdentityAudit,
     canonicalReportDirectory,
     defaultReportIo,
+    dischargedValidationReportStaleness,
     generatedContentPresence,
     measureCatalog,
+    mergeOwnedFields,
     notApplicableChecksForItem,
     perCategoryByStatus,
     pruneSupersededKeys,
@@ -98,6 +106,7 @@ import {
     toItemRecord,
     toQuarantinedIdentity,
     unrecognisedStoredValuesOfRow,
+    validationReportIdentityOf,
 } from '../../../scripts/catalog-report';
 import type {
     CatalogMeasurement,
@@ -125,7 +134,9 @@ import {
     AGGREGATE_ASSERTIONS_THE_OWNER_REWRITES,
     AGGREGATE_OWNED_ASSERTION_KEYS,
     AGGREGATE_OWNED_ASSERTION_SUB_KEYS,
+    FRESHNESS_OBLIGATIONS_FIELD,
     ManifestError,
+    PROVISIONAL_REPORT_MARKER_KEYS,
     loadCoveragePlan,
     loadEvidenceAllowlist,
     mergeStageReport,
@@ -134,6 +145,15 @@ import {
 } from '../../../scripts/lib/manifest';
 import type { CoveragePlan } from '../../../scripts/lib/manifest';
 import type { ScriptLogger } from '../../../scripts/lib/logger';
+
+/**
+ * A twelve-character target digest of the shape
+ * `scripts/lib/logger.ts::opaqueDigest` produces, and a second one that is not
+ * it — so a case that confused "this run's target" with "the artefact's" fails
+ * rather than passing on one value used twice.
+ */
+const HARNESS_TARGET_DIGEST = '1661b5560863';
+const OTHER_TARGET_DIGEST = 'ffeeddccbbaa';
 
 /* ---------------------------------------------------------------------------
  * Fixtures. Every field is stated so a test reads as the row it describes, and
@@ -1700,8 +1720,10 @@ describe('aggregate-owned assertions do not outlive the write that produced them
                 itemRecords: 1449,
                 publishedRowsMeasured: 1449,
                 validationReportRelativePath: 'data/meal-planning/reports/latest/validation-report.json',
+                validationReportIdentity: validationReportIdentityOf(null),
                 scopedTo: null,
                 existing,
+                targetDigest: HARNESS_TARGET_DIGEST,
             }),
         );
 
@@ -3859,5 +3881,365 @@ describe('reading a counter block by a name Object.prototype also carries', () =
         expect(presence.withheldGeneratedRowsTotal).toBe(5);
         expect(presence.withheldGeneratedRowsByStatus['__proto__']).toBe(3);
         expect(presence.statement).toContain('__proto__ 3, quarantined 2');
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * THE ARTEFACT PAIR'S INTEGRITY ACROSS ITS TWO WRITERS.
+ *
+ * THE DEFECT THESE PIN (CATREP-artefact-overwrite). Three things about the
+ * committed pair were true at once and together let a later run degrade
+ * evidence an earlier one had produced:
+ *
+ *   (a) `catalog-validate.ts` published `validation-report.json` with a bare
+ *       write, so the fourteen sections only this stage writes — including the
+ *       per-item records AAP §0.9.3 names as acceptance evidence — were deleted
+ *       by every validate pass. The preserving write and the freshness
+ *       obligation that keeps a preserved section from posing as fresh are
+ *       asserted in `artifact-publication.test.ts`, against real files; what
+ *       belongs here is the other half of that obligation, which this stage
+ *       discharges on its own write.
+ *   (b) Neither artefact recorded WHICH DATABASE it described, so a run against
+ *       another one merged into it undetectably. Both artefacts now carry a
+ *       one-way target digest and this stage refuses to merge into one that
+ *       records a different digest.
+ *   (c) `siblingReconciliation.validationReport.writtenByThisRun` was a
+ *       hard-coded `true`, so the claim of agreement kept standing after a
+ *       later validate pass rewrote the sibling. It is replaced by the
+ *       sibling's OWN identity as this run read it back off the document it
+ *       staged, which a reader can compare.
+ * ------------------------------------------------------------------------- */
+
+describe('the freshness obligation this stage discharges', () => {
+    const markerFor = (outstanding: unknown): Record<string, unknown> => ({
+        [VALIDATION_REPORT_STALENESS_KEY]: { [FRESHNESS_OBLIGATIONS_FIELD]: outstanding, note: 'preserved prose' },
+    });
+
+    it('names the marker key the library reviews, and the one stage name the other writer records', () => {
+        // The accounting here is written for exactly one marker key, and the
+        // obligation is matched by string. Both are pinned so a change to the
+        // library is caught here rather than by an artefact carrying a debt
+        // nothing can pay.
+        expect([...PROVISIONAL_REPORT_MARKER_KEYS]).toEqual([VALIDATION_REPORT_STALENESS_KEY]);
+        expect(REPORT_STAGE_NAME).toBe('catalog-report');
+    });
+
+    it('removes the marker when this stage was the last stage outstanding', () => {
+        expect(dischargedValidationReportStaleness(markerFor([REPORT_STAGE_NAME]))).toBeUndefined();
+    });
+
+    it('leaves another stage`s obligation standing, and only crosses itself off', () => {
+        const discharged = dischargedValidationReportStaleness(markerFor([REPORT_STAGE_NAME, 'catalog-import-usda']));
+
+        expect(discharged).toEqual({
+            [FRESHNESS_OBLIGATIONS_FIELD]: ['catalog-import-usda'],
+            note: 'preserved prose',
+        });
+    });
+
+    it('discharges nothing on a document that carries no marker', () => {
+        expect(dischargedValidationReportStaleness(null)).toBeUndefined();
+        expect(dischargedValidationReportStaleness({ counts: {} })).toBeUndefined();
+    });
+
+    it('leaves a marker whose obligation list it cannot read exactly as it found it', () => {
+        // Failing towards "still stale" is the conservative direction: the
+        // alternative is clearing a warning about sections this stage cannot
+        // confirm it measured.
+        for (const unusable of [undefined, 'catalog-report', 7, [1, 2], [{}]]) {
+            const marker = markerFor(unusable);
+            expect(dischargedValidationReportStaleness(marker)).toEqual(marker[VALIDATION_REPORT_STALENESS_KEY]);
+        }
+    });
+
+    it('is applied by the real write, which takes the marker off the document', () => {
+        const published = { produce_vegetable: 1400, spice_herb: 49 };
+        const shortfall = computeCoverageShortfall(policy(), published);
+        const measured = measurement({ publishedByCategory: published, byPublicationStatus: { published: 1449 } });
+        const rows = buildCoverageRows(policy(), plan(), measured, shortfall);
+        const existing = {
+            stage: 'catalog-validate',
+            counts: { judged: 1449 },
+            ...markerFor([REPORT_STAGE_NAME]),
+        };
+
+        const header = mergeOwnedFields(
+            existing,
+            buildValidationReportEntries({
+                plan: plan(),
+                policy: policy(),
+                allowlistVersion: 'v1',
+                evidenceRegistrySnapshot: '2026-01-01',
+                measurement: measured,
+                shortfall,
+                rows,
+                requirement: buildRequirementBlock({
+                    plan: plan(),
+                    measurement: measured,
+                    shortfall,
+                    rows,
+                    scopedTo: null,
+                }),
+                scopedTo: null,
+                existing,
+                targetDigest: HARNESS_TARGET_DIGEST,
+            }),
+        );
+
+        // The debt is paid and the marker is gone — from the in-memory document
+        // as well as from the serialised one, which is what `mergeOwnedFields`
+        // reading an `undefined` entry as a removal buys.
+        expect(header).not.toHaveProperty(VALIDATION_REPORT_STALENESS_KEY);
+        expect(JSON.parse(JSON.stringify(header))).not.toHaveProperty(VALIDATION_REPORT_STALENESS_KEY);
+        // The other writer's own section is untouched by the discharge.
+        expect(header.counts).toEqual({ judged: 1449 });
+        // And the document says which database it describes.
+        expect(header[CATALOG_ARTIFACT_TARGET_IDENTITY_KEY]).toMatchObject({
+            [CATALOG_ARTIFACT_TARGET_DIGEST_FIELD]: HARNESS_TARGET_DIGEST,
+        });
+    });
+});
+
+describe('mergeOwnedFields', () => {
+    it('keeps a key it is not given, replaces one it is, and preserves position', () => {
+        const merged = mergeOwnedFields({ a: 1, b: 2, c: 3 }, [
+            ['b', 'measured'],
+            ['d', 4],
+        ]);
+
+        expect(Object.keys(merged)).toEqual(['a', 'b', 'c', 'd']);
+        expect(merged).toEqual({ a: 1, b: 'measured', c: 3, d: 4 });
+    });
+
+    it('removes the key an entry worth undefined names', () => {
+        const merged = mergeOwnedFields({ a: 1, staleness: { outstandingStages: [] } }, [['staleness', undefined]]);
+
+        expect(Object.keys(merged)).toEqual(['a']);
+        expect(merged).not.toHaveProperty('staleness');
+    });
+
+    it('reads a __proto__ key off the artefact as the ordinary property it is', () => {
+        const fromDisk = JSON.parse('{"__proto__": {"polluted": true}, "counts": 1}') as Record<string, unknown>;
+        const merged = mergeOwnedFields(fromDisk, [['measured', true]]);
+
+        expect(Object.prototype.hasOwnProperty.call(merged, '__proto__')).toBe(true);
+        expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+    });
+});
+
+describe('validationReportIdentityOf', () => {
+    it('states four nulls for a document that identifies itself with nothing', () => {
+        expect(validationReportIdentityOf(null)).toEqual({
+            stage: null,
+            generatedAt: null,
+            runId: null,
+            targetDigest: null,
+        });
+        expect(validationReportIdentityOf({ counts: {} })).toEqual({
+            stage: null,
+            generatedAt: null,
+            runId: null,
+            targetDigest: null,
+        });
+    });
+
+    it('reads the identity the document states about itself', () => {
+        expect(
+            validationReportIdentityOf({
+                stage: 'catalog-validate',
+                generatedAt: '2026-09-18T22:24:00.000Z',
+                runId: 'run-9',
+                [CATALOG_ARTIFACT_TARGET_IDENTITY_KEY]: {
+                    [CATALOG_ARTIFACT_TARGET_DIGEST_FIELD]: HARNESS_TARGET_DIGEST,
+                },
+            }),
+        ).toEqual({
+            stage: 'catalog-validate',
+            generatedAt: '2026-09-18T22:24:00.000Z',
+            runId: 'run-9',
+            targetDigest: HARNESS_TARGET_DIGEST,
+        });
+    });
+
+    it('reads a field that is not a non-empty string as absent rather than asserting it', () => {
+        expect(
+            validationReportIdentityOf({
+                stage: '',
+                generatedAt: 17,
+                runId: null,
+                [CATALOG_ARTIFACT_TARGET_IDENTITY_KEY]: 'not a block',
+            }),
+        ).toEqual({ stage: null, generatedAt: null, runId: null, targetDigest: null });
+    });
+});
+
+describe('the sibling reconciliation states what it observed', () => {
+    const siblingBlock = (
+        existing: Readonly<Record<string, unknown>> | null,
+        stagedSibling: Readonly<Record<string, unknown>> | null,
+    ): Record<string, unknown> => {
+        const published = { produce_vegetable: 1400, spice_herb: 49 };
+        const shortfall = computeCoverageShortfall(policy(), published);
+        const measured = measurement({ publishedByCategory: published, byPublicationStatus: { published: 1449 } });
+        const rows = buildCoverageRows(policy(), plan(), measured, shortfall);
+        const written = Object.fromEntries(
+            buildImportReportEntries({
+                measurement: measured,
+                shortfall,
+                rows,
+                requirement: buildRequirementBlock({
+                    plan: plan(),
+                    measurement: measured,
+                    shortfall,
+                    rows,
+                    scopedTo: null,
+                }),
+                quarantine: { total: 0, perCategory: {} },
+                itemRecords: 1449,
+                publishedRowsMeasured: 1449,
+                validationReportRelativePath: 'data/meal-planning/reports/latest/validation-report.json',
+                validationReportIdentity: validationReportIdentityOf(stagedSibling),
+                scopedTo: null,
+                existing,
+                targetDigest: HARNESS_TARGET_DIGEST,
+            }),
+        );
+
+        return (written.siblingReconciliation as Record<string, unknown>).validationReport as Record<string, unknown>;
+    };
+
+    it('records the sibling`s own identity instead of asserting that this run wrote it', () => {
+        const block = siblingBlock(null, {
+            stage: 'catalog-validate',
+            generatedAt: '2026-09-18T22:24:00.000Z',
+            runId: 'run-9',
+            [CATALOG_ARTIFACT_TARGET_IDENTITY_KEY]: {
+                [CATALOG_ARTIFACT_TARGET_DIGEST_FIELD]: HARNESS_TARGET_DIGEST,
+            },
+        });
+
+        expect(block.validatedBy).toEqual({
+            stage: 'catalog-validate',
+            generatedAt: '2026-09-18T22:24:00.000Z',
+            runId: 'run-9',
+            targetDigest: HARNESS_TARGET_DIGEST,
+        });
+        // The standing boolean is gone: it asserted agreement that a later
+        // validate pass could invalidate without this file being rewritten.
+        expect(block).not.toHaveProperty('writtenByThisRun');
+        // And the note tells a reader the exact comparison to make.
+        expect(String(block.validatedByNote)).toContain('targetIdentity.targetDigest');
+        expect(String(block.validatedByNote)).toContain('npm run catalog:report');
+    });
+
+    it('retires the stale boolean an earlier producer wrote, and says what supersedes it', () => {
+        // The `releaseManifest` precedent in this stage's own SUPERSEDED_KEYS,
+        // applied to the same class of staleness one level down.
+        expect(supersededKeyPaths()).toContain('siblingReconciliation.writtenByThisRun');
+        expect(pruneSupersededKeys('siblingReconciliation', { writtenByThisRun: true, keptByAnotherStage: 1 })).toEqual({
+            keptByAnotherStage: 1,
+        });
+
+        const carried = siblingBlock({ siblingReconciliation: { writtenByThisRun: true } }, null);
+        expect(carried).not.toHaveProperty('writtenByThisRun');
+    });
+
+    it('states four nulls when no validate pass has ever written the sibling', () => {
+        expect(siblingBlock(null, { reportVersion: 'v1' }).validatedBy).toEqual({
+            stage: null,
+            generatedAt: null,
+            runId: null,
+            targetDigest: null,
+        });
+    });
+});
+
+describe('runReport refuses a pair produced against a different database', () => {
+    const REPORT_ROWS: readonly ReportFoodRow[] = [];
+
+    let workspace: string;
+
+    beforeEach(() => {
+        workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'soh-report-target-'));
+    });
+
+    afterEach(() => {
+        fs.rmSync(workspace, { recursive: true, force: true });
+    });
+
+    const emptyDb: ReportDb = {
+        catalog_foods: { findMany: async (): Promise<ReportFoodRow[]> => [...REPORT_ROWS] },
+    };
+
+    const run = (targetDigest: string | undefined): Promise<ReportOutcome> =>
+        runReport({
+            db: emptyDb,
+            plan: loadCoveragePlan(),
+            allowlistVersion: loadEvidenceAllowlist().allowlistVersion,
+            evidenceRegistrySnapshot: loadEvidenceAllowlist().registrySnapshot,
+            options: { help: false, category: null, out: workspace },
+            outDir: workspace,
+            logger: { info: () => undefined, warn: () => undefined, error: () => undefined, debug: () => undefined } as unknown as ScriptLogger,
+            io: defaultReportIo(),
+            targetDigest,
+        });
+
+    it('stamps both artefacts with the digest of the database it measured', async () => {
+        await run(HARNESS_TARGET_DIGEST);
+
+        for (const name of ['validation-report.json', 'import-report.json']) {
+            const document = JSON.parse(fs.readFileSync(path.join(workspace, name), 'utf-8')) as Record<string, unknown>;
+            expect(document[CATALOG_ARTIFACT_TARGET_IDENTITY_KEY]).toMatchObject({
+                [CATALOG_ARTIFACT_TARGET_DIGEST_FIELD]: HARNESS_TARGET_DIGEST,
+            });
+        }
+    });
+
+    it('refuses the second run and leaves both artefacts byte-identical', async () => {
+        await run(HARNESS_TARGET_DIGEST);
+        const before = ['validation-report.json', 'import-report.json'].map((name) =>
+            fs.readFileSync(path.join(workspace, name)),
+        );
+
+        const failure = await run(OTHER_TARGET_DIGEST).then(
+            () => null,
+            (error: unknown) => error,
+        );
+
+        expect(failure).toBeInstanceOf(CatalogArtifactTargetError);
+        expect((failure as CatalogArtifactTargetError).code).toBe('artefact_target_mismatch');
+        expect((failure as CatalogArtifactTargetError).context.recordedDigest).toBe(HARNESS_TARGET_DIGEST);
+        expect((failure as CatalogArtifactTargetError).context.runDigest).toBe(OTHER_TARGET_DIGEST);
+        // The refusal names neither host nor database name, which is the whole
+        // reason a digest is what the artefact carries.
+        expect((failure as CatalogArtifactTargetError).message).toContain('describes a different database');
+
+        ['validation-report.json', 'import-report.json'].forEach((name, index) => {
+            expect(fs.readFileSync(path.join(workspace, name)).equals(before[index])).toBe(true);
+        });
+        // And nothing was left staged for a later run to promote.
+        expect(fs.readdirSync(workspace).sort()).toEqual(['import-report.json', 'validation-report.json']);
+    });
+
+    it('adopts a pair that records no digest at all, so a committed artefact needs no editing', async () => {
+        // Every artefact published before the field existed is in this state.
+        await run(undefined);
+        for (const name of ['validation-report.json', 'import-report.json']) {
+            const target = path.join(workspace, name);
+            const document = JSON.parse(fs.readFileSync(target, 'utf-8')) as Record<string, unknown>;
+            delete document[CATALOG_ARTIFACT_TARGET_IDENTITY_KEY];
+            fs.writeFileSync(target, `${JSON.stringify(document, null, 2)}\n`, 'utf-8');
+        }
+
+        await expect(run(HARNESS_TARGET_DIGEST)).resolves.toMatchObject({ publishedItems: 0 });
+
+        // Adopted, and stamped — so the NEXT write against another database is
+        // refused rather than adopted a second time.
+        const document = JSON.parse(
+            fs.readFileSync(path.join(workspace, 'validation-report.json'), 'utf-8'),
+        ) as Record<string, unknown>;
+        expect(document[CATALOG_ARTIFACT_TARGET_IDENTITY_KEY]).toMatchObject({
+            [CATALOG_ARTIFACT_TARGET_DIGEST_FIELD]: HARNESS_TARGET_DIGEST,
+        });
     });
 });

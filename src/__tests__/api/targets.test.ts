@@ -12,17 +12,23 @@
 //
 // WHAT IS BEING PROVEN, AND WHY A UNIT TEST CANNOT DO IT.
 //
-// 1. STALENESS IS ANCESTRY AGAINST THE PREFERENCES REVISION.
-//    `targets.logic.test.ts` pins the pure half — the comparison
-//    `deriveTargetsResponse` makes — but the user-visible claim is a property of
-//    that comparison TOGETHER with the writers that advance the counter. Only a
-//    real save can show that `PUT /meal-planning/preferences/steps/:step` and
-//    `PUT /meal-planning/preferences` bump the all-purpose `revision`, so a
-//    confirmed estimate whose `targets_input_revision` was recorded at an
-//    earlier revision reads stale after ANY preference save — a diet or schedule
-//    edit as much as an activity one (AAP 0.5.2) — and reads fresh again only
-//    once the user reconfirms at the current revision. A manual target is never
-//    stale, whatever the revision does.
+// 1. STALENESS IS ANCESTRY AGAINST THE PREFERENCES REVISION, PLUS AN ANSWER
+//    THAT REALLY MOVED. `targets.logic.test.ts` pins the pure half — the
+//    comparison and the recomputation `deriveTargetsResponse` makes — but the
+//    user-visible claim is a property of that verdict TOGETHER with the writers
+//    that advance the counter and rewrite the answers. Only a real save can
+//    show that `PUT /meal-planning/preferences/steps/:step` and
+//    `PUT /meal-planning/preferences` bump the all-purpose `revision` while
+//    touching only the columns their own step owns — so a confirmed estimate
+//    reads stale after a save that changed goal, body, activity or pace
+//    (AAP 0.5.2), reads FRESH after a diet, schedule, cooking or start-date
+//    save that advanced the same counter and moved nothing the equation reads,
+//    and reads fresh again after a recalculation the user takes. The
+//    start-date case is the one the generate sequence itself performs
+//    immediately after confirming targets (0.7.4), so getting it wrong shows
+//    every generating user a recalculation that would return the figure they
+//    are looking at. A manual target is never stale, whatever the revision
+//    does.
 //
 // 2. A PERSISTED MANUAL ROUTE REFUSES AN ESTIMATE. Skip writes
 //    `target_route = 'manual'` while deliberately RETAINING the measurements it
@@ -48,8 +54,10 @@
 //
 // Every property is asserted in both directions, which is what makes the
 // assertions load-bearing rather than decorative:
-//   * a save must make a confirmed estimate stale, and a reconfirmation must
-//     make it fresh again — otherwise "stale" could pass by being constant;
+//   * a save that moves an estimate INPUT must make a confirmed estimate
+//     stale, a save that moves anything else must leave it fresh, and a
+//     reconfirmation must clear it — otherwise "stale" could pass by being
+//     constant in either direction;
 //   * the manual route must refuse the estimate, and re-answering the body step
 //     must restore it, so the refusal is a route decision and not a dead end;
 //   * the revision predicate must refuse the save when the holder bumps the
@@ -394,10 +402,24 @@ const runWatchingForLockWaits = async (work: Promise<unknown>, what: string): Pr
     }
 };
 
-/** The confirmed-estimate starting state: four stored targets that match the snapshot. */
+/**
+ * The confirmed-estimate starting state: four stored targets that match the
+ * snapshot, held by a row whose own answers PRODUCE them.
+ *
+ * THE TWO OVERRIDES ARE LOAD-BEARING. `makePreferences` defaults to 79 kg and
+ * `lightly_active`, which recompute to 2389 kcal while `FIXTURE_TARGETS` — the
+ * figure the shared factory confirms, and the number the plan, swap, grocery and
+ * log fixtures of other suites are calibrated to — is 2100. A confirmed figure
+ * its own answers could not produce is stale for a reason no test here names,
+ * and every "a save that moved nothing leaves it fresh" case would pass or fail
+ * invisibly. 80.25 kg at `not_very_active` recomputes to exactly 2100 / 158 /
+ * 210 / 70 (basal 1750, maintenance 1750 × 1.2 = 2100, both exact integers), so
+ * the fixture is coherent without moving `FIXTURE_TARGETS`, which is not this
+ * suite's to move.
+ */
 const seedConfirmedEstimate = async (): Promise<void> => {
     await makeUser({ id: USER_ID, ...FIXTURE_USER_TARGET_COLUMNS });
-    await makePreferences(USER_ID);
+    await makePreferences(USER_ID, { weight_kg: 80.25, activity_level: 'not_very_active' });
 };
 
 /** `saveSetupStep`, with the refusal verdicts turned into failures. */
@@ -449,13 +471,20 @@ afterAll(async () => {
 });
 
 /* ---------------------------------------------------------------------------
- * Staleness is an ancestry check on the preferences revision
+ * Staleness is an ancestry check on the preferences revision, and an answer
+ * that really moved
  *
  * AAP §0.5.2: a confirmed estimate is stale when `targets_input_revision`
- * differs from `preferences.revision`. Every preference save advances that
- * revision, so the claim under test is that a confirmed figure is reported as
- * behind the answers on file the moment those answers are saved again — and
- * that only a reconfirmation brings it back, never a silent recalculation.
+ * differs from `preferences.revision` — "goal/body/activity/pace changed since
+ * the estimate was confirmed". EVERY preference save advances that revision,
+ * whatever it edited, so the counter alone cannot make that distinction; the
+ * verdict additionally requires that recalculating from the answers now on file
+ * would give a DIFFERENT figure. The claim under test is therefore twofold, and
+ * only real saves can establish it: an edit to goal, body, activity or pace
+ * puts the confirmed figure behind the answers on file, an edit to anything
+ * else — diet, schedule, cooking, dislikes, time zone, the plan start date —
+ * leaves it current even though the counter moved, and only a reconfirmation
+ * clears a real staleness, never a silent recalculation.
  * ------------------------------------------------------------------------- */
 
 describe('a confirmed estimate across real preference saves', () => {
@@ -473,7 +502,7 @@ describe('a confirmed estimate across real preference saves', () => {
         expect(await storedRevisions()).toMatchObject({ revision: 1, targetsInput: 1 });
     });
 
-    it('goes stale on a diet edit, because that save advances the revision it was confirmed at', async () => {
+    it('stays fresh through a diet edit, which advances the revision and moves no estimate input', async () => {
         await saveStep('diet', {
             diet: 'vegan',
             allergens: ['milk'],
@@ -483,15 +512,29 @@ describe('a confirmed estimate across real preference saves', () => {
 
         const revisions = await storedRevisions();
 
-        // The client's own counter advanced — a concurrent save must still be
-        // detected — and the confirmed figure was derived from revision 1, so
-        // it no longer describes the answers on file.
+        // BOTH counters are asserted, because the point is that they really did
+        // move apart: the client's own counter advanced — a concurrent save must
+        // still be detected — while the ancestry stayed at 1. The confirmed
+        // figure is nonetheless still what recalculating would produce, so the
+        // review screen must not offer a recalculation that returns the number
+        // already on screen.
         expect(revisions.revision).toBe(2);
         expect(revisions.targetsInput).toBe(1);
-        expect(await getTargets(USER_ID)).toMatchObject({ source: 'estimated', stale: true, revision: 1 });
+        expect(await getTargets(USER_ID)).toMatchObject({ source: 'estimated', stale: false, revision: 1 });
+
+        // And the recalculation on offer really would be a no-op, read from the
+        // estimate route rather than assumed.
+        const estimate = await getTargetEstimate(USER_ID);
+
+        expect({
+            calories: estimate.calories,
+            protein: estimate.protein,
+            carbs: estimate.carbs,
+            fat: estimate.fat,
+        }).toEqual({ ...FIXTURE_TARGETS });
     });
 
-    it('goes stale through schedule, cooking, dislike and time-zone edits', async () => {
+    it('stays fresh through schedule, cooking, dislike and time-zone edits', async () => {
         await saveStep('schedule', {
             mealSchedule: 'three_plus_snack',
             mealTimes: [
@@ -515,12 +558,83 @@ describe('a confirmed estimate across real preference saves', () => {
 
         const revisions = await storedRevisions();
 
+        // Four saves through two different writers — the step route and the
+        // full save — and four revisions, none of them an answer the energy
+        // equation reads.
         expect(revisions.revision).toBe(5);
         expect(revisions.targetsInput).toBe(1);
-        expect(await getTargets(USER_ID)).toMatchObject({ stale: true });
+        expect(await getTargets(USER_ID)).toMatchObject({ stale: false });
     });
 
-    it('goes stale when the body step is re-saved with the same measurements, which is still a save', async () => {
+    it('stays fresh when the plan start date is saved, which is the save the generate sequence makes', async () => {
+        // THE REPRODUCTION OF THE REPORTED DEFECT. AAP §0.7.4's
+        // `planGenerateSequence` confirms the displayed targets in step (1) and
+        // then persists `review {startDate}` in step (2), so this save happens
+        // on the primary happy path for every user who generates a plan. Keyed
+        // on the revision alone, the Review screen would show "Recalculate"
+        // and a "New estimate" line carrying the SAME number as the confirmed
+        // figure the moment generation began.
+        await saveStep('review', {
+            startDate: addDaysToDayKey(utcTodayDayKey(), 1),
+            timeZone: TIME_ZONE,
+            expectedRevision: 1,
+        });
+
+        const revisions = await storedRevisions();
+
+        // The counters DID move apart, so the flag is answering the right
+        // question and not simply never firing.
+        expect(revisions.revision).toBe(2);
+        expect(revisions.targetsInput).toBe(1);
+        expect(await getTargets(USER_ID)).toEqual({
+            targets: { ...FIXTURE_TARGETS },
+            complete: true,
+            source: 'estimated',
+            stale: false,
+            revision: 1,
+        });
+    });
+
+    it('stays fresh when only the cooking time limit is saved', async () => {
+        // The second save the finding names, independently of the generate
+        // sequence: a cooking-time edit from plan settings.
+        await saveStep('cooking', {
+            cookingTimeLimitMin: 15,
+            budget: null,
+            noBudgetPreference: true,
+            timeZone: TIME_ZONE,
+            expectedRevision: 1,
+        });
+
+        expect(await storedRevisions()).toMatchObject({ revision: 2, targetsInput: 1 });
+        expect(await getTargets(USER_ID)).toMatchObject({ stale: false });
+    });
+
+    it('stays fresh when the body step is re-saved with the same measurements', async () => {
+        await saveStep('body', {
+            age: 34,
+            heightCm: 178,
+            weightKg: 80.25,
+            sexForEstimate: 'male',
+            heightUnitPref: 'ft_in',
+            weightUnitPref: 'lb',
+            timeZone: TIME_ZONE,
+            expectedRevision: 1,
+        });
+
+        const revisions = await storedRevisions();
+
+        // A real save — the revision advanced — that rewrote every measurement
+        // with the value it already held. Nothing the equation reads moved, so
+        // the confirmed figure still describes the answers on file.
+        expect(revisions.revision).toBe(2);
+        expect(revisions.targetsInput).toBe(1);
+        expect(await getTargets(USER_ID)).toMatchObject({ stale: false });
+    });
+
+    it('goes stale when the body step is re-saved with a different weight', async () => {
+        // The counterpart that makes the case above an assertion rather than a
+        // constant: the same step, the same writer, one measurement moved.
         await saveStep('body', {
             age: 34,
             heightCm: 178,
@@ -532,12 +646,7 @@ describe('a confirmed estimate across real preference saves', () => {
             expectedRevision: 1,
         });
 
-        const revisions = await storedRevisions();
-
-        // Nothing the equation reads moved, and the revision advanced all the
-        // same, so the ancestry no longer holds.
-        expect(revisions.revision).toBe(2);
-        expect(revisions.targetsInput).toBe(1);
+        expect(await storedRevisions()).toMatchObject({ revision: 2, targetsInput: 1 });
         expect(await getTargets(USER_ID)).toMatchObject({ stale: true });
     });
 
@@ -558,6 +667,13 @@ describe('a confirmed estimate across real preference saves', () => {
             stale: true,
             revision: 1,
         });
+
+        // THE LOAD-BEARING HALF of every "stays fresh" case above: on these
+        // answers the recalculation on offer really is a different figure, so
+        // the flag distinguishes the two kinds of save rather than never firing.
+        const estimate = await getTargetEstimate(USER_ID);
+
+        expect(estimate.calories).not.toBe(FIXTURE_TARGETS.calories);
     });
 
     it('goes stale on a body change made through the full save', async () => {
@@ -605,9 +721,15 @@ describe('a confirmed estimate across real preference saves', () => {
         });
         expect(await storedRevisions()).toMatchObject({ revision: 2, targetsInput: 2 });
 
-        // And the next unrelated save puts it behind again, which is what makes
-        // the flag a live statement about the row rather than a one-off.
+        // And the next save that moves an ANSWER puts it behind again, which is
+        // what makes the flag a live statement about the row rather than a
+        // one-off. A diet save at this point would not, and must not: the
+        // reconfirmed figure still describes the answers on file.
         await saveStep('diet', { diet: 'vegan', allergens: ['none'], timeZone: TIME_ZONE, expectedRevision: 2 });
+
+        expect(await getTargets(USER_ID)).toMatchObject({ stale: false, revision: 2 });
+
+        await saveFull({ weightKg: 82, timeZone: TIME_ZONE, expectedRevision: 3 });
 
         expect(await getTargets(USER_ID)).toMatchObject({ stale: true, revision: 2 });
     });
@@ -683,30 +805,36 @@ describe('the stored estimate a confirmation leaves behind', () => {
 
     /**
      * The fixture user's estimate, written out rather than computed: male, 34,
-     * 178 cm, 79 kg, lightly active, maintaining. A record derived here from the
-     * same function under test would assert nothing about the numbers, so these
-     * are the Mifflin–St Jeor figures for that row — basal 1737.5 → 1738,
-     * maintenance 1737.5 × 1.375 = 2388.9 → 2389, no adjustment, nothing
-     * clamped, and 30/40/30 of 2389 kcal at 4/4/9 kcal per gram.
+     * 178 cm, 80.25 kg, not very active, maintaining. A record derived here from
+     * the same function under test would assert nothing about the numbers, so
+     * these are the Mifflin–St Jeor figures for that row — basal 1750 exactly,
+     * maintenance 1750 × 1.2 = 2100 exactly, no adjustment, nothing clamped,
+     * and 30/40/30 of 2100 kcal at 4/4/9 kcal per gram.
+     *
+     * Those four values are `FIXTURE_TARGETS`, which is the whole reason
+     * {@link seedConfirmedEstimate} states this weight and activity level: the
+     * confirmed figure and the answers on the row are the same statement, so a
+     * staleness verdict anywhere in this file is about the save under test and
+     * not about a fixture that never agreed with itself.
      */
     const FIXTURE_ESTIMATE = {
         inputRevision: 1,
         inputs: {
             age: 34,
             heightCm: 178,
-            weightKg: 79,
+            weightKg: 80.25,
             sexForEstimate: 'male',
-            activityLevel: 'lightly_active',
+            activityLevel: 'not_very_active',
             goal: 'maintain',
             paceLbPerWeek: null,
         },
-        bmr: 1738,
-        tdee: 2389,
+        bmr: 1750,
+        tdee: 2100,
         adjustment: 0,
-        calories: 2389,
-        protein: 179,
-        carbs: 239,
-        fat: 80,
+        calories: 2100,
+        protein: 158,
+        carbs: 210,
+        fat: 70,
         clamped: false,
         clampReason: null,
     };
@@ -782,9 +910,9 @@ describe('the stored estimate a confirmation leaves behind', () => {
 
         const stored = await storedEstimate();
 
-        // The new answer, the new maintenance rate (1737.5 × 1.55 = 2693.1),
-        // and the PREFERENCES revision the new figure was derived from — so the
-        // record tracks the latest confirmation rather than accumulating
+        // The new answer, the new maintenance rate (1750 × 1.55 = 2712.5 →
+        // 2713), and the PREFERENCES revision the new figure was derived from —
+        // so the record tracks the latest confirmation rather than accumulating
         // history. `revision: 3` is the TARGETS counter, which each of the two
         // confirmations advanced by one from the fixture's 1; `inputRevision`
         // is the preferences counter, which the single activity save moved to
@@ -792,8 +920,8 @@ describe('the stored estimate a confirmation leaves behind', () => {
         expect(stored).toMatchObject({
             inputRevision: 2,
             inputs: { ...FIXTURE_ESTIMATE.inputs, activityLevel: 'active' },
-            tdee: 2693,
-            calories: 2693,
+            tdee: 2713,
+            calories: 2713,
         });
         expect(await getTargets(USER_ID)).toMatchObject({ stale: false, revision: 3 });
     });
@@ -894,7 +1022,7 @@ describe('the estimate paths against a persisted manual route', () => {
         expect([row.age, row.height_cm, row.weight_kg, row.sex_for_estimate]).toEqual([
             34,
             178,
-            79,
+            80.25,
             'male',
         ]);
     });
@@ -2484,8 +2612,16 @@ describe('GET /api/meal-planning/targets', () => {
     });
 
     describe('stale', () => {
-        it('becomes true when a preference save advances the revision, and the confirmed values stand', async () => {
-            await seedHttpConfirmedEstimate();
+        /**
+         * The answers that produce `FIXTURE_TARGETS` exactly — the same two
+         * overrides {@link seedConfirmedEstimate} states, and for the same
+         * reason: this group's verdicts must be about the save under test, not
+         * about a confirmed figure the row's own answers never produced.
+         */
+        const COHERENT_ANSWERS = { weight_kg: 80.25, activity_level: 'not_very_active' };
+
+        it('becomes true when a preference save moves an estimate input, and the confirmed values stand', async () => {
+            await seedHttpConfirmedEstimate(HTTP_USER, COHERENT_ANSWERS);
 
             await asUser(request.put(`${PREFERENCES_PATH}/steps/activity`), { uid: HTTP_USER })
                 .send({ activityLevel: 'very_active', timeZone: TIME_ZONE, expectedRevision: 1 })
@@ -2513,6 +2649,52 @@ describe('GET /api/meal-planning/targets', () => {
             expect(
                 ((await getEstimate(HTTP_USER).expect(200)).body as TargetEstimateResponse).calories,
             ).not.toBe(FIXTURE_TARGETS.calories);
+        });
+
+        it('stays false when the save moves nothing the estimate reads, over the wire the client decodes', async () => {
+            // THE REPORTED DEFECT, driven through the shipped request path
+            // rather than the service: the save AAP §0.7.4's generate sequence
+            // performs immediately after confirming targets is a `review`
+            // step carrying only the plan start date. Keyed on the preferences
+            // counter alone, `GET /api/meal-planning/targets` answered
+            // `stale: true` here, so Review rendered "Recalculate" plus a "New
+            // estimate" line repeating the confirmed figure for every user who
+            // pressed Generate.
+            await seedHttpConfirmedEstimate(HTTP_USER, COHERENT_ANSWERS);
+
+            await asUser(request.put(`${PREFERENCES_PATH}/steps/review`), { uid: HTTP_USER })
+                .send({
+                    startDate: addDaysToDayKey(utcTodayDayKey(), 1),
+                    timeZone: TIME_ZONE,
+                    expectedRevision: 1,
+                })
+                .expect(200);
+
+            // The counters really did move apart, so the flag is answering
+            // rather than never firing.
+            expect(await storedTargetRecord(HTTP_USER)).toMatchObject({
+                revision: 2,
+                targets_input_revision: 1,
+            });
+            expect((await getTargetsOverHttp(HTTP_USER).expect(200)).body).toEqual({
+                targets: { ...FIXTURE_TARGETS },
+                complete: true,
+                source: 'estimated',
+                stale: false,
+                revision: 1,
+            });
+
+            // And the recalculation the screen would have offered is the figure
+            // already on it, read from the estimate route.
+            const fresh = (await getEstimate(HTTP_USER).expect(200)).body as TargetEstimateResponse;
+
+            expect({
+                calories: fresh.calories,
+                protein: fresh.protein,
+                carbs: fresh.carbs,
+                fat: fresh.fat,
+            }).toEqual({ ...FIXTURE_TARGETS });
+            expect(fresh.estimateRevision).toBe(2);
         });
 
         it('is false again once the user reconfirms at the current revision', async () => {

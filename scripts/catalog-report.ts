@@ -152,8 +152,10 @@ import { classifyDatabaseOrigin, DatabaseOriginError, originLogFields } from './
 import { createFatalLogger, createLogger, formatSafeError, isThrownInstanceOf, safeError, writeLineSync } from './lib/logger';
 import type { LogFields, LogLevel, SafeErrorFields, ScriptLogger } from './lib/logger';
 import {
+    FRESHNESS_OBLIGATIONS_FIELD,
     MERGED_REPORT_COMPOUND_BLOCKS,
     ManifestError,
+    PROVISIONAL_REPORT_MARKER_KEYS,
     assertSafeArtifactParent,
     discardStagedArtifacts,
     loadCoveragePlan,
@@ -185,10 +187,16 @@ import { parseStoredAssumptions } from './lib/nutritionAssumptions';
 // be a second authority that can drift from the one the rows were written
 // under.
 import {
+    CATALOG_ARTIFACT_TARGET_DIGEST_FIELD,
+    CATALOG_ARTIFACT_TARGET_IDENTITY_KEY,
+    CATALOG_ARTIFACT_UNIDENTIFIED_TARGET,
     CATALOG_CHECK_NAMES,
+    CatalogArtifactTargetError,
     CATALOG_QUARANTINE_CHECK_NAMES,
     CATALOG_REJECT_CHECK_NAMES,
     CATALOG_REVIEW_CHECK_NAMES,
+    assertCatalogArtifactTarget,
+    catalogArtifactTargetIdentity,
     catalogCheckTier,
     computeCoverageShortfall,
     isCatalogFoodState,
@@ -205,9 +213,53 @@ import type { CatalogValidationOutcome } from '../src/types/catalog';
 
 const STAGE = 'catalog-report';
 
-/** The §0.3.3 artefact names; `--out` overrides their directory, not their names. */
-const VALIDATION_REPORT_FILE = 'validation-report.json';
+/**
+ * This stage's own name, exported because another stage has to name it.
+ *
+ * `catalog-validate.ts` preserves this stage's sections in
+ * `validation-report.json` and records the freshness obligation this stage
+ * still owes for them; that obligation is matched by string, so the two stages
+ * spelling the name separately would produce a marker this stage never
+ * discharges.
+ */
+export const REPORT_STAGE_NAME = STAGE;
+
+/**
+ * The §0.3.3 artefact names; `--out` overrides their directory, not their names.
+ *
+ * `VALIDATION_REPORT_FILE` is exported because `catalog-validate.ts` writes the
+ * same file and must name it the same way: two stages spelling one artefact's
+ * name separately is how they end up publishing two.
+ */
+export const VALIDATION_REPORT_FILE = 'validation-report.json';
 const IMPORT_REPORT_FILE = 'import-report.json';
+
+/**
+ * The key a freshness marker lives under, taken from the library's reviewed
+ * list rather than spelled again here.
+ *
+ * Read once at this module boundary behind a check that fails loudly (Rule
+ * backend-architecture §9): the freshness accounting in
+ * {@link dischargedValidationReportStaleness} is written for EXACTLY ONE marker
+ * key, and a second key added to `scripts/lib/manifest.ts` would be a marker
+ * this stage silently never discharges. A stage that cannot discharge its own
+ * obligation is worse than one that refuses to start, because the artefact
+ * would then carry a permanent debt no command can pay.
+ */
+const provisionalMarkerKey = (): string => {
+    const [only] = PROVISIONAL_REPORT_MARKER_KEYS;
+    if (PROVISIONAL_REPORT_MARKER_KEYS.length !== 1 || only === undefined) {
+        throw new CatalogReportError(
+            `scripts/lib/manifest.ts declares ${PROVISIONAL_REPORT_MARKER_KEYS.length} provisional report marker ` +
+                'key(s) and this stage\u2019s freshness accounting is written for exactly one, so a marker it ' +
+                'cannot discharge would be left standing on the artefact. Reconcile the two before publishing.',
+            'report_unreadable',
+        );
+    }
+    return only;
+};
+
+export const VALIDATION_REPORT_STALENESS_KEY = provisionalMarkerKey();
 
 const REPORT_VERSION = 'v1';
 const VALIDATION_REPORT_KIND = 'catalog-validation-evidence';
@@ -295,7 +347,12 @@ const WITHHELD_IDENTITY_LIMIT = 5000;
 
 /** Named because the read-back that reconciles the two artefacts slices the
  * document at exactly this key (see `reconcileQuarantineFigures`). */
-const ITEMS_KEY = 'items';
+/**
+ * The streamed member of the validation report, exported for the same reason as
+ * {@link VALIDATION_REPORT_FILE}: the other writer of this document has to
+ * recognise the key it is preserving rather than restating the string.
+ */
+export const ITEMS_KEY = 'items';
 
 const COVERAGE_PLAN_RELATIVE_PATH = 'data/meal-planning/coverage-plan.v1.json';
 const EVIDENCE_ALLOWLIST_RELATIVE_PATH = 'data/meal-planning/evidence-allowlist.v1.json';
@@ -3546,6 +3603,58 @@ const ITEM_RECORD_FIELDS: readonly string[] = [
 /** The fields a not-applicable entry carries — no pass, no observed, no bound. */
 const NOT_APPLICABLE_FIELDS: readonly string[] = ['name', 'tier', 'applicable', 'reasonCode', 'reason'];
 
+/**
+ * The freshness marker this write leaves behind, having crossed itself off it.
+ *
+ * WHAT THE MARKER IS FOR. `catalog-validate.ts` preserves this stage's sections
+ * rather than deleting them (it is the other writer of this document and owns
+ * only sixteen of its keys), and a preserved section must not silently pose as
+ * fresh — so that stage records the obligation this stage still owes, through
+ * `scripts/lib/manifest.ts`'s marker mechanism (`PROVISIONAL_REPORT_MARKER_KEYS`,
+ * `FRESHNESS_OBLIGATIONS_FIELD`). This is the other half: the write that
+ * MEASURES those sections discharges its own obligation and no one else's.
+ *
+ * `mergeStageReport` does exactly this for `import-report.json`, and it cannot
+ * do it here: this document is not written through that merge — its `items` map
+ * is streamed, so the header goes through `mergeOwnedFields` — which is why the
+ * same rule is applied at this call site instead. Both spellings remove only
+ * `stage` from the list and drop the marker when the list empties; failing
+ * towards "still stale" on an unusable list is the same conservative direction,
+ * for the same reason: clearing a warning about sections this stage never
+ * measured is the one outcome worse than leaving a stale one up.
+ *
+ * `undefined` means REMOVE THE KEY (see {@link mergeOwnedFields}), which is what
+ * the last outstanding stage discharging its obligation has to produce.
+ */
+export const dischargedValidationReportStaleness = (
+    existing: Readonly<Record<string, unknown>> | null,
+): Record<string, unknown> | undefined => {
+    const marker = existing === null ? null : asRecord(existing[VALIDATION_REPORT_STALENESS_KEY]);
+
+    if (marker === null) {
+        // No marker to discharge. `undefined` removes a key that is not there,
+        // which is a no-op, and states the intent for a document that does
+        // carry an unreadable one below.
+        return undefined;
+    }
+
+    const outstanding = marker[FRESHNESS_OBLIGATIONS_FIELD];
+
+    if (!Array.isArray(outstanding) || outstanding.some((entry) => typeof entry !== 'string')) {
+        // A marker with no usable obligation list cannot say whose sections are
+        // stale, so this write leaves it exactly as it found it.
+        return marker;
+    }
+
+    const remaining = (outstanding as readonly string[]).filter((entry) => entry !== STAGE);
+
+    if (remaining.length === 0) {
+        return undefined;
+    }
+
+    return { ...marker, [FRESHNESS_OBLIGATIONS_FIELD]: remaining };
+};
+
 export const buildValidationReportEntries = (input: {
     readonly plan: CoveragePlan;
     readonly policy: CatalogValidationPolicy;
@@ -3557,6 +3666,12 @@ export const buildValidationReportEntries = (input: {
     readonly requirement: RequirementBlock;
     readonly scopedTo: string | null;
     readonly existing: Readonly<Record<string, unknown>> | null;
+    /**
+     * The one-way digest of the database this run addresses, recorded in the
+     * artefact so a later write against a different one is refused rather than
+     * merged (`catalog.logic.ts`, EVIDENCE ARTEFACTS).
+     */
+    readonly targetDigest: string;
 }): OwnedEntries => {
     const { plan, allowlistVersion, evidenceRegistrySnapshot, measurement, shortfall, rows, requirement, scopedTo } = input;
     const publishedItems = shortfall.publishedTotal;
@@ -3615,6 +3730,14 @@ export const buildValidationReportEntries = (input: {
                     'the plan describes.',
             },
         ],
+        // WHICH DATABASE THIS EVIDENCE DESCRIBES, beside the scope it was
+        // measured over. `scope` names the environment VARIABLE; this names the
+        // target, in the one form a committed file may carry it.
+        [CATALOG_ARTIFACT_TARGET_IDENTITY_KEY, catalogArtifactTargetIdentity(input.targetDigest)],
+        // This write measures every section this stage owns, so it crosses
+        // `catalog-report` off the freshness marker a validate write left — and
+        // takes the marker away when nothing else is outstanding.
+        [VALIDATION_REPORT_STALENESS_KEY, dischargedValidationReportStaleness(input.existing)],
         ['requirement', requirement],
         [
             'policy',
@@ -4063,6 +4186,24 @@ const SUPERSEDED_KEYS: Readonly<Record<string, readonly SupersededKey[]>> = {
         },
     ],
     siblingReconciliation: [
+        // THE SAME CLASS OF STALENESS ONE LEVEL DOWN, and the reason it is
+        // named here as well as replaced. This stage rewrites
+        // `validationReconciliation`/`validationReport` wholesale, so the
+        // boolean vanishes from the artefact on the next report run either way;
+        // it is listed because `aggregateFieldsSuperseded` in the artefact is
+        // where a reader finds out WHY a claim they had read before is gone,
+        // and "the write that asserted it could not see the write that
+        // invalidated it" is exactly the kind of removal that needs saying. A
+        // `catalog:validate` pass replaces the sibling without touching this
+        // file, so `writtenByThisRun: true` outlived the agreement it asserted.
+        {
+            key: 'writtenByThisRun',
+            supersededBy:
+                'siblingReconciliation.validationReport.validatedBy, which records the sibling document\u2019s own ' +
+                'stage, generatedAt, runId and target digest as this run read them back off the file it staged, so ' +
+                'a later catalog:validate write that replaces the sibling is detectable instead of silently ' +
+                'contradicting a standing boolean',
+        },
         // THE ONE SUB-KEY THIS BLOCK CANNOT CARRY. This stage writes
         // `validationReport` — the reconciliation it can actually make, because
         // it writes both documents from one snapshot — and merges it over
@@ -4222,6 +4363,34 @@ const mergeCategoryRows = (
     );
 };
 
+/**
+ * The identity the validation report states about itself: which stage wrote its
+ * header, when, under which run, and against which database.
+ *
+ * Every field is read out of the document rather than taken from this run,
+ * because the whole point is to record what is THERE. All four are `null` on a
+ * document that states none — an artefact no `catalog:validate` pass has ever
+ * written has no run of its own — and a `null` is an honest absence rather than
+ * a mismatch: the note beside it says so.
+ *
+ * Only these four, and each of them a scalar: the block is a cross-artefact
+ * claim inside a committed file, so it carries what makes the claim CHECKABLE
+ * and nothing that would grow with the catalog.
+ */
+export const validationReportIdentityOf = (
+    header: Readonly<Record<string, unknown>> | null,
+): Record<string, unknown> => {
+    const text = (value: unknown): string | null => (typeof value === 'string' && value.length > 0 ? value : null);
+    const identity = header === null ? null : asRecord(header[CATALOG_ARTIFACT_TARGET_IDENTITY_KEY]);
+
+    return {
+        stage: header === null ? null : text(header.stage),
+        generatedAt: header === null ? null : text(header.generatedAt),
+        runId: header === null ? null : text(header.runId),
+        targetDigest: identity === null ? null : text(identity[CATALOG_ARTIFACT_TARGET_DIGEST_FIELD]),
+    };
+};
+
 export const buildImportReportEntries = (input: {
     readonly measurement: CatalogMeasurement;
     readonly shortfall: CatalogCoverageShortfall;
@@ -4235,8 +4404,18 @@ export const buildImportReportEntries = (input: {
      * the figure `itemRecords` was reconciled against. */
     readonly publishedRowsMeasured: number;
     readonly validationReportRelativePath: string;
+    /**
+     * The sibling document's own identity, as this run read it back off the
+     * document it staged (see {@link validationReportIdentityOf}).
+     */
+    readonly validationReportIdentity: Record<string, unknown>;
     readonly scopedTo: string | null;
     readonly existing: Readonly<Record<string, unknown>> | null;
+    /**
+     * The one-way digest of the database this run addresses, recorded in this
+     * artefact for the same reason it is recorded in the sibling.
+     */
+    readonly targetDigest: string;
 }): OwnedEntries => {
     const { measurement, shortfall, rows, requirement, quarantine, existing, scopedTo } = input;
 
@@ -4429,12 +4608,37 @@ export const buildImportReportEntries = (input: {
                 valuesRecorded: 'none \u2014 environment variable names only, never their values',
             },
         ],
+        // WHICH DATABASE THIS EVIDENCE DESCRIBES. `environment` above names the
+        // variable and deliberately not its value, which is exactly why this
+        // block has to exist: without it nothing in the document said which
+        // database it measured, and a run against another one merged into it
+        // undetectably.
+        [CATALOG_ARTIFACT_TARGET_IDENTITY_KEY, catalogArtifactTargetIdentity(input.targetDigest)],
         [
             'siblingReconciliation',
             mergeSubObject(existing, 'siblingReconciliation', {
                 validationReport: {
                     path: input.validationReportRelativePath,
-                    writtenByThisRun: true,
+                    // WHAT WAS OBSERVED, NOT WHAT THIS RUN INTENDED. This was a
+                    // hard-coded `writtenByThisRun: true`, which is a true
+                    // statement about the write that produced it and a claim
+                    // that keeps standing afterwards: a later
+                    // `catalog:validate` pass rewrites the sibling — with its
+                    // own run id, its own timestamp and, since it publishes
+                    // no per-item records of its own, the previous run's
+                    // `items` map carried through — while this block went on
+                    // asserting agreement with a document that had moved. QA
+                    // measured exactly that sequence.
+                    //
+                    // The sibling's OWN identity, read back off the document
+                    // this run staged, makes the claim checkable: compare
+                    // `validatedBy` with the sibling's top-level `stage`,
+                    // `generatedAt`, `runId` and
+                    // `targetIdentity.targetDigest`, and a difference means a
+                    // later pass replaced it and this reconciliation describes
+                    // the previous one. A reader can then act; a boolean gave
+                    // them nothing to compare.
+                    validatedBy: input.validationReportIdentity,
                     publishedItems: shortfall.publishedTotal,
                     publishedRowsMeasured: input.publishedRowsMeasured,
                     itemRecords: input.itemRecords,
@@ -4452,6 +4656,15 @@ export const buildImportReportEntries = (input: {
                         'here match the block read back off the staged validation report, and that both documents ' +
                         'are complete. A disagreement ends the run with both previous artefacts intact instead of ' +
                         'producing two reports that cannot both be right.',
+                    validatedByNote:
+                        'The sibling document\u2019s own identity as this run read it back off the file it staged, ' +
+                        'so this reconciliation names the document it was made against instead of asserting ' +
+                        'agreement with whatever now sits at that path. Check it: if the sibling\u2019s top-level ' +
+                        'stage, generatedAt, runId or targetIdentity.targetDigest differ from the values here, a ' +
+                        'later catalog:validate pass rewrote it and every figure in this block describes the ' +
+                        'previous one \u2014 re-run npm run catalog:report to reconcile the pair again. A null field ' +
+                        'means the sibling states none, which is what a document no validate pass has written ' +
+                        'looks like.',
                     publishedItemsNote:
                         'publishedItems counts published rows in the categories the coverage plan declares, because ' +
                         'that is what the shortfall is measured from; publishedRowsMeasured counts every published ' +
@@ -4686,8 +4899,35 @@ const parseHeaderText = (text: string, absolutePath: string): Record<string, unk
 };
 
 /**
+ * A report artefact as it is on disk: its fields without the `items` map, and
+ * where that map starts.
+ *
+ * `itemsOffset` is a BYTE offset into the file — the index of the `\n  "items":`
+ * member — and `null` for a document that carries no such key (the import
+ * report, and a validation report written before any per-item records existed).
+ * It is what lets a second writer of this format PRESERVE tens of megabytes of
+ * item records without parsing them: the header is merged in memory and the
+ * tail is copied through byte for byte from this offset
+ * (`catalog-validate.ts::publishValidationReport`).
+ */
+export interface ReportDocumentOnDisk {
+    readonly header: Record<string, unknown>;
+    /** Byte offset of the `items` member, or `null` when the document has none. */
+    readonly itemsOffset: number | null;
+    /** The file's size as the descriptor read from reported it. */
+    readonly size: number;
+}
+
+/**
  * The prefix of `absolutePath`, refusing a symlink and anything that is not a
  * regular file, or `null` when the file is not there.
+ *
+ * EXPORTED, and the one implementation of this read. `catalog-validate.ts` is
+ * the other writer of `validation-report.json` and has to preserve the fields
+ * this stage owns, which means it needs exactly this read — bounded, no-follow,
+ * `items`-aware. A second copy of a symlink-refusing read is a second place the
+ * guarantee can quietly weaken, which is the argument `O_NOFOLLOW_FLAG` below
+ * already makes for making a shared copy structural rather than conventional.
  *
  * NO-FOLLOW, for the same reason manifest.ts's `readArtifactFileNoFollow` is:
  * this read is how the fields another stage owns are preserved and how the
@@ -4704,7 +4944,7 @@ const parseHeaderText = (text: string, absolutePath: string): Record<string, unk
  * read from, which is the only check no path change can invalidate and which is
  * also where the size comes from.
  */
-const readHeaderObjectFromFile = (absolutePath: string): Record<string, unknown> | null => {
+export const readStagedReportDocument = (absolutePath: string): ReportDocumentOnDisk | null => {
     let entry: fs.Stats;
     try {
         entry = fs.lstatSync(absolutePath);
@@ -4793,11 +5033,11 @@ const readHeaderObjectFromFile = (absolutePath: string): Record<string, unknown>
     const index = buffer.indexOf(marker, 0, 'utf8');
     if (index >= 0) {
         const head = buffer.subarray(0, index).toString('utf-8').replace(/,\s*$/, '');
-        return parseHeaderText(`${head}\n}`, absolutePath);
+        return { header: parseHeaderText(`${head}\n}`, absolutePath), itemsOffset: index, size };
     }
 
     if (size <= HEADER_READ_LIMIT_BYTES) {
-        return parseHeaderText(buffer.toString('utf-8'), absolutePath);
+        return { header: parseHeaderText(buffer.toString('utf-8'), absolutePath), itemsOffset: null, size };
     }
 
     throw new CatalogReportError(
@@ -4823,7 +5063,11 @@ export const defaultReportIo = (): ReportIo => ({
         const staged: StagedArtifact = { finalPath: absolutePath, stagingPath: stagingPathFor(absolutePath) };
         return { sink: openFileSink(staged.stagingPath), staged };
     },
-    readHeaderObject: readHeaderObjectFromFile,
+    // The seam wants the header alone; the `items` offset the reader also
+    // returns is for the other writer of this format, not for this stage, which
+    // re-emits every item record from the catalog on every run.
+    readHeaderObject: (absolutePath): Record<string, unknown> | null =>
+        readStagedReportDocument(absolutePath)?.header ?? null,
     stageJsonObject: (absolutePath, value): StagedArtifact => stageJsonArtifact(absolutePath, value),
     promote: promoteStagedArtifacts,
     discard: discardStagedArtifacts,
@@ -4853,6 +5097,20 @@ export const mergeOwnedFields = (
     // disappears from a document that promises to preserve it.
     const merged = existing === null ? emptyIndex<unknown>() : copyOwnEntries(existing);
     for (const [key, value] of entries) {
+        // AN ENTRY WORTH `undefined` REMOVES THE KEY, and one entry needs that:
+        // the freshness marker `catalog-validate.ts` writes exists only while
+        // some stage still owes this document a measurement, so the write that
+        // discharges the last obligation has to take it OUT (see
+        // `dischargedValidationReportStaleness`). Omitting the entry instead
+        // would preserve the marker — this function's whole contract is that a
+        // key it is not given survives — leaving the artefact claiming a debt
+        // the write beside it had just paid. Deleting rather than assigning
+        // `undefined` keeps the in-memory document and the serialised one the
+        // same shape, since `JSON.stringify` drops an undefined-valued property.
+        if (value === undefined) {
+            delete merged[key];
+            continue;
+        }
         merged[key] = value;
     }
     return merged;
@@ -5054,6 +5312,54 @@ export const reconcileItemCount = (input: {
     );
 };
 
+/**
+ * Decides whether this run may merge into the artefact it just read, and says
+ * out loud what it decided.
+ *
+ * The RULE is `catalog.logic.ts`'s (EVIDENCE ARTEFACTS) and is shared with
+ * `catalog-validate.ts` and `catalog-generate-ai.ts`, which write the same two
+ * files; what belongs here is the log line, because the verdict is a fact about
+ * this write and deliberately not a field of the deterministic artefact. The
+ * ADOPTION case is warned rather than logged at info: it is the state every
+ * artefact committed before this field existed is in, so it is expected once
+ * per file and then never again, and a second adoption of the same artefact
+ * would mean a write in between had dropped the identity.
+ */
+const reportArtifactTarget = (input: {
+    readonly file: string;
+    readonly existing: Readonly<Record<string, unknown>> | null;
+    readonly targetDigest: string;
+    readonly logger: ScriptLogger;
+}): void => {
+    const decision = assertCatalogArtifactTarget({
+        file: input.file,
+        existing: input.existing,
+        runDigest: input.targetDigest,
+    });
+
+    const fields: LogFields = {
+        stage: STAGE,
+        file: input.file,
+        verdict: decision.verdict,
+        recordedDigest: decision.recordedDigest ?? 'none',
+        targetDigest: decision.runDigest,
+    };
+
+    if (decision.verdict === 'adopted') {
+        input.logger.warn('artefact_target_adopted', {
+            ...fields,
+            basis:
+                'The artefact records no database identity, so this run cannot tell whether it describes the ' +
+                'database this run addresses. It is adopted rather than refused \u2014 every artefact published ' +
+                'before this field existed records none \u2014 and this write stamps its own digest, so the next ' +
+                'write against a different database is refused instead of merged.',
+        });
+        return;
+    }
+
+    input.logger.info('artefact_target_checked', fields);
+};
+
 // ---------------------------------------------------------------------------
 // The run.
 // ---------------------------------------------------------------------------
@@ -5074,6 +5380,22 @@ export interface RunReportDeps {
     readonly outDir: string;
     readonly logger: ScriptLogger;
     readonly io: ReportIo;
+    /**
+     * The one-way digest of the database this run addresses
+     * (`scripts/lib/dbGuard.ts::originLogFields`), recorded in both artefacts
+     * and compared against what they already record.
+     *
+     * OPTIONAL, and an absent value is read as "this caller names no target"
+     * ({@link CATALOG_ARTIFACT_UNIDENTIFIED_TARGET}) rather than as agreement
+     * with whatever is on disk. `main()` always supplies it, so every real run
+     * identifies itself; a harness that supplies none writes artefacts
+     * identifying no database, which the adoption path then accepts. The one
+     * consequence worth stating: an unidentified run finding an IDENTIFIED
+     * artefact is refused, which is the safe direction — evidence produced
+     * against a named database is not replaced by a write that cannot say what
+     * it measured.
+     */
+    readonly targetDigest?: string;
 }
 
 export interface ReportOutcome {
@@ -5142,6 +5464,7 @@ const assertScopedReportMayPublish = (
 
 export const runReport = async (deps: RunReportDeps): Promise<ReportOutcome> => {
     const { db, plan, options, outDir, logger: runLogger, io } = deps;
+    const targetDigest = deps.targetDigest ?? CATALOG_ARTIFACT_UNIDENTIFIED_TARGET;
     const scopedTo = options.category;
 
     // The policy the shortfall is measured against. Under `--category` it holds
@@ -5311,6 +5634,19 @@ export const runReport = async (deps: RunReportDeps): Promise<ReportOutcome> => 
         // the directory first.
         assertPublicationDirectoryUnreplaced(`reading the fields ${VALIDATION_REPORT_FILE} already carries`);
         const existingValidationReport = io.readHeaderObject(validationReportPath);
+        // WHICH DATABASE THE DOCUMENT ON DISK DESCRIBES, decided before a byte
+        // is staged. A pair produced against another database is evidence for
+        // another catalog, and merging this run's sections into it yields a file
+        // whose halves describe two — the defect nothing could previously
+        // detect, because the artefacts record no target at all. An artefact
+        // recording no digest is ADOPTED and logged, never refused: every
+        // artefact committed before this field existed is in that state.
+        reportArtifactTarget({
+            file: VALIDATION_REPORT_FILE,
+            existing: existingValidationReport,
+            targetDigest,
+            logger: runLogger,
+        });
         const validationEntries = buildValidationReportEntries({
             plan,
             policy,
@@ -5322,6 +5658,7 @@ export const runReport = async (deps: RunReportDeps): Promise<ReportOutcome> => 
             requirement,
             scopedTo,
             existing: existingValidationReport,
+            targetDigest,
         });
 
         assertPublicationDirectoryUnreplaced(`staging ${VALIDATION_REPORT_FILE}`);
@@ -5388,18 +5725,31 @@ export const runReport = async (deps: RunReportDeps): Promise<ReportOutcome> => 
             // inside it, and a reconciliation made from a document read through
             // a replaced directory would gate the pair on somebody else's file.
             assertPublicationDirectoryUnreplaced(`reading the staged ${VALIDATION_REPORT_FILE} back`);
+            // ONE read of the staged sibling, used twice: the quarantine block
+            // the pair is gated on, and the sibling's own identity the
+            // reconciliation records (see `validationReportIdentityOf`). Two
+            // reads would be two documents in principle and the same cost in
+            // practice, so the header is held.
+            const stagedValidationHeader = io.readHeaderObject(validationSink.staged.stagingPath);
             reconcileQuarantineFigures({
                 validationReportPath,
                 importReportPath,
-                onDisk: quarantineFiguresOf(
-                    io.readHeaderObject(validationSink.staged.stagingPath),
-                    validationSink.staged.stagingPath,
-                ),
+                onDisk: quarantineFiguresOf(stagedValidationHeader, validationSink.staged.stagingPath),
                 measured: quarantine,
             });
 
             assertPublicationDirectoryUnreplaced(`reading the fields ${IMPORT_REPORT_FILE} already carries`);
             const existingImportReport = io.readHeaderObject(importReportPath);
+            // The same decision for the second artefact, and taken separately:
+            // the two files are published together but they are merged from two
+            // different documents, and one of them can have been produced
+            // against another database while the other was not.
+            reportArtifactTarget({
+                file: IMPORT_REPORT_FILE,
+                existing: existingImportReport,
+                targetDigest,
+                logger: runLogger,
+            });
             // One merge policy for all three stages that write this file
             // (`MERGED_REPORT_COMPOUND_BLOCKS`), so a sub-key a sibling stage
             // contributes to a shared block cannot be dropped by a top-level
@@ -5417,6 +5767,8 @@ export const runReport = async (deps: RunReportDeps): Promise<ReportOutcome> => 
                         itemRecords: itemCount,
                         publishedRowsMeasured: publishedRows,
                         validationReportRelativePath: `data/meal-planning/reports/latest/${VALIDATION_REPORT_FILE}`,
+                        validationReportIdentity: validationReportIdentityOf(stagedValidationHeader),
+                        targetDigest,
                         scopedTo,
                         existing: existingImportReport,
                     }),
@@ -5537,6 +5889,13 @@ const describeFailure = (error: unknown): { code: string; error: SafeErrorFields
     if (isThrownInstanceOf(error, ManifestError)) {
         return { code: error.code, error: safeError(error) };
     }
+    // A pair of artefacts this run must not merge into, because they were
+    // produced against a different database. Its own code rather than
+    // `unexpected_error`: the remedy is an operator decision about WHERE to
+    // publish, not a defect report.
+    if (isThrownInstanceOf(error, CatalogArtifactTargetError)) {
+        return { code: error.code, error: safeError(error) };
+    }
     return { code: 'unexpected_error', error: safeError(error) };
 };
 
@@ -5595,7 +5954,16 @@ const openReportSnapshot = async <T>(client: SnapshotCapableClient, run: (db: Re
         // finding about the catalog or about the artefacts, not about the
         // snapshot, and relabelling it would send an operator to the wrong
         // place.
-        if (isThrownInstanceOf(error, CatalogReportError) || isThrownInstanceOf(error, ManifestError) || isThrownInstanceOf(error, DatabaseOriginError)) {
+        if (
+            isThrownInstanceOf(error, CatalogReportError) ||
+            isThrownInstanceOf(error, ManifestError) ||
+            isThrownInstanceOf(error, DatabaseOriginError) ||
+            // The artefact-identity refusal is raised inside the snapshot, and
+            // it is a finding about the artefacts on disk rather than about the
+            // snapshot, so it keeps its own code for the same reason as the
+            // three above.
+            isThrownInstanceOf(error, CatalogArtifactTargetError)
+        ) {
             throw error;
         }
         if (isPrismaError(error)) {
@@ -5700,6 +6068,12 @@ const main = async (): Promise<number> => {
                 outDir: destination.directory,
                 logger,
                 io: defaultReportIo(),
+                // Taken from the origin classified at the top of main(), where
+                // the target is read once and never again (Rule
+                // backend-architecture §9): the publication must not consult
+                // the environment on its own, or the identity it stamps could
+                // differ from the one the guard admitted.
+                targetDigest: String(originLogFields(origin).targetDigest),
             }),
         );
 

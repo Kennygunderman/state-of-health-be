@@ -1,0 +1,103 @@
+{
+  "slug": "hearty-mushroom-bean-walnut-plate",
+  "name": "Hearty mushroom, black bean and walnut plate",
+  "description": "A very large soy-free vegan lunch or dinner plate for a high calorie target: eighteen and a half cups of sliced mushrooms seared hard in dry pans, warmed through with drained black beans and cooked lentils, then finished with chopped walnuts and sunflower seeds.",
+  "iconKey": "fork_knife",
+  "instructions": [
+    "Set two wide non-stick pans over high heat, divide the mushrooms between them in a single layer and leave them undisturbed for 4 minutes so they brown rather than steam.",
+    "Stir once, add the salt and the black pepper, and cook for 4 minutes more until both pans are dry again.",
+    "Divide the black beans and the lentils between the pans and warm them through for 2 minutes, pressing them lightly into the surface.",
+    "Pile everything onto one large plate and scatter the walnuts and the sunflower seeds over the top."
+  ],
+  "yieldServings": 1,
+  "servingDescription": "1 large plate",
+  "prepMinutes": 5,
+  "cookMinutes": 10,
+  "mealSlots": [
+    "lunch",
+    "dinner"
+  ],
+  "dietTags": [
+    "gluten_free",
+    "pescatarian",
+    "vegan",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "tree_nuts"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 2,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "dairy_free",
+    "vegan",
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:169251",
+      "quantity": 18.5,
+      "unit": "cup",
+      "gramWeight": 1295,
+      "displayText": "18½ cups, sliced",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:175238",
+      "quantity": 0.5,
+      "unit": "cup",
+      "gramWeight": 120,
+      "displayText": "½ cup, drained",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:172421",
+      "quantity": 70,
+      "unit": "g",
+      "gramWeight": 70,
+      "displayText": "70 g, warm",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170187",
+      "quantity": 20,
+      "unit": "g",
+      "gramWeight": 20,
+      "displayText": "20 g, chopped",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170562",
+      "quantity": 27,
+      "unit": "g",
+      "gramWeight": 27,
+      "displayText": "27 g",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 3,
+      "displayText": "½ tsp",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170931",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 1.15,
+      "displayText": "½ tsp",
+      "sortOrder": 6,
+      "isOptional": false
+    }
+  ]
+}

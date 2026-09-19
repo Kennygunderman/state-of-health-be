@@ -63,7 +63,7 @@
 // nutrition derivation and planning eligibility (`recipe.logic.ts`), and
 // choosing a status code (the controller).
 
-import { PlanNotFoundError } from './mealPlanning.errors';
+import { OutsidePlanWeekError, PlanNotFoundError } from './mealPlanning.errors';
 import { isCalendarDayKey, MAX_REVISION } from './preferences.logic';
 import { scalePlannedNutrition } from './recipe.logic';
 import { InvalidRequestDetail, LogPlannedMealPayload } from '../types/mealPlanning';
@@ -539,6 +539,14 @@ export const deriveConsumedTotals = (snapshot: PlannedEntryMacros, eatenServings
  * The codes are spelt as `grocery.logic.ts`, `nutrition.logic.ts` and
  * `targets.logic.ts` spell the same conditions, so the client needs one mapping
  * and not four.
+ *
+ * ONE MORE `details[].code` REACHES THIS ENDPOINT AND IS DELIBERATELY ABSENT
+ * FROM THIS MAP: `outside_plan_week`, the verdict on a well-formed `date` that
+ * falls outside the plan's own week. This map is the PARSER's vocabulary — codes
+ * the pure parsers below RETURN from a request judged against itself — while
+ * that one is judged against a stored plan row and is therefore raised, as
+ * `OutsidePlanWeekError` (see {@link requireDateInPlanWeek}). The class owns the
+ * string, so it is declared exactly once.
  */
 export const LOG_PLANNED_MEAL_FIELD_CODES = {
     REQUIRED: 'required',
@@ -954,6 +962,38 @@ export const isDateInPlanWeek = (date: string, plan: PlanWeekRow): boolean => {
     return date >= startDate && date <= endDate;
 };
 
+/**
+ * {@link isDateInPlanWeek}, as the refusal the endpoint actually answers with:
+ * `400 invalid_request` naming `date`.
+ *
+ * WHY THE DATE IS ITS OWN RULE. §0.5.2 lists `date ∈ [plan.startDate,
+ * plan.endDate]` among this route's REQUEST validations, beside the servings
+ * bounds and the day-key format, and the route already answers a malformed date
+ * `400 [{date, invalid_date}]`. A well-formed date outside the week used to be
+ * one of {@link requireLoggableTarget}'s 404s instead, so one endpoint typed the
+ * two halves of one input differently and a client could not tell "wrong date"
+ * from "wrong plan" — it refetched a plan that was exactly where it left it. The
+ * only thing that kept the rule out of the parser is that it is judged against a
+ * STORED plan row, which the parser cannot see; that makes it late, not
+ * un-typed.
+ *
+ * WHERE IT MAY BE CALLED. Only after the plan has been read by
+ * `{id, user_id}`. A date verdict reachable for a plan that is not the caller's
+ * would confirm that plan exists, which is precisely the oracle §8 forbids —
+ * so the ordering is the caller's obligation and `plannedMealLog.service.ts`
+ * documents where it discharges it.
+ *
+ * The diary-bucket half stays a 404 and is deliberately NOT folded in here: a
+ * bucket that is missing, deleted, someone else's or filed under another day
+ * must remain one indistinguishable answer, because each of those verdicts would
+ * otherwise say something about rows the caller does not own.
+ */
+export const requireDateInPlanWeek = (date: string, plan: PlanWeekRow): void => {
+    if (!isDateInPlanWeek(date, plan)) {
+        throw new OutsidePlanWeekError();
+    }
+};
+
 /** Everything a planned log is aimed at, judged together. */
 export interface PlannedLogTarget {
     plan: PlanWeekRow;
@@ -966,11 +1006,21 @@ export interface PlannedLogTarget {
  * Passes when the log may proceed, and throws `PlanNotFoundError` when it may
  * not.
  *
- * One class for every refusal on purpose: a bucket that does not exist, a
- * bucket belonging to someone else, a bucket filed under another day and a date
- * outside the plan's week must all be the same 404, or the response itself
- * becomes an oracle for what exists in another user's diary. The two predicates
- * stay exported beside it so each can be tested — and can fail — on its own.
+ * One class for every refusal it raises, on purpose: a bucket that does not
+ * exist, a bucket belonging to someone else and a bucket filed under another day
+ * must all be the same 404, or the response itself becomes an oracle for what
+ * exists in another user's diary. The two predicates stay exported beside it so
+ * each can be tested — and can fail — on its own.
+ *
+ * THE DATE IS ASKED FIRST AND SEPARATELY BY THE CALLER.
+ * `plannedMealLog.service.ts` calls {@link requireDateInPlanWeek} immediately
+ * before this, so an out-of-plan-week date answers `400 invalid_request` naming
+ * `date` — the typed verdict §0.5.2 gives that constraint — and never reaches the
+ * week comparison below. The comparison stays here because this function is the
+ * whole-target gate and dropping either predicate is a real hole: a caller that
+ * has not settled the date still gets a refusal rather than a log filed outside
+ * its own plan. What it cannot do on that path is *decide the status*, which is
+ * why the two rules are now two functions.
  */
 export const requireLoggableTarget = (target: PlannedLogTarget): void => {
     if (!isDateInPlanWeek(target.date, target.plan)) {

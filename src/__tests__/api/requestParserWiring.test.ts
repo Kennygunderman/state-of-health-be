@@ -157,6 +157,7 @@ import { logPlannedMeal } from '../../services/plannedMealLog.service';
 import { savePreferences, saveSetupStep } from '../../services/preferences.service';
 import { commitSwap, getSwapAlternatives, getSwapPreview } from '../../services/swap.service';
 import { saveTargets } from '../../services/targets.service';
+import { TestIdentity, asUser, request } from '../setup/testApp';
 
 /** The live recorder and stub, read back from the module the services imported. */
 const mockedClient = jest.requireMock('../../prisma/client') as {
@@ -1059,6 +1060,286 @@ describe('the entry points that already parsed first still do', () => {
             () => saveTargets(USER_ID, { source: 'estimated', estimateRevision: 1e30 }),
             'estimateRevision',
         );
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * The transport body, refused before any parser or route can read it
+ * ------------------------------------------------------------------------- */
+
+/** The awaited supertest response, structurally, so supertest stays unimported. */
+interface TransportOutcome {
+    status: number;
+    body: unknown;
+    text: string;
+    headers: Record<string, string>;
+}
+
+/** The envelope `app.ts`'s terminal error handler answers an unreadable body with (§0.5.2). */
+const MALFORMED_TRANSPORT_ANSWER = {
+    error: 'invalid_request',
+    details: [{ field: 'body', code: 'malformed_json' }],
+};
+
+/** A grocery item id that PARSES, so the body is the only thing left to fail. */
+const GROCERY_ITEM_ID = 'a81ec726-9c0f-4ab1-bc2d-4e5f60718293';
+
+const GROCERY_TOGGLE_PATH = `/api/meal-planning/plans/${PLAN_ID}/groceries/${GROCERY_ITEM_ID}`;
+
+const PREFERENCES_PATH = '/api/meal-planning/preferences';
+
+const PLANNED_LOG_PATH = `/api/meal-planning/plans/${PLAN_ID}/meals/${MEAL_ID}/log`;
+
+/** The one write reachable with no token at all — `userRoutes` mounts before the guard. */
+const SIGNUP_PATH = '/api/user';
+
+/** Comfortably past the global `express.json()` 100 KB limit (§0.5.2). */
+const OVERSIZED_BODY = `{"isChecked":"${'x'.repeat(120 * 1024)}"}`;
+
+/** One awaited supertest response, reduced to the members these assertions read. */
+const outcomeOf = (response: {
+    status: number;
+    body: unknown;
+    text: string;
+    headers: Record<string, string>;
+}): TransportOutcome => ({
+    status: response.status,
+    body: response.body,
+    text: response.text,
+    headers: response.headers,
+});
+
+/**
+ * Sends `body` byte for byte under a JSON content type, as an authenticated
+ * caller when one is given.
+ *
+ * `send` with a STRING leaves the payload untouched, and that is the point:
+ * every body below is one no client could produce by serialising an object, so
+ * passing an object here would exercise `JSON.stringify` rather than the
+ * parser.
+ */
+const sendRawJson = async (
+    method: 'post' | 'put',
+    path: string,
+    body: string,
+    identity?: TestIdentity,
+): Promise<TransportOutcome> => {
+    const started = method === 'post' ? request.post(path) : request.put(path);
+    const addressed = identity === undefined ? started : asUser(started, identity);
+
+    return outcomeOf(await addressed.set('Content-Type', 'application/json').send(body));
+};
+
+/**
+ * Asserts a transport failure was answered in the documented envelope, that
+ * nothing of the server's insides travelled with it, and that no database call
+ * was made.
+ *
+ * The four negative string assertions are the finding's own measurements turned
+ * into a gate: `<` catches the HTML page (which shipped in production too),
+ * `node_modules` and a `file:line` reference catch the absolute paths, and
+ * `at ` catches a stack frame. Three of the four held only under
+ * `NODE_ENV=production`, and none of them may depend on the environment now.
+ */
+const expectTransportEnvelope = (outcome: TransportOutcome, status: number, body: unknown): void => {
+    expect(outcome.status).toBe(status);
+    expect(outcome.body).toEqual(body);
+    expect(outcome.headers['content-type']).toMatch(/^application\/json/);
+    expect(outcome.text).toBe(JSON.stringify(body));
+    expect(outcome.text).not.toContain('<');
+    expect(outcome.text).not.toContain('node_modules');
+    expect(outcome.text).not.toMatch(/\.[jt]s:\d+/);
+    expect(outcome.text).not.toContain('at ');
+    expect(prismaCalls).toEqual([]);
+};
+
+/**
+ * Asserts the terminal handler emitted exactly ONE line for the refusal, and
+ * that the line says what happened without saying what it happened to.
+ *
+ * `SyntaxError`'s own message is the leak channel a log line has that a
+ * response body does not — "Unexpected end of JSON input" quotes the request —
+ * so its absence is asserted beside the stack's.
+ */
+const expectOneSafeLogLine = (lines: string[], status: number, code: string): void => {
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('transport_rejected');
+    expect(lines[0]).toContain(`"status":${status}`);
+    expect(lines[0]).toContain(`"code":"${code}"`);
+    expect(lines[0]).not.toContain('at ');
+    expect(lines[0]).not.toContain('node_modules');
+    expect(lines[0]).not.toContain('Unexpected');
+};
+
+describe('a malformed transport body is refused in the documented envelope', () => {
+    // The sibling claim of every case above, one layer lower down. Those prove
+    // a malformed REQUEST — a body the parsers can read and judge — never
+    // reaches Prisma. This one proves a malformed TRANSPORT BODY, which no
+    // parser and no handler ever sees, reaches the database just as little and
+    // is answered in the same `{error, details}` envelope instead of by
+    // Express's `finalhandler`. It belongs in this file for the same reason the
+    // rest does: the request dies inside `express.json()`, above the auth
+    // boundary and far above any service, so the recording stub installed here
+    // is the instrument that can state "and no database call was made", and no
+    // row-backed case could make the claim at all.
+    //
+    // What it would catch: `finalhandler` serialises `err.stack` whenever
+    // `NODE_ENV` is not `production`, which is how these same requests returned
+    // 1381 bytes of HTML naming `…/node_modules/body-parser/lib/types/json.js`
+    // in development and a 138-byte HTML `Bad Request` in production. A client
+    // decodes neither, classifies the outcome as UNKNOWN (§0.2.5) and retries a
+    // keyed write that in fact failed permanently.
+    let warned: string[] = [];
+    let warnSpy: jest.SpyInstance;
+
+    beforeEach(() => {
+        warned = [];
+        warnSpy = jest.spyOn(console, 'warn').mockImplementation((...args: unknown[]) => {
+            warned.push(String(args[0]));
+        });
+    });
+
+    afterEach(() => {
+        warnSpy.mockRestore();
+    });
+
+    it('refuses a truncated body on the grocery toggle, the route the finding was measured on', async () => {
+        const outcome = await sendRawJson('put', GROCERY_TOGGLE_PATH, '{"isChecked":true', { uid: USER_ID });
+
+        expectTransportEnvelope(outcome, 400, MALFORMED_TRANSPORT_ANSWER);
+        expectOneSafeLogLine(warned, 400, 'invalid_request');
+    });
+
+    it('refuses a top-level string, which parses but is no body a route could read', async () => {
+        // `express.json()` runs in strict mode, so `"hello"` is rejected by the
+        // parser rather than arriving as a string `req.body` that every
+        // `typeof body !== 'object'` check downstream would have to repeat.
+        const outcome = await sendRawJson('put', PREFERENCES_PATH, '"hello"', { uid: USER_ID });
+
+        expectTransportEnvelope(outcome, 400, MALFORMED_TRANSPORT_ANSWER);
+        expectOneSafeLogLine(warned, 400, 'invalid_request');
+    });
+
+    it('refuses a top-level null for the same reason', async () => {
+        const outcome = await sendRawJson('put', PREFERENCES_PATH, 'null', { uid: USER_ID });
+
+        expectTransportEnvelope(outcome, 400, MALFORMED_TRANSPORT_ANSWER);
+        expectOneSafeLogLine(warned, 400, 'invalid_request');
+    });
+
+    it('refuses a raw control character inside a string, on the write that reserves an idempotency key', async () => {
+        // JSON forbids an unescaped U+0000–U+001F inside a string, so this body
+        // is a parse failure rather than a value. The route matters: the log
+        // write reserves the caller's key, and a refusal here must happen before
+        // the ledger can burn it.
+        const outcome = await sendRawJson('post', PLANNED_LOG_PATH, '{"servings":"1\u0007"}', { uid: USER_ID });
+
+        expectTransportEnvelope(outcome, 400, MALFORMED_TRANSPORT_ANSWER);
+        expectOneSafeLogLine(warned, 400, 'invalid_request');
+    });
+
+    it('refuses a truncated body on the unauthenticated signup route', async () => {
+        // The finding's own reproduction: `POST /api/user` is a route mounted
+        // before `app.use(authenticateFirebaseToken)`, so the HTML stack page
+        // this used to answer was readable by any caller on the network with no
+        // credential of any kind.
+        const outcome = await sendRawJson('post', SIGNUP_PATH, '{"broken":');
+
+        expectTransportEnvelope(outcome, 400, MALFORMED_TRANSPORT_ANSWER);
+        expectOneSafeLogLine(warned, 400, 'invalid_request');
+    });
+
+    it('refuses a malformed body on a protected route even with no token, because the parser runs above the guard', async () => {
+        // Not an authorization hole and worth pinning as intended: the global
+        // `express.json()` is mounted before the auth boundary, so a body that
+        // cannot be read is answered 400 rather than 401. It is also what makes
+        // this refusal verifiable against a running server without a token.
+        const outcome = await sendRawJson('put', PREFERENCES_PATH, '{"diet":');
+
+        expectTransportEnvelope(outcome, 400, MALFORMED_TRANSPORT_ANSWER);
+        expectOneSafeLogLine(warned, 400, 'invalid_request');
+    });
+
+    it('answers a body past the 100 KB limit with payload_too_large', async () => {
+        const outcome = await sendRawJson('put', GROCERY_TOGGLE_PATH, OVERSIZED_BODY, { uid: USER_ID });
+
+        expectTransportEnvelope(outcome, 413, { error: 'payload_too_large' });
+        expectOneSafeLogLine(warned, 413, 'payload_too_large');
+    });
+
+    it('answers a charset the parser cannot decode with unsupported_media_type', async () => {
+        // The other half of the mapping table that a client can actually
+        // produce: body-parser raises `charset.unsupported` before it reads a
+        // byte, and answering it 400 would tell the caller to fix a body that
+        // was never the problem.
+        const response = await asUser(request.put(PREFERENCES_PATH), { uid: USER_ID })
+            .set('Content-Type', 'application/json; charset=utf-32')
+            .send('{"diet":"vegan"}');
+
+        expectTransportEnvelope(outcomeOf(response), 415, { error: 'unsupported_media_type' });
+        expectOneSafeLogLine(warned, 415, 'unsupported_media_type');
+    });
+
+    it('answers a path Express cannot percent-decode with the envelope rather than a stack', async () => {
+        // Not a body failure at all, and the reason the handler keys off
+        // `err.type` first and a claimed 4xx second: the router throws a
+        // `URIError` carrying `status: 400` and no `type` while decoding
+        // `:planId`, which used to be the same HTML error page.
+        const response = await asUser(
+            request.get(`/api/meal-planning/plans/%E0%A4%A/days/${DAY_KEY}`),
+            { uid: USER_ID },
+        );
+
+        expectTransportEnvelope(outcomeOf(response), 400, { error: 'invalid_request' });
+        expectOneSafeLogLine(warned, 400, 'invalid_request');
+    });
+
+    it('answers the identical body under NODE_ENV=development', async () => {
+        // The half of the finding that leaked 1381 bytes and ten stack frames.
+        // The guarantee asserted here is structural rather than environmental —
+        // the handler builds its body from module constants and reads nothing
+        // off the error, so no environment can change it — and that is the
+        // stronger statement, because Express captures `env` once at app
+        // creation and this flip could not reach `finalhandler` in-process even
+        // if the handler delegated to it. The out-of-process measurement is the
+        // `NODE_ENV=development` server the same request now answers as JSON.
+        const original = process.env.NODE_ENV;
+
+        process.env.NODE_ENV = 'development';
+
+        try {
+            const outcome = await sendRawJson('put', PREFERENCES_PATH, '{"diet":', { uid: USER_ID });
+
+            expectTransportEnvelope(outcome, 400, MALFORMED_TRANSPORT_ANSWER);
+            expectOneSafeLogLine(warned, 400, 'invalid_request');
+        } finally {
+            if (original === undefined) {
+                delete process.env.NODE_ENV;
+            } else {
+                process.env.NODE_ENV = original;
+            }
+        }
+    });
+
+    it('lets a well-formed body through to the database, so the refusals above are about the transport alone', async () => {
+        // The converse, and the reason the eight cases above are not vacuous: a
+        // middleware that refused every body would pass all of them. The stub's
+        // throw surfaces as the controller's own 500, which logs at error
+        // level — silenced so a passing run stays readable, with the recorder as
+        // the evidence.
+        const failure = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+
+        try {
+            const outcome = await sendRawJson('put', PREFERENCES_PATH, JSON.stringify(updateBody()), {
+                uid: USER_ID,
+            });
+
+            expect(prismaCalls.length).toBeGreaterThan(0);
+            expect(outcome.status).toBe(500);
+            expect(outcome.body).toEqual({ error: 'internal_error' });
+        } finally {
+            failure.mockRestore();
+        }
     });
 });
 

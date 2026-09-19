@@ -58,7 +58,7 @@ threshold.
 | `src/utils/units.ts`, `src/utils/seededRandom.ts` | present |
 | `src/types/mealPlanning.ts`, `src/types/recipe.ts`, `src/types/nutrition.ts` | present; every stable code named here is spelled there |
 | `data/meal-planning/recipes/coverage-report.json` | present, generated from the seeded recipe set; §5 quotes it and nothing else |
-| The 42 authored recipe files in `data/meal-planning/recipes/` | present, against a required minimum of 40 |
+| The 121 authored recipe files in `data/meal-planning/recipes/` | present, against a required minimum of 40 |
 | Per-run acceptance evidence — published catalogue counts, benchmark hit rates and latencies | **operator-produced, and committed** under `data/meal-planning/reports/latest/` as `import-report.json`, `validation-report.json` and `benchmark-report.json`; the last declares itself the acceptance evidence for search quality. Each figure is owned by the report that measured it — a measurement of one database at one moment — so it is read there and **nothing here states a measured result.** Which runs happened and what each returned is one table, in [`requirement-evidence-checklist.md`](./requirement-evidence-checklist.md#what-was-verified-in-this-environment); see also [`catalog-policy.md`](./catalog-policy.md) and [`README.md`](./README.md). |
 
 <!-- END POLICY GATE: status-at-this-commit -->
@@ -606,6 +606,43 @@ This rule is also what fixes the coverage arithmetic in §3.10 and §5.6: seven
 days of one slot, at most two uses each and never adjacent, **cannot** be filled
 by three recipes and can be filled by four.
 
+**Two uses may fall on the same day, and a third clause would be wrong.** The
+rule counts uses per week and forbids adjacent days; it says nothing about two
+slots of one day, because a lunch and a dinner that both serve a dish are two
+distinct meals. A clause refusing that would refuse weeks this policy allows: a
+tight pool can need one dish twice on one day while **every** slot holds plenty
+of recipes, so the clause would answer a feasible week with
+`422 no_matching_meals`.
+
+**Same-day variety is a preference, delivered in the order rather than the
+rule.** Left at the two clauses alone the generator took the legal pair readily —
+measured against the seeded corpus, two thirds of planned weeks served one
+recipe at two slots of a day — which is permitted and still poor. Two mechanisms
+in §3.5 fix it without narrowing what is legal: within a slot, a recipe already
+on today's plate is tried **after** every recipe that is not, and each day is
+solved in two passes, the first offering no repeat at all and the second
+reopening it. The property that buys is statable: **a day serves one dish twice
+only when, given the days before it, it cannot be filled any other way.** A rule
+refuses weeks; an order only chooses between them, and only the second can
+prefer variety without ever costing a week.
+
+**The week has the same preference, and there it is also a feasibility
+mechanism.** Behind the same-day tier, a recipe the week has not used yet is
+tried before one it has. This is the least-constraining choice, and the reason it
+is not merely cosmetic is that the two weekly uses are a **scarce resource** —
+one the scoring actively rewards spending, since `reuseBonus` (§3.3) scores a
+recipe already on the grocery list better, so the assignment that scored best
+today scores best again tomorrow. Left to the score alone the generator produced
+a week whose third day copied its first and whose fourth copied its second, four
+days spending both uses of every recipe able to carry a large target, after which
+the remaining days had nothing left to reach the band with and the week was
+refused as though the targets were impossible. Deferring reuse instead of
+front-loading it keeps the later days solvable. Measured against a slot holding
+seven or more interchangeable recipes, the week now serves seven different
+dishes where the scored order served four twice — and with only four available it
+still serves three of them twice, because an order cannot invent a fifth dish and
+is not permitted to refuse the week.
+
 ## 3.3 Scoring
 
 ```text
@@ -686,8 +723,17 @@ stronger: see [`api.md`](./api.md#idempotency-and-replay).
 ## 3.5 The search
 
 Depth-first with backtracking. Days in **date** order, slots in **schedule**
-order, candidates in **move** order (§3.3). One *evaluation* is one candidate
-placed in one slot.
+order, candidates in **move** order (§3.3).
+
+**What one evaluation is.** One candidate **placed** in one slot is one
+evaluation, and so is proving a whole day unfillable before any candidate is
+placed — the two things the search can spend time on. Charging both is what
+makes the two budgets below bound the *search* rather than merely bound its
+placements. Work that proves nothing about the arithmetic is free: a candidate
+the admissibility bound rules out is never placed and costs nothing, and a day
+impossible because some slot holds **no** candidate at all costs nothing either,
+since there was no search to charge for — that is coverage rather than
+arithmetic, and §3.7 answers it with `slot_coverage` alone.
 
 **Guidance shares shape the order, and constrain nothing.** Each slot carries a
 cumulative share of the day target, stored cumulatively so the final entry is
@@ -716,12 +762,101 @@ The recursion, clause by clause:
 
 - a day is accepted only when its **last** slot is filled **and** the completed
   day passes the tolerance;
+- a candidate whose branch **provably cannot** finish inside the day's bands is
+  not placed at all — the admissibility bound below;
+- within one slot, a recipe **not** yet on today's plate is tried before one that
+  is, and among the rest a recipe the **week** has not yet used is tried before
+  one it has. Two tiers of move order, never a rule (§3.2);
+- a day no assignment can close is recognised **before** its first placement and
+  dead-ends for the price of one evaluation — the day-feasibility test below;
+- filling the **penultimate** slot asks the exact question rather than the
+  bounded one: does any candidate in the final slot's pool actually close this
+  day? A prefix no final meal completes is not placed;
 - a slot with no candidate left backtracks to the previous slot's next
   candidate;
 - **a day that dead-ends backtracks into the previous day.** This is what
   preserves the week-wide repetition rule without a second pass: day 6
   discovering that days 1 to 5 have used up every eligible dinner is recoverable
-  precisely because day 5 can take its next assignment instead.
+  precisely because day 5 can take its next assignment instead;
+- each day is solved in **two passes** — the first offering no same-day repeat,
+  the second reopening the legal pair — and the second runs only when the first
+  has been explored to exhaustion, every distinct assignment of the day tried
+  with the rest of the week tried on top of each.
+
+**The admissibility bound, and why it removes no week.** Before a candidate is
+placed, the search asks whether the day could still land inside its bands with
+that candidate taken: it adds the running totals to the widest and narrowest each
+remaining slot could still contribute, and cuts the branch when even the most
+favourable completion overshoots a band or the most generous one still undershoots
+it. The bounds are taken over each remaining slot's **whole** pool, which is a
+superset of what the repetition rule will actually leave available, so the test
+is **optimistic** — when it says no, no assignment of the remaining slots could
+have closed the day, and the branch held no solution to remove. The move order,
+the scoring and "first feasible wins" are untouched: the week the search returns
+is the week it would have returned without the bound. What changes is only how
+much work it does to get there, and the bounds are recomputed on entry to each
+day so that the exclusions the week has already accumulated are reflected in
+them. At the last slot nothing remains to place, the bounds are zero, and the
+test **is** the day tolerance — asked one step before a placement that would have
+had to be undone.
+
+**Why that matters to the answer and not just the cost.** Without the bound the
+search spent its day allowance placing and unwinding branches that could never
+close, and ran out before reaching the assignments that do. The refusal that
+followed named the day tolerance as the reason for weeks that satisfy it — and
+because how much allowance a target happened to waste is not monotonic in the
+target, neighbouring targets could differ in verdict. Two things follow from
+fixing it. Feasible weeks at ordinary maintain- and gain-sized targets are now
+found, well inside one day's allowance. And a refusal that **does** come back
+from a settled search is a demonstrated one: the search explored every assignment
+the rule allows, so "no combination met the day bands" is proved rather than
+guessed — which is the distinction §3.7 depends on.
+
+**The exact test at the penultimate slot.** The bound above treats each nutrient
+independently, so it admits a remainder no single meal actually has: "some dinner
+supplies between 300 and 900 kcal, and some dinner supplies between 20 and 60 g
+of fat" does not mean one dinner supplies both at once. One slot from the end
+that relaxation is unnecessary, because nothing follows the last slot to bound —
+the day's final total is the running total plus exactly one candidate's
+nutrition, so asking whether **any** candidate in the final pool closes the day
+is an exact question over a finite pool, answered in one pass over it. That is
+where the day allowance was going: every lunch the intervals let through was
+placed, and charged, only for the exact test one slot later to find nothing able
+to follow it. The test is taken over the final slot's whole pool, a superset of
+what remains available, so a negative answer removes nothing reachable.
+
+**The day-feasibility test, and why a doomed day must not spend an allowance.**
+On entry to a day, before any placement, the search asks whether **any**
+assignment of that day's slots lands the day inside its bands — walking the
+slots, pruning each prefix with the bound above, settling the final slot with the
+exact test, and serving no recipe more often than the week's remaining allowance
+permits. It answers "does a witness exist" and nothing else: no score is
+computed and no order imposed, so it cannot influence *which* week is returned.
+It earns its place because running an allowance out **ends the search** rather
+than unwinding it: one genuinely unfillable day — days before it having spent the
+two permitted uses of the recipes it needed — would otherwise consume the whole
+day allowance proving itself impossible, and take with it every week reachable by
+changing an earlier day. Answered on entry, that becomes an ordinary dead end:
+one evaluation, the frontier records the day, and the recursion unwinds into the
+previous day's next candidate. The budgets are unchanged; what changes is that
+they are spent on days that can close.
+
+**The walk is bounded, and the bound is a trade rather than a free win.** That
+feasibility walk is itself a search, and on a pool where no assignment closes the
+day it enumerates prefixes to prove it — measured at around 150,000 steps for one
+such proof against the shipped corpus, which unbounded would spend the whole
+wall-clock limit on a few hundred of them and return a `502` where the truthful
+answer is a `422`. It therefore stops after a fixed amount of work and reports
+"explore this day the ordinary way". Stopping keeps the test **sound** — it never
+denies a day that has a feasible assignment, so no week legal under §3.2 is made
+unreachable — but it does cost the shortcut: a doomed day it declines to judge is
+discovered the expensive way, by the search spending evaluations on it, and a
+search that then runs out of allowance refuses. The figure is set from
+measurement in both directions, the pools that need the proof in order to plan at
+all concluding well inside it while the pools that cost orders of magnitude more
+are refusals regardless. It is not a policy threshold and is deliberately not
+published as one: it names an amount of work, changes no rule, and appears in no
+response.
 
 | Budget | Value | Status |
 | --- | --- | --- |
@@ -760,6 +895,14 @@ main set and filtered per slot.
 **The day tolerance is the only hard nutrition acceptance test**, and it is
 applied to a **completed** day — never to a partial one, and never to an
 individual meal.
+
+A partial day is read in one narrower sense and no other: the admissibility
+bound in §3.5 asks whether the slots still to be filled could carry the day into
+**these same bands**, and cuts the branch when they provably cannot. That is a
+reachability test over the identical intervals — derived once, from the table
+below, and read by both — never a verdict on the partial totals themselves. The
+guidance shares of §3.5 remain the only thing with an opinion about how a
+half-built day ought to look, and they only order moves.
 
 | Quantity | Accepted band | Status |
 | --- | --- | --- |
@@ -1086,9 +1229,33 @@ been shipping for two versions and its arithmetic is the reference:
 `nutrition.service.ts` rounds each per-serving value once as it writes an entry,
 multiplies that stored value by the servings eaten and rounds the product once,
 and its daily and history aggregates do the same in SQL as
-`SUM(ROUND(x * servings))::int`. Step 3 above is that same arithmetic applied to
-the same snapshot, so the server's totals, the SQL aggregates and the client's
-card agree by construction.
+`SUM(FLOOR((x * servings)::numeric + 0.5))::int`. Step 3 above is that same
+arithmetic applied to the same snapshot, so the server's totals, the SQL
+aggregates and the client's card agree by construction.
+
+**Why `FLOOR(… ::numeric + 0.5)` and not `ROUND`.** This paragraph used to name
+`SUM(ROUND(x * servings))::int`, and that claim was not true — which is the
+whole of the defect it now records. PostgreSQL's `round(double precision)` is
+**half-to-even**, while JavaScript's `Math.round` is **half-up**, so the daily
+read (which rounds in JS) and the history read and meal breakdown (which round
+in SQL) disagreed by 1 on every value landing exactly on `.5`. Measured: one
+entry at `servings = 0.5` over the snapshot `145/145/153/57` gave the day read
+`73/73/77/29` and both SQL readers `72/72/76/28`, and `DayBreakdownCard` prints
+those numbers verbatim, so Macros History showed a different figure than the
+Diary for the same day.
+
+Casting to `numeric` alone does **not** fix it. `round(numeric)` is half-up for
+positive values but rounds half **away from zero** for negative ones, where
+`Math.round` rounds half **towards positive infinity**: `-0.5`, `-1.5` and
+`-2.5` become `-1`, `-2`, `-3` under `round(::numeric)` and `0`, `-1`, `-2`
+under `Math.round`. Negative macros are storable — the legacy entry parser
+requires only that each value be finite — so that difference is reachable.
+`FLOOR(x::numeric + 0.5)` is `Math.round`'s definition rather than an
+approximation of it, and it agreed with `Math.round` on every probed value,
+positive, negative and half-integer alike. The form is therefore the contract:
+all ten aggregate sites in `nutrition.service.ts` — four in `getMealBreakdowns`,
+four in `getHistory`'s page query and the `HAVING` clause of both the page query
+and its count subquery — use it, and none may go back to bare `ROUND`.
 
 The user-visible guarantee this buys: **"1 serving" in the diary equals the
 planned portion exactly.**
@@ -1196,17 +1363,17 @@ restated from anywhere else.
 the two promise thresholds (4 and 2) are **product policy**, and the composition
 floors are product policy read from the same report.
 
-**Recipe count: 42**, against a required minimum of 40. Ten of them are
+**Recipe count: 121**, against a required minimum of 40. 49 of them are
 cross-listed across more than one slot.
 
 Composition per slot, with the floors policy requires:
 
 | Slot | Vegan | Further vegetarian | Further pescatarian | Further omnivore | Eligible | Authored to this slot |
 | --- | --- | --- | --- | --- | --- | --- |
-| Breakfast | 4 (floor 4) | 3 (floor 3) | 2 (floor 2) | 3 (floor 3) | 12 | 12 |
-| Lunch | 6 (floor 4) | 3 (floor 3) | 3 (floor 2) | 4 (floor 3) | 16 | 6 |
-| Dinner | 8 (floor 4) | 3 (floor 3) | 3 (floor 2) | 4 (floor 3) | 18 | 8 |
-| Snack | 4 (floor 4) | 2 (floor 2) | 0 (no floor) | 0 (no floor) | 6 | 6 |
+| Breakfast | 18 (floor 4) | 9 (floor 3) | 4 (floor 2) | 9 (floor 3) | 40 | 40 |
+| Lunch | 25 (floor 4) | 8 (floor 3) | 9 (floor 2) | 13 (floor 3) | 55 | 6 |
+| Dinner | 30 (floor 4) | 9 (floor 3) | 10 (floor 2) | 15 (floor 3) | 64 | 15 |
+| Snack | 6 (floor 4) | 3 (floor 2) | 1 (no floor) | 1 (no floor) | 11 | 11 |
 
 The four strata **partition** the recipes eligible for the slot with no allergen
 excluded at the loosest time tier, and they sum to the eligible count. "Eligible"

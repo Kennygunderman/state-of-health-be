@@ -1,0 +1,87 @@
+{
+  "slug": "large-pork-potato-breakfast-hash",
+  "name": "Large pork and potato breakfast hash",
+  "description": "Grated potato and onion crisped in one pan with small cubes of pork tenderloin — a large hash that comes together in fifteen minutes.",
+  "iconKey": "crosshair",
+  "instructions": [
+    "Coarsely grate the potatoes and cut the pork tenderloin into small cubes.",
+    "Warm the olive oil in a large skillet over medium-high heat, spread the grated potato and the onion in an even layer and cook, covered, for 5 minutes, until the potato is tender.",
+    "Push the potato aside, add the pork tenderloin with the salt and the black pepper and cook for 4 minutes, turning the cubes once, until they are cooked through.",
+    "Stir the hash together and tip it onto one large plate."
+  ],
+  "yieldServings": 1,
+  "servingDescription": "1 large plate",
+  "prepMinutes": 6,
+  "cookMinutes": 9,
+  "mealSlots": [
+    "breakfast"
+  ],
+  "dietTags": [
+    "gluten_free"
+  ],
+  "allergenTags": [],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "dairy_free",
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:168249",
+      "quantity": 9.5,
+      "unit": "oz",
+      "gramWeight": 268.375,
+      "displayText": "9½ oz",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170027",
+      "quantity": 2,
+      "unit": "each",
+      "gramWeight": 395.0,
+      "displayText": "2 medium potatoes",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170000",
+      "quantity": 0.5,
+      "unit": "cup",
+      "gramWeight": 80.0,
+      "displayText": "½ cup, chopped",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 1.5,
+      "unit": "tbsp",
+      "gramWeight": 20.25,
+      "displayText": "1½ tbsp",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170931",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 1.15,
+      "displayText": "½ tsp",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 3.0,
+      "displayText": "½ tsp",
+      "sortOrder": 5,
+      "isOptional": false
+    }
+  ]
+}

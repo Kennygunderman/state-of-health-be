@@ -605,6 +605,27 @@ const toDateOrNull = (value: unknown): Date | null => {
     return null;
 };
 
+/**
+ * How a checkpoint's counts meet the ones the run row already carries.
+ *
+ * `merge` is the default and what every stage making progress needs: the second
+ * half of an interrupted import adds to what the first half recorded (see
+ * {@link mergeCounts} for why the addition happens in application code).
+ *
+ * `replace` exists for the one shape addition cannot express — an attempt that
+ * has ABANDONED the work its predecessor measured. A resume whose saved cursor
+ * belongs to a different plan restarts from the beginning, so the earlier
+ * attempt's totals describe records this attempt is about to redo: left in
+ * place they double `candidates` and overstate `inserted`/`updated`, and the
+ * previous plan's own `skipped*`/`admitted*` keys linger beside the new plan's.
+ * Replacement drops the stored map entirely and writes the caller's, which is
+ * why it is opt-in per call rather than a mode a stage can be left in.
+ */
+export type CatalogRunCountsMode = 'merge' | 'replace';
+
+export const COUNTS_MODE_MERGE: CatalogRunCountsMode = 'merge';
+export const COUNTS_MODE_REPLACE: CatalogRunCountsMode = 'replace';
+
 // Accumulates counters by ADDITION, never replacement. This is what makes a
 // resumed run's totals correct: the second half of an interrupted import adds to
 // what the first half already recorded instead of overwriting it. It is also why
@@ -649,6 +670,24 @@ export const mergeCounts = (existing: unknown, delta: Record<string, number>): R
 
     return merged;
 };
+
+/**
+ * The counts a checkpoint writes, from what the row holds and the mode asked
+ * for (see {@link CatalogRunCountsMode}).
+ *
+ * `replace` is expressed as `mergeCounts(null, counts)` rather than as a second
+ * sanitiser: `mergeCounts` treats any non-record `existing` as "no counters
+ * yet", so discarding the stored map reuses the SAME guards the additive path
+ * applies to the caller's values — the `__proto__` key, NaN, Infinity and
+ * non-numbers are dropped identically, and there is no second implementation to
+ * drift from the first. The additive path is passed through untouched, so every
+ * caller that does not ask for replacement is byte-for-byte unaffected.
+ */
+export const resolveCounts = (
+    existing: unknown,
+    counts: Record<string, number>,
+    mode: CatalogRunCountsMode,
+): Record<string, number> => mergeCounts(mode === COUNTS_MODE_REPLACE ? null : existing, counts);
 
 // Appends one entry and keeps the MOST RECENT `maxEntries` (see
 // RUN_LOG_MAX_ENTRIES for why a cap exists at all).
@@ -1734,6 +1773,7 @@ const writeCheckpointToRun = async <TCursor>(
     runId: string,
     cursor: TCursor,
     delta: Record<string, number>,
+    mode: CatalogRunCountsMode,
 ): Promise<Readonly<Record<string, number>>> => {
     // ONE locking read, ONE write. That is the whole point of this function: the
     // cursor and the counts for the work it names move together or not at all.
@@ -1746,7 +1786,11 @@ const writeCheckpointToRun = async <TCursor>(
         throw new CheckpointError('run_not_open', runId);
     }
 
-    const counts = mergeCounts(locked.counts, delta);
+    // Under the SAME row lock in either mode, which is what makes a replacement
+    // safe to offer at all: the stored map is read and written inside one
+    // locked section, so a concurrent additive writer queues on the row rather
+    // than landing its delta on a value this statement is about to discard.
+    const counts = resolveCounts(locked.counts, delta, mode);
 
     const result = await db.catalog_import_runs.updateMany({
         where: { id: runId, status: RUN_STATUS_RUNNING },
@@ -1789,15 +1833,30 @@ const writeCheckpointToRun = async <TCursor>(
  *
  * Returns the merged counts, as `recordCounts` does, so a caller can log what
  * the run now says without reading the row again.
+ *
+ * `countsMode` is optional and defaults to `merge`, so every existing caller —
+ * `catalog-import-usda.ts`, `catalog-generate-ai.ts`, `catalog-validate.ts`,
+ * `catalog-load.ts`, `catalog-release.ts`, `recipes-seed.ts` — keeps the
+ * additive behaviour unchanged. `replace` is for an attempt that abandoned the
+ * work its predecessor measured and must state its own totals from zero rather
+ * than add to figures describing records it is about to redo; see
+ * {@link CatalogRunCountsMode}. It is per call, not per run, because the very
+ * next checkpoint of the same attempt must accumulate again.
  */
 export const saveCheckpoint = async <TCursor>(
     db: CatalogRunDb,
     runId: string,
-    input: { readonly cursor: TCursor; readonly counts?: Record<string, number> },
+    input: {
+        readonly cursor: TCursor;
+        readonly counts?: Record<string, number>;
+        readonly countsMode?: CatalogRunCountsMode;
+    },
 ): Promise<Readonly<Record<string, number>>> => {
     assertWellFormedRunId(runId);
 
-    return inRunTransaction(db, (tx) => writeCheckpointToRun(tx, runId, input.cursor, input.counts ?? {}));
+    return inRunTransaction(db, (tx) =>
+        writeCheckpointToRun(tx, runId, input.cursor, input.counts ?? {}, input.countsMode ?? COUNTS_MODE_MERGE),
+    );
 };
 
 const appendLogToRun = async (

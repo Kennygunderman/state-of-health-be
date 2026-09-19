@@ -164,7 +164,17 @@ import path from 'path';
 import readline from 'readline';
 
 import { classifyDatabaseOrigin, DatabaseOriginError, originLogFields } from './lib/dbGuard';
-import { createFatalLogger, createLogger, formatSafeError, isThrownInstanceOf, safeError, writeLineSync } from './lib/logger';
+import {
+    UNEXPECTED_FAILURE_REMEDY,
+    classifyInfrastructureFailure,
+    createFatalLogger,
+    createLogger,
+    firstPartyMessage,
+    formatSafeError,
+    isThrownInstanceOf,
+    safeError,
+    writeLineSync,
+} from './lib/logger';
 import type { LogFields, LogLevel, SafeErrorFields, ScriptLogger } from './lib/logger';
 import {
     ManifestError,
@@ -5034,6 +5044,114 @@ const gapFields = (gaps: readonly PrerequisiteGap[]): LogFields => {
     return fields;
 };
 
+/**
+ * How a context value reaches a LOG LINE, as opposed to how it sits on the
+ * error.
+ *
+ * `expected` and `observed` hold a full SHA-256 for the three digest and
+ * measurement refusals, and the last rule in scripts/lib/logger.ts's
+ * `SCRUB_RULES` redacts any opaque run of 40 characters or more — so a digest
+ * forwarded verbatim reaches the operator as `"expected":"***"`, which is the
+ * reported value being lost a second time on the very field they compare
+ * against the manifest. Twelve characters plus an ellipsis is what the
+ * refusal's own sentence already shows (see {@link forDisplay}), is far past
+ * the point of ambiguity between two releases, and survives the rule intact.
+ *
+ * A count comparison's numbers pass through unchanged and stay NUMBERS, so a
+ * reader of `catalog_import_runs.log` can still index on them, and the full
+ * digests stay on the error's `context` for a programmatic caller, where no
+ * redaction applies.
+ */
+const forLogField = (value: number | string): number | string =>
+    typeof value === 'string' ? forDisplay(value) : value;
+
+/**
+ * WHICH member and WHICH line a refusal is about, as typed fields rather than
+ * as prose a reader has to parse.
+ *
+ * WHY THIS EXISTS. `safeError` carries a closed set of machine-readable members
+ * and no `message`, so a refusal reached the operator as its class and its code
+ * and nothing else: `{"code":"release_duplicate_food","error":{"name":
+ * "CatalogLoadError"}}` says a release repeats a food but not which file, which
+ * line or which key — and repairing a release means editing exactly that line.
+ * The error already carries all of it in {@link CatalogLoadErrorContext},
+ * assembled at each throw site against a typed shape, so the facts travel as
+ * the DATA they already are.
+ *
+ * Every value here is one this pipeline assigned: a release member's file name
+ * from the manifest, a 1-based line number this stage counted, a `source_key`
+ * from the release's own vocabulary, or the two sides of a digest, byte-length
+ * or row-count comparison. None of it is derived from a vendor sentence, a
+ * connection string or a model's output, which is what separates these fields
+ * from the `message` `safeError` withholds.
+ *
+ * Assembled so an absent member is ABSENT rather than `undefined` — the same
+ * convention `safeError` and `checkpointErrorFields` follow — because these
+ * fields are spread onto a log line and into `catalog_import_runs.log`, where
+ * `"line":undefined` reads as a line number that was lost rather than one that
+ * never applied. The codes fail at different granularities (a member, a line
+ * within it, a food, a count), so most refusals carry a subset.
+ *
+ * Deliberately field-by-field rather than `...error.context`: the spread would
+ * widen automatically to any member a later revision adds to the context type,
+ * and whether a new field may reach a durable log is a decision this function
+ * exists to make explicitly.
+ *
+ * `expected` and `observed` are the one pair that is transformed on the way
+ * out, for the reason {@link forLogField} states.
+ */
+export const catalogLoadErrorFields = (error: CatalogLoadError): LogFields => ({
+    ...(error.context.file === undefined ? {} : { file: error.context.file }),
+    ...(error.context.line === undefined ? {} : { line: error.context.line }),
+    ...(error.context.sourceKey === undefined ? {} : { sourceKey: error.context.sourceKey }),
+    ...(error.context.componentSourceKey === undefined
+        ? {}
+        : { componentSourceKey: error.context.componentSourceKey }),
+    ...(error.context.expected === undefined ? {} : { expected: forLogField(error.context.expected) }),
+    ...(error.context.observed === undefined ? {} : { observed: forLogField(error.context.observed) }),
+});
+
+/**
+ * The message of an error THIS REPOSITORY composed, as a log field.
+ *
+ * Only called from a branch that has already narrowed the value to a
+ * first-party class — that narrowing is what makes reading a message legitimate
+ * at all, and `firstPartyMessage` in scripts/lib/logger.ts documents the
+ * obligation. A load refusal's sentence is the remedy half of the refusal
+ * ("aliases.jsonl does not match the digest manifest.json states; the release
+ * is not the reviewed artefact, so re-cut it"), and no code can carry it.
+ *
+ * The field is named for its PROVENANCE, matching `scripts/seed-dev.ts` and
+ * `scripts/catalog-import-usda.ts`, so a reader of a line or of
+ * `catalog_import_runs.log` can tell at a glance that the sentence was written
+ * here rather than quoted from a driver or a vendor.
+ */
+const firstPartyMessageField = (error: unknown): LogFields => {
+    const message = firstPartyMessage(error);
+
+    return message === undefined ? {} : { firstPartyMessage: message };
+};
+
+/**
+ * What the shared infrastructure remedy cannot know about THIS stage.
+ *
+ * A run that fails closes 'failed' and can therefore never be the newest
+ * succeeded `release_load` row, so the release that was active stays active
+ * with no compensating write, and re-running the same command is the repair —
+ * the cursor it saved makes the rerun continue after the last settled food, and
+ * re-reconciling a food that already matches the release is a no-op (this
+ * file's header, AAP §0.7.5). Stating that is the difference between an
+ * operator who fixes the database and runs the command again and one who starts
+ * hunting for a pointer to roll back.
+ *
+ * It names NO FLAG, which is why the import stage's clause could not be reused:
+ * that stage tells an operator to re-run with `--resume`, and this one has no
+ * such flag — its rerun continues from the checkpoint on its own. A remedy that
+ * names a flag the stage does not accept is worse than no clause at all.
+ */
+const RERUN_CLAUSE =
+    ' A load that stops this way leaves the active release pointer where it was, and re-running the same command is the repair: it continues from the checkpoint the stopped run saved, if it got as far as opening one, and re-reconciling a food that already matches the release writes nothing.';
+
 // Every error class this file can observe gets its own reported code; anything
 // unrecognised is reported through safeError under `unexpected_error` rather
 // than swallowed or printed raw.
@@ -5041,15 +5159,32 @@ const gapFields = (gaps: readonly PrerequisiteGap[]): LogFields => {
 // machine code and status, and deliberately no `message`: this value reaches the
 // durable run log and the operator console, where foreign prose can carry a
 // connection URL, a key or a fragment of the document that failed (CWE-532).
+// What replaces it is composed BY THIS FILE, per arm: the typed context its own
+// error class carries, the sentence it wrote itself, and fixed remedy prose.
 export const describeFailure = (error: unknown): { code: string; error: SafeErrorFields; detail?: LogFields } => {
     // This stage's own refusals first: they are the codes an operator acts on —
     // a digest mismatch means the artefact is not the reviewed one, a count
     // mismatch means the load did not produce what the release promised and the
     // pointer has not moved.
+    //
+    // And they are reported WITH THE CONTEXT THEY CARRY, like the stage-lock
+    // branch below and unlike the code alone this used to print: which member,
+    // which line, which key, and both sides of whatever disagreed. See
+    // catalogLoadErrorFields for why those travel as data, and
+    // firstPartyMessageField for why this arm may forward its sentence at all.
     if (isThrownInstanceOf(error, CatalogLoadError)) {
-        return { code: error.code, error: safeError(error) };
+        return {
+            code: error.code,
+            error: safeError(error),
+            detail: { ...catalogLoadErrorFields(error), ...firstPartyMessageField(error) },
+        };
     }
     if (isThrownInstanceOf(error, DatabaseOriginError)) {
+        // Deliberately WITHOUT its message, unlike the first-party arm above:
+        // a `DatabaseOriginError` explains itself by naming the host and the
+        // database it refused, and dbGuard reports that refusal itself with the
+        // target reduced to a digest. Forwarding the sentence here would publish
+        // the topology the guard's own line takes care to withhold.
         return { code: error.code, error: safeError(error) };
     }
     if (isThrownInstanceOf(error, ManifestError)) {
@@ -5068,7 +5203,37 @@ export const describeFailure = (error: unknown): { code: string; error: SafeErro
     if (isThrownInstanceOf(error, RateLimitConfigError)) {
         return { code: 'rate_limit_misconfigured', error: safeError(error) };
     }
-    return { code: 'unexpected_error', error: safeError(error) };
+    // THE DATABASE, which used to be reported as a surprise.
+    //
+    // A load takes the exclusive catalog-graph lock through checkpoint.ts's own
+    // `pg` session before the Prisma client is even constructed, so a database
+    // that will not accept a connection fails HERE — before Prisma exists to
+    // translate it — as a node-postgres `DatabaseError` whose `name` is the
+    // literal lower-case `'error'` and whose `code` is a five-character
+    // SQLSTATE. It matched none of the classes above, so the most ordinary
+    // failure this stage has was reported as
+    // `{"code":"unexpected_error","error":{"name":"error"}}`: no class, no
+    // SQLSTATE, no remedy, on a failure whose remedies ("raise the connection
+    // limit", "create the database", "fix the password") could not be further
+    // apart, while every other failure class in this file names itself.
+    //
+    // The taxonomy lives in scripts/lib/logger.ts so that all five stages give
+    // the same answer for the same SQLSTATE, and `safeError` now carries that
+    // SQLSTATE beside this code. It returns `null` for everything a stage owns
+    // — including a Prisma `P2002`, which is a unique-constraint violation
+    // wearing a database code — so this branch sits immediately before the
+    // fallback and leaves every arm above it untouched.
+    const infrastructure = classifyInfrastructureFailure(error);
+    if (infrastructure !== null) {
+        return {
+            code: infrastructure.code,
+            error: safeError(error),
+            detail: { remedy: `${infrastructure.remedy}${RERUN_CLAUSE}` },
+        };
+    }
+    // Genuinely unclassified, and it says so with something to do about it
+    // rather than with an empty hand.
+    return { code: 'unexpected_error', error: safeError(error), detail: { remedy: UNEXPECTED_FAILURE_REMEDY } };
 };
 
 const main = async (): Promise<number> => {

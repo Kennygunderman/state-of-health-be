@@ -63,12 +63,13 @@ import {
     parseLogPlannedMealCall,
     parseLogPlannedMealPath,
     parseLogPlannedMealRequest,
+    requireDateInPlanWeek,
     requireLoggableTarget,
 } from '../plannedMealLog.logic';
 // `plannedIngredientGrams` is the grocery side of the cross-domain traversal at
 // the end of this file; both modules are pure, so nothing is mocked.
 import { plannedIngredientGrams } from '../grocery.logic';
-import { PlanNotFoundError } from '../mealPlanning.errors';
+import { OutsidePlanWeekError, PlanNotFoundError } from '../mealPlanning.errors';
 // The one bound every revision parser in this layer shares, imported from the
 // module that publishes it rather than restated as a literal here.
 import { MAX_REVISION } from '../preferences.logic';
@@ -1484,8 +1485,14 @@ describe('requireLoggableTarget', () => {
         expect(() => requireLoggableTarget(target())).not.toThrow();
     });
 
-    it('answers one 404 for every refusal, so the response is no existence oracle', () => {
-        expect(() => requireLoggableTarget(target({ date: '2026-07-12' }))).toThrow(PlanNotFoundError);
+    it('answers one 404 for every BUCKET refusal, so the response is no existence oracle', () => {
+        // The four bucket verdicts — absent, someone else's, filed under another
+        // day, soft-deleted — must stay one indistinguishable answer, because
+        // each would otherwise say something about rows the caller does not own.
+        // The DATE is deliberately not in this list any more: production settles
+        // it first, through `requireDateInPlanWeek` below, and gets a typed 400
+        // naming the field instead (AAP 0.5.2 states the constraint as
+        // `date ∈ [plan.startDate, plan.endDate]`, a request-validity condition).
         expect(() => requireLoggableTarget(target({ diaryMeal: null }))).toThrow(PlanNotFoundError);
         expect(() =>
             requireLoggableTarget(target({ diaryMeal: diaryMeal({ user_id: OTHER_USER_ID }) })),
@@ -1500,12 +1507,82 @@ describe('requireLoggableTarget', () => {
         ).toThrow(PlanNotFoundError);
     });
 
+    it('still refuses an out-of-week date itself, the hole a caller that skipped the date rule would open', () => {
+        // Defence in depth rather than the production verdict. `requireLoggable-
+        // Target` is the whole-target gate, so dropping its week comparison
+        // would let a caller that has not called `requireDateInPlanWeek` file a
+        // log outside its own plan. What this path may NOT do is decide the
+        // status — hence two functions — so the class here is the conservative
+        // 404 and the typed 400 belongs to the rule below.
+        expect(() => requireLoggableTarget(target({ date: '2026-07-12' }))).toThrow(PlanNotFoundError);
+    });
+
     it('checks the plan week before it looks at the bucket', () => {
         // A date outside the week refuses even when the bucket is unreadable,
         // so the cheap check cannot be short-circuited by stored nonsense.
         expect(() =>
             requireLoggableTarget(target({ date: '2026-07-20', diaryMeal: diaryMeal({ date: 'garbage' }) })),
         ).toThrow(PlanNotFoundError);
+    });
+});
+
+describe('requireDateInPlanWeek', () => {
+    // The typed half of what used to be one 404 for two different inputs. A
+    // malformed date on this endpoint already answered
+    // `400 invalid_request [{date, invalid_date}]` while a well-formed date
+    // outside the plan week answered an untyped `404 "Plan not found"`, so one
+    // endpoint typed the two halves of one input differently and a client could
+    // not tell "wrong date" from "wrong plan" — it refetched a plan that was
+    // exactly where it left it.
+    it('passes for both ends of the week and every day inside it', () => {
+        const week = planWeek({ start_date: '2026-07-05', end_date: '2026-07-11' });
+
+        expect(() => requireDateInPlanWeek('2026-07-05', week)).not.toThrow();
+        expect(() => requireDateInPlanWeek('2026-07-08', week)).not.toThrow();
+        expect(() => requireDateInPlanWeek('2026-07-11', week)).not.toThrow();
+    });
+
+    it('throws OutsidePlanWeekError on either side of the window', () => {
+        const week = planWeek({ start_date: '2026-07-05', end_date: '2026-07-11' });
+
+        expect(() => requireDateInPlanWeek('2026-07-04', week)).toThrow(OutsidePlanWeekError);
+        expect(() => requireDateInPlanWeek('2026-07-12', week)).toThrow(OutsidePlanWeekError);
+        expect(() => requireDateInPlanWeek('2026-06-27', week)).toThrow(OutsidePlanWeekError);
+    });
+
+    // The detail pair is the whole point of the typed verdict: the controller
+    // renders it verbatim, and the client declares `outside_plan_week` in its
+    // detail-code vocabulary. A code the client can compare against but the
+    // server does not send — or the reverse — is the defect this checkpoint's
+    // sibling finding is about, so the string is asserted as a literal here.
+    it('carries the field and code the controller renders, as literals', () => {
+        try {
+            requireDateInPlanWeek('2026-07-12', planWeek());
+            throw new Error('expected requireDateInPlanWeek to throw');
+        } catch (error) {
+            expect(error).toBeInstanceOf(OutsidePlanWeekError);
+            expect((error as OutsidePlanWeekError).details).toEqual([
+                { field: 'date', code: 'outside_plan_week' },
+            ]);
+        }
+    });
+
+    it('refuses a date it cannot read rather than coercing it', () => {
+        expect(() => requireDateInPlanWeek('2026-02-30', planWeek({ start_date: '2026-02-25', end_date: '2026-03-03' }))).toThrow(
+            OutsidePlanWeekError,
+        );
+        expect(() => requireDateInPlanWeek('', planWeek())).toThrow(OutsidePlanWeekError);
+    });
+
+    // Stored nonsense is a data fault, not a request fault, so it must not be
+    // laundered into a 400 blaming the caller's date.
+    it('lets a stored-week data fault through as itself, not as a request refusal', () => {
+        expect(() =>
+            requireDateInPlanWeek('2026-07-08', planWeek({ start_date: '2026-07-11', end_date: '2026-07-05' })),
+        ).toThrow(PlannedMealLogDataError);
+        expect(() => requireDateInPlanWeek('2026-07-08', planWeek({ end_date: 'whenever' }))).toThrow(
+            PlannedMealLogDataError,
+        );
     });
 });
 

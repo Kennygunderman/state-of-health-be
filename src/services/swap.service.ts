@@ -129,13 +129,19 @@
 //    to a compatible recipe clear that meal's flags, and the candidate's
 //    compatibility was established by the selection itself. Nothing here reads
 //    a preference to reach that value; recomputing flags from preferences is
-//    `preferences.service.ts`'s, and stays one implementation.
+//    `preferences.service.ts`'s, and stays one implementation. The commit also
+//    REFRESHES the plan-level audit aggregate `meal_plans.incompatibility_flags`
+//    from the flags the meal rows now carry ({@link planFlagAuditRecord}),
+//    which is a read-back of derived state and not a second evaluation: the
+//    aggregate would otherwise keep naming a meal this swap has just made
+//    compatible.
 
 import { Prisma } from '../generated/prisma';
 import { prisma } from '../prisma/client';
 import {
     GroceryChangeSummary,
     LoggedPlannedEntry,
+    MealFlagCode,
     MealPlanDayResponse,
     MealPlanMacroTotals,
     MealPlanMealResponse,
@@ -162,6 +168,7 @@ import {
     LoggedPlannedEntryRow,
     formatPortionText,
     groupLoggedPlannedEntries,
+    readStoredFlags,
     readTargetsSnapshot,
     toMealPlanDayResponse,
     toMealPlanMealResponse,
@@ -176,7 +183,7 @@ import {
 import { buildRequestFingerprint } from './mealPlanningAction.logic';
 import { KeyedActionResult, runKeyedAction } from './mealPlanningAction.service';
 import { dayKeyInTimeZone, loadPreferencesRow } from './preferences.service';
-import { PlanningPreferences, isMealSlot, roundNutritionForDisplay } from './recipe.logic';
+import { PlanningPreferences, PREFERENCE_FLAG_CODES, isMealSlot, roundNutritionForDisplay } from './recipe.logic';
 import { RecipeVersionRow, mapSwapAlternative } from './recipe.mapper';
 import { getRecipeVersionDetail, getRecipeVersionRowsByIds, getRecipeVersionsForPlanning } from './recipe.service';
 import {
@@ -402,6 +409,78 @@ const loadLoggedEntries = async (
  * to this one helper so no call site carries a cast of its own.
  */
 const asJsonValue = (value: unknown): Prisma.InputJsonValue => value as Prisma.InputJsonValue;
+
+/** One planned meal as the plan-level flag aggregate reads it: its id and its stored flags. */
+interface PlanFlagAuditRow {
+    readonly id: string;
+    readonly flags: Prisma.JsonValue;
+}
+
+/** The audit record `meal_plans.incompatibility_flags` holds. */
+interface PlanFlagAuditRecord {
+    readonly flaggedMealIds: string[];
+    readonly codes: MealFlagCode[];
+    readonly recomputedAt: string;
+}
+
+/**
+ * The plan-level flag aggregate, composed from the flags the MEAL ROWS carry.
+ *
+ * `meal_plans.incompatibility_flags` is an AUDIT RECORD and never the source of
+ * truth — `MealPlanResponse.hasIncompatibilities` and `getAffectedMeals` both
+ * derive from the meals themselves — so this reads those meals back rather than
+ * re-deciding anything: a meal is flagged here exactly when its own `flags`
+ * column is non-empty. No preference is read and no eligibility is evaluated,
+ * which is what keeps `preferences.service.ts` the one implementation of the
+ * verdict (module header above).
+ *
+ * WHY THE SWAP WRITES IT AT ALL. §0.5.1 and §0.5.2 name this column as the
+ * plan-level aggregate maintained alongside `meal_plan_meals.flags`, and a swap
+ * clears the swapped meal's flags (§0.7.3). Left alone, the column would go on
+ * naming a meal the commit has just made compatible, and an operator or a later
+ * read path trusting it would report a flag that no longer exists. It is
+ * written in the SAME statement that bumps the plan's revision, so the
+ * aggregate and the meal rows can never be observed disagreeing.
+ *
+ * `flaggedMealIds` is in plan order (day date, then slot order) and `codes`
+ * follows `recipe.logic.ts::PREFERENCE_FLAG_CODES`, so this writer and
+ * `preferences.service.ts`'s produce the same shape in the same order for the
+ * same plan — two writers of one record that a reader cannot tell apart.
+ * `recomputedAt` is the commit's own instant: the record states when it was
+ * last derived, which is the only thing an audit record can honestly say.
+ */
+const planFlagAuditRecord = (meals: readonly PlanFlagAuditRow[], recomputedAt: Date): PlanFlagAuditRecord => {
+    const flaggedMealIds: string[] = [];
+    const present = new Set<MealFlagCode>();
+
+    for (const meal of meals) {
+        const flags = readStoredFlags(meal.flags);
+
+        if (flags.length === 0) {
+            continue;
+        }
+
+        flaggedMealIds.push(meal.id);
+
+        for (const flag of flags) {
+            present.add(flag.code);
+        }
+    }
+
+    const presentCodes = [...present];
+
+    return {
+        flaggedMealIds,
+        // The canonical order is WALKED rather than the set sorted: the order
+        // belongs to `PREFERENCE_FLAG_CODES` alone, exactly as
+        // `preferences.service.ts::orderedFlagCodes` reads it, so the two
+        // writers of this record cannot disagree about it. The filter is also
+        // what narrows that array's wider `PlanningEligibilityCode` element
+        // type back to the four flag codes, without a second list here.
+        codes: PREFERENCE_FLAG_CODES.flatMap((code) => presentCodes.filter((flagCode) => flagCode === code)),
+        recomputedAt: recomputedAt.toISOString(),
+    };
+};
 
 /* ---------------------------------------------------------------------------
  * The context every selection is made from
@@ -1390,6 +1469,20 @@ interface SwapWrite {
  * reporting a meal the selection has just established as compatible. The
  * `flags` member is separated from the rest only to pass it through
  * {@link asJsonValue}; every other column takes its value verbatim.
+ *
+ * AND THE PLAN'S `incompatibility_flags` AUDIT RECORD IS PART OF THE PLAN'S
+ * WRITE, for the same reason one statement further out. Clearing the meal's
+ * flags without refreshing the aggregate leaves the plan row naming a meal that
+ * is no longer flagged — the meal rows and the aggregate then disagree, and an
+ * operator reading the plan row directly is told about a conflict that the
+ * commit resolved. It is composed by {@link planFlagAuditRecord} from the meal
+ * rows as they now stand (read back after the meal write, so the cleared value
+ * is the one it sees) and folded into the SAME `updateMany` that increments the
+ * revision: one statement, so the two can never be observed out of step, and
+ * one revision bump, so a swap still costs a client exactly one stale-plan
+ * boundary. Written unconditionally — the plan row is being written regardless,
+ * so there is no "nothing changed" branch to get wrong, and the aggregate's own
+ * `recomputedAt` is what states how current it is.
  */
 const applySwap = async (tx: Prisma.TransactionClient, write: SwapWrite): Promise<number> => {
     const { context, candidate, userId } = write;
@@ -1423,9 +1516,22 @@ const applySwap = async (tx: Prisma.TransactionClient, write: SwapWrite): Promis
 
     requireSingleWrite(dayWritten.count, `meal_plan_days row of ${context.planId} on ${context.date}`);
 
+    // Read back AFTER the meal write, so the swapped meal's cleared flags are
+    // what the aggregate sees. Day date then slot order, the same ordering
+    // `preferences.service.ts` reads them in, so the two writers of this record
+    // list `flaggedMealIds` identically for the same plan.
+    const flaggedMeals = await tx.meal_plan_meals.findMany({
+        where: { meal_plan_id: context.planId, user_id: userId },
+        select: { id: true, flags: true },
+        orderBy: [{ meal_plan_days: { date: 'asc' } }, { sort_order: 'asc' }],
+    });
+
     const planWritten = await tx.meal_plans.updateMany({
         where: { id: context.planId, user_id: userId, revision: write.expectedPlanRevision },
-        data: { revision: { increment: 1 } },
+        data: {
+            revision: { increment: 1 },
+            incompatibility_flags: asJsonValue(planFlagAuditRecord(flaggedMeals, write.now)),
+        },
     });
 
     requireSingleWrite(planWritten.count, `meal_plans row ${context.planId}`);

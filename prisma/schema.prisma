@@ -584,9 +584,21 @@ model catalog_food_aliases {
   id              String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   catalog_food_id String        @db.Uuid
   alias           String
+  // STORED generated column, for the same reason and in the same shape as
+  // catalog_foods.search_vector: the alias full-text branch of the catalog
+  // search tests `@@` against it, and testing a projected to_tsvector() instead
+  // made that branch read every alias in the table on every request. The
+  // generated expression lives only in the migration because Prisma cannot
+  // express it, and the generated client omits Unsupported fields, so this
+  // stays optional to keep create() calls compiling. The GIN index over it is
+  // declarable and is declared below.
+  search_vector   Unsupported("tsvector")?
   catalog_foods   catalog_foods @relation(fields: [catalog_food_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
 
   @@unique([catalog_food_id, alias])
+  // Mirrors the GIN index the migration creates by hand, so the schema-diff gate
+  // does not read it as drift. map: pins the migration's index name.
+  @@index([search_vector(ops: raw("tsvector_ops"))], map: "idx_catalog_food_aliases_search_vector", type: Gin)
 }
 
 // Portion -> gram conversions, the only way a recipe or grocery quantity leaves
@@ -873,7 +885,18 @@ model meal_plans {
   // item or action of one user structurally unable to reference another user's
   // plan. id is already unique, so no row is newly restricted.
   @@unique([id, user_id])
-  @@index([user_id, status, start_date])
+  // Shaped to the plan-lifecycle statement, which is the only read of this table
+  // that is not already better served elsewhere: it selects every plan of one
+  // user and orders by (start_date, id), carrying no status predicate because
+  // current/upcoming resolution and the week-overlap check classify the rows in
+  // memory. Leading with start_date and carrying id turns that into an ordered
+  // index scan with no Sort node. The status-filtered reads (active plans whose
+  // end_date has not passed) are served by the partial unique index
+  // unique_active_meal_plan_start_date, which indexes only active rows and is
+  // therefore narrower than any composite leading with status could be — which
+  // is why AAP §0.5.1's literal (user_id, status, start_date) measured zero
+  // index scans across the whole read workload before this change.
+  @@index([user_id, start_date, id])
 }
 
 model meal_plan_days {

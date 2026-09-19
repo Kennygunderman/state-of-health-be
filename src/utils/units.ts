@@ -711,3 +711,345 @@ export const formatCount = (portions: number, portion: CountPortionMeasure): Dis
     const unit = pluralizeCount(value, noun);
     return { value, unit, text: `${value} ${unit}` };
 };
+
+/* ---------------------------------------------------------------------------
+ * Ingredient display — the recipe card's own convention
+ *
+ * A SECOND display contract, deliberately separate from the grocery one above.
+ * A grocery row is something you buy, so it promotes to the largest unit that
+ * stays >= 1 and rounds cups to a quarter; a recipe row is something you
+ * MEASURE, so it keeps the unit the recipe authored and reads in the fractions
+ * a cook works in. `formatMass`, `formatVolume`, `formatInUnit`, `formatCount`
+ * and `formatQuarters` are the grocery contract and are untouched by anything
+ * below.
+ *
+ * The client renders recipe rows itself — the API returns each ingredient's
+ * AUTHORED `display_text` and the whole-recipe quantity, and the portion
+ * toggle scales in the app — so this convention exists twice by necessity:
+ * here, and mirrored in `mobile/src/utility/ServingsUtility.ts`. The two are
+ * kept in step by shape (same sets, same ladder, same rules) and proven in
+ * step by the seed corpus: recomputing every authored row reproduces its own
+ * `display_text`.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * The fraction stops a recipe amount may land on, smallest first.
+ *
+ * The five glyphs the design writes (frame 12's "⅓ cup", the log screen's
+ * fraction chips) plus the two bounds the snap needs: 0, which renders as the
+ * whole number alone, and 1, which carries into it. A recipe amount is never
+ * rendered as a bare decimal in these units — "0.31 cup" is not a measurement
+ * a cook can act on, and the amount was only ever approximate once a portion
+ * divided it.
+ */
+const FRACTION_LADDER: readonly { readonly value: number; readonly glyph: string }[] = [
+    { value: 0, glyph: '' },
+    { value: 0.25, glyph: '¼' },
+    { value: 1 / 3, glyph: '⅓' },
+    { value: 0.5, glyph: '½' },
+    { value: 2 / 3, glyph: '⅔' },
+    { value: 0.75, glyph: '¾' },
+    { value: 1, glyph: '' },
+];
+
+const SMALLEST_FRACTION_INDEX = 1;
+const CARRY_FRACTION_INDEX = FRACTION_LADDER.length - 1;
+
+// Two stops count as equidistant when their distances differ by less than this.
+//
+// An exact comparison would make the tie rule below depend on binary
+// representation rather than on arithmetic: a third of 1¼ cups is exactly 5/12,
+// the true midpoint between ⅓ and ½, but the nearest double to it sits a hair
+// BELOW that midpoint, so `1.25 * (1 / 3)` would take ⅓ while `(1.25 / 3)`
+// takes ½ — the same amount rendered two ways by two call sites that agree.
+// The closest two real stops are ¼ and ⅓, 0.083 apart, so a tolerance eight
+// orders of magnitude smaller separates genuine ties from genuine differences
+// and nothing else.
+const FRACTION_TIE_EPSILON = 1e-9;
+
+/** A snapped recipe amount: what to print, and the number it now stands for. */
+export interface SnappedAmount {
+    /** The rendered amount, with no unit: "2", "¾", "1¼". */
+    text: string;
+    /**
+     * The number `text` stands for, which is what decides the unit's plural.
+     * Snapped, not the input: "¾" of a cup is one cup, "1¼" is two.
+     */
+    value: number;
+}
+
+/**
+ * A recipe amount on the fraction ladder.
+ *
+ * The fractional part takes the NEAREST stop, and a tie takes the larger one —
+ * a cook measuring 0.125 of a cup reaches for the quarter, not for nothing. A
+ * snap to 1 carries into the whole, so 1.9 cups reads "2 cups" and never
+ * "1 cups". A positive amount that would round away to nothing renders as the
+ * smallest stop instead, for the same reason `clampPositiveToOne` exists: a
+ * row the recipe needs must not read as none of it.
+ */
+export const snapToFraction = (value: number): SnappedAmount => {
+    assertFiniteQuantity(value, 'quantity');
+
+    const negative = value < 0;
+    const sign = negative ? '-' : '';
+    const signFactor = negative ? -1 : 1;
+    const magnitude = Math.abs(value);
+    const wholeOfInput = Math.floor(magnitude);
+    const fraction = magnitude - wholeOfInput;
+
+    let stop = 0;
+    let bestDistance = Math.abs(fraction - FRACTION_LADDER[0].value);
+    for (let index = 1; index < FRACTION_LADDER.length; index += 1) {
+        // Within the tie tolerance of the best so far counts as equal, and the
+        // later — larger — stop wins it: a cook measuring midway between an
+        // eighth and a quarter of a cup reaches for the quarter.
+        const distance = Math.abs(fraction - FRACTION_LADDER[index].value);
+        if (distance <= bestDistance + FRACTION_TIE_EPSILON) {
+            stop = index;
+            bestDistance = distance;
+        }
+    }
+
+    const carries = stop === CARRY_FRACTION_INDEX;
+    let whole = carries ? wholeOfInput + 1 : wholeOfInput;
+    let glyph = carries ? '' : FRACTION_LADDER[stop].glyph;
+
+    if (whole === 0 && glyph === '' && magnitude > 0) {
+        glyph = FRACTION_LADDER[SMALLEST_FRACTION_INDEX].glyph;
+        stop = SMALLEST_FRACTION_INDEX;
+    }
+    if (glyph === '' && whole === 0) {
+        // A true zero prints as 0, matching `formatQuarters`.
+        return { text: `${sign}0`, value: 0 };
+    }
+
+    const snapped = whole + (glyph === '' ? 0 : FRACTION_LADDER[stop].value);
+    // Whole and fraction sit adjacent, with no space: "1¼".
+    const text = glyph === '' ? `${sign}${String(whole)}` : `${sign}${whole === 0 ? '' : String(whole)}${glyph}`;
+
+    return { text, value: signFactor * snapped };
+};
+
+/** How precisely a recipe amount in a given unit is written. */
+export type IngredientUnitPrecision = 'integer' | 'tenth' | 'fraction';
+
+// Base units, where a fraction of one is below what any kitchen scale reads:
+// grams and millilitres are written whole. "187½ g" is a measurement nobody
+// takes; 188 g is.
+const INTEGER_PRECISION_UNITS: ReadonlySet<string> = new Set([
+    'g',
+    'gram',
+    'grams',
+    'mg',
+    'milligram',
+    'milligrams',
+    'ml',
+    'milliliter',
+    'milliliters',
+    'millilitre',
+    'millilitres',
+]);
+
+// Larger and derived measures, read off a scale or a jug rather than measured
+// in spoons: a tenth is the precision such a number is worth.
+const TENTH_PRECISION_UNITS: ReadonlySet<string> = new Set([
+    'kg',
+    'kilogram',
+    'kilograms',
+    'oz',
+    'ounce',
+    'ounces',
+    'lb',
+    'lbs',
+    'pound',
+    'pounds',
+    'l',
+    'liter',
+    'liters',
+    'litre',
+    'litres',
+    'fl oz',
+    'fluid ounce',
+    'fluid ounces',
+]);
+
+/**
+ * The precision a recipe amount in `unit` is written to.
+ *
+ * Kitchen measures (cups, spoons) and counted things (cloves, slices, an
+ * unrecognised token, no unit at all) take fraction glyphs, because that is
+ * how the measure itself works and how the design draws it. Weights and
+ * volumes read off an instrument take numbers.
+ */
+export const ingredientUnitPrecision = (unit: string): IngredientUnitPrecision => {
+    const key = normaliseUnit(unit);
+
+    if (INTEGER_PRECISION_UNITS.has(key)) {
+        return 'integer';
+    }
+    if (TENTH_PRECISION_UNITS.has(key)) {
+        return 'tenth';
+    }
+    return 'fraction';
+};
+
+/**
+ * A recipe amount written to its unit's numeric precision.
+ *
+ * Clamped away from zero at a tenth: an ingredient the recipe needs never
+ * reads as "0 g" because a portion divided it below a gram.
+ */
+export const roundIngredientAmount = (value: number, precision: 'integer' | 'tenth'): SnappedAmount => {
+    assertFiniteQuantity(value, 'quantity');
+
+    const rounded = precision === 'integer' ? roundToInteger(value) : roundToTenth(value);
+    if (rounded !== 0 || value === 0) {
+        return { text: renderDecimal(rounded), value: rounded };
+    }
+
+    const tenth = roundToTenth(value);
+    const smallest = 1 / TENTHS_PER_UNIT;
+    const floored = tenth !== 0 ? tenth : Math.sign(value) * smallest;
+
+    return { text: renderDecimal(floored), value: floored };
+};
+
+// Count units that name nothing: the design shows "¼" for a quarter of an
+// avocado, never "¼ each". The catalog stores such a row with an explicit
+// placeholder unit, so the placeholder has to be dropped at the point of
+// display rather than wished out of the data.
+const GENERIC_COUNT_UNITS: ReadonlySet<string> = new Set(['each', 'whole', 'piece', 'pieces', 'count']);
+
+/** Whether `unit` is a count placeholder that names nothing and is not printed. */
+export const isGenericCountUnit = (unit: string): boolean => GENERIC_COUNT_UNITS.has(normaliseUnit(unit));
+
+// Symbols, not words: "8 tbsp" and "24 oz" are already correct at any amount,
+// and "8 tbsps" is not a form anyone writes. Everything else in a recipe's
+// unit column is an English noun and inflects.
+const INVARIANT_UNIT_ABBREVIATIONS: ReadonlySet<string> = new Set([
+    'g',
+    'kg',
+    'mg',
+    'ml',
+    'l',
+    'oz',
+    'lb',
+    'lbs',
+    'tsp',
+    'tbsp',
+    'fl oz',
+]);
+
+/** Whether `unit` is an abbreviation, which is written the same at every amount. */
+export const isInvariantUnitAbbreviation = (unit: string): boolean =>
+    INVARIANT_UNIT_ABBREVIATIONS.has(normaliseUnit(unit));
+
+/**
+ * A unit word in the number `amount` calls for: "2 cups", "1 cup", "½ cup",
+ * "4 cloves".
+ *
+ * The sibling of {@link pluralizeCount}, and separate from it because the two
+ * answer "how many" differently. A grocery count row is a whole number of
+ * items, so `pluralizeCount` reads the singular off `count === 1`. A recipe
+ * amount is continuous — half a cup, one and a quarter cups — so the plural
+ * turns on `amount > 1`, which is the same rule `unitWord` applies to the
+ * grocery list's own cup tier. Without it, halving an authored "3 cloves"
+ * reads "½ cloves".
+ *
+ * A unit the recipe already wrote in the plural is inflected in whichever
+ * direction it needs, so a seed that spells both `cup` and `cups` still reads
+ * "1 cup" and "3 cups".
+ */
+export const pluralizeUnit = (amount: number, unit: string): string => {
+    const word = unit.trim();
+
+    if (word.length === 0 || isInvariantUnitAbbreviation(word) || !Number.isFinite(amount)) {
+        return word;
+    }
+
+    const match = headNounMatch(word);
+    if (!match) {
+        return word;
+    }
+
+    const noun = match[0];
+    const wantsSingular = !(Math.abs(amount) > 1);
+
+    // Nothing to do when the unit is already in the number asked for.
+    if (wantsSingular !== alreadyPlural(noun)) {
+        return word;
+    }
+
+    const inflected = matchCase(noun, wantsSingular ? singularizeWord(noun) : pluralizeWord(noun));
+
+    return word.slice(0, match.index) + inflected + word.slice(match.index + noun.length);
+};
+
+/**
+ * A recipe ingredient amount as the recipe card renders it: "6.2 oz",
+ * "1¼ cups", "⅓ cup", "188 g", "2 cloves", "¼".
+ *
+ * The ingredient's OWN unit is kept — a recipe that says 5 oz of chicken must
+ * not start saying 0.3 lb — and the unit is printed only when it names
+ * something.
+ */
+export const formatIngredientAmount = (value: number, unit: string): string => {
+    assertFiniteQuantity(value, 'quantity');
+
+    const label = unit.trim();
+    const precision = ingredientUnitPrecision(label);
+    const amount = precision === 'fraction' ? snapToFraction(value) : roundIngredientAmount(value, precision);
+
+    if (label.length === 0 || isGenericCountUnit(label)) {
+        return amount.text;
+    }
+
+    return `${amount.text} ${pluralizeUnit(amount.value, label)}`;
+};
+
+const QUALIFIER_BOUNDARY_PATTERN = /^[\s,(]/;
+const CONTAINS_DIGIT_PATTERN = /\d/;
+
+/**
+ * The phrasing an authored `display_text` carries beyond its own amount and
+ * unit: ", chopped", " leaves", " banana", " medium".
+ *
+ * Recomputing an amount for a portion would otherwise throw this away, and it
+ * is the part of the row a cook acts on — "¼ cup" and "¼ cup, chopped" send
+ * you to different places.
+ *
+ * SELF-VERIFYING, which is what makes it safe to append to a recomputed
+ * amount: the qualifier is whatever remains after this module's OWN rendering
+ * of the row's stored amount, and it is returned only when that rendering is
+ * genuinely the authored text's prefix. A seed row whose text disagrees with
+ * its own columns — 320 g labelled "2 cups, drained" — therefore contributes
+ * no qualifier at all rather than a mangled one, and a remainder that carries
+ * digits is treated as bound to the amount it was written for ("(4 medium)")
+ * and dropped once that amount changes. The boundary check keeps a bare
+ * numeric prefix from splitting a number in half.
+ */
+export const authoredAmountQualifier = (
+    displayText: string | null | undefined,
+    value: number,
+    unit: string,
+): string => {
+    if (displayText === null || displayText === undefined || !Number.isFinite(value)) {
+        return '';
+    }
+
+    const authored = displayText.trim();
+    const rendered = formatIngredientAmount(value, unit);
+
+    if (authored.length === 0 || !authored.startsWith(rendered)) {
+        return '';
+    }
+
+    const qualifier = authored.slice(rendered.length);
+    if (qualifier.length === 0) {
+        return '';
+    }
+
+    return QUALIFIER_BOUNDARY_PATTERN.test(qualifier) && !CONTAINS_DIGIT_PATTERN.test(qualifier) ? qualifier : '';
+};
+

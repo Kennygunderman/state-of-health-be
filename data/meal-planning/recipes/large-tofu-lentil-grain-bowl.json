@@ -1,0 +1,112 @@
+{
+  "slug": "large-tofu-lentil-grain-bowl",
+  "name": "Large tofu, lentil and quinoa bowl",
+  "description": "Seared firm tofu and cooked lentils over cooked quinoa with steamed broccoli and spinach, dressed with lemon and a little olive oil — a large grain bowl for a high calorie and protein target.",
+  "iconKey": "bowl",
+  "instructions": [
+    "Press the tofu dry, cut it into cubes and sear it in the olive oil over medium-high heat for 5 minutes, turning once.",
+    "Steam the broccoli florets for 4 minutes, until just tender.",
+    "Warm the cooked quinoa and the cooked lentils together in the pan for 2 minutes, then fold in the spinach and the salt off the heat.",
+    "Pile the quinoa and lentils into a large bowl, add the broccoli and the tofu, and squeeze the lemon over the top."
+  ],
+  "yieldServings": 1,
+  "servingDescription": "1 large bowl",
+  "prepMinutes": 6,
+  "cookMinutes": 9,
+  "mealSlots": [
+    "lunch",
+    "dinner"
+  ],
+  "dietTags": [
+    "gluten_free",
+    "pescatarian",
+    "vegan",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "soy"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 2,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "dairy_free",
+    "vegan",
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:172448",
+      "quantity": 420,
+      "unit": "g",
+      "gramWeight": 420,
+      "displayText": "420 g, cubed",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:172421",
+      "quantity": 1,
+      "unit": "cup",
+      "gramWeight": 198,
+      "displayText": "1 cup",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168917",
+      "quantity": 0.5,
+      "unit": "cup",
+      "gramWeight": 93,
+      "displayText": "½ cup",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170379",
+      "quantity": 1,
+      "unit": "cup",
+      "gramWeight": 88,
+      "displayText": "1 cup, chopped",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168462",
+      "quantity": 3,
+      "unit": "cup",
+      "gramWeight": 90,
+      "displayText": "3 cups",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:167746",
+      "quantity": 0.25,
+      "unit": "each",
+      "gramWeight": 21,
+      "displayText": "¼ lemon",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 0.33,
+      "unit": "tbsp",
+      "gramWeight": 4.5,
+      "displayText": "⅓ tbsp",
+      "sortOrder": 6,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 3,
+      "displayText": "½ tsp",
+      "sortOrder": 7,
+      "isOptional": false
+    }
+  ]
+}

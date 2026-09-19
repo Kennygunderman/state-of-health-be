@@ -34,6 +34,7 @@ import {
     BUDGET_TIER_2_MAX_PER_MEAL,
     CALORIE_TOLERANCE_RATIO,
     DEFAULT_PORTION_POLICY,
+    DayToleranceBands,
     EXTENDED_PORTION_POLICY,
     GeneratedPlan,
     MACRO_TOLERANCE_ABSOLUTE_G,
@@ -56,6 +57,7 @@ import {
     PlannedMealAssignment,
     PlanSeedInputs,
     REUSE_BONUS_CAP,
+    RemainingContributionBounds,
     SNACK_PORTION_MULTIPLIERS,
     ScoredCandidate,
     addDaysToDayKey,
@@ -63,10 +65,13 @@ import {
     baselineCandidateRanks,
     budgetPenalty,
     buildPlanCandidates,
+    canReachDayBands,
     candidatesForSlot,
     checkStartDateWindow,
     compareCandidateMoves,
     computeDayTotals,
+    dayHasFeasibleAssignment,
+    dayToleranceBands,
     daysBetweenDayKeys,
     derivePlanSeed,
     derivePortionUnit,
@@ -94,6 +99,7 @@ import {
     plansOverlap,
     portableCandidateIdentity,
     portionMultipliersForSlot,
+    remainingContributionBounds,
     requireNonConflictingWeek,
     requireWritablePlan,
     resolveCurrentAndUpcoming,
@@ -106,6 +112,8 @@ import {
     scheduleCumulativeShares,
     scheduleSlots,
     searchPlanWeek,
+    slotContributionBounds,
+    someCandidateClosesDay,
     startDateWindow,
     targetProximity,
     toPlanningPreferences,
@@ -452,6 +460,90 @@ const feasibleCatalog = (): PlanRecipeCandidate[] => [
     ...['l1', 'l2', 'l3', 'l4'].map((slug) => makeRecipe({ slug, slots: ['lunch'], calories: 700 })),
     ...['d1', 'd2', 'd3', 'd4'].map((slug) => makeRecipe({ slug, slots: ['dinner'], calories: 800 })),
 ];
+
+/* ---------------------------------------------------------------------------
+ * The jointly-infeasible pool — what "nothing here closes a day" has to look
+ * like now that the search carries an admissibility bound.
+ *
+ * Every budget, exhaustion and probe fixture needs a catalog the search cannot
+ * close but CAN spend its allowance on. A pool that misses the target on
+ * calories alone no longer qualifies: the bound adds up what the unfilled slots
+ * could still contribute and rejects such a branch before placing anything, so
+ * the search settles in a handful of evaluations and reports a proven
+ * infeasibility rather than a spent budget. That is the right answer for those
+ * pools, and it is why the fixtures below are built the other way round —
+ * every band is individually reachable and no assignment satisfies all four at
+ * once.
+ *
+ * Two families per slot, at the same calories and carbs:
+ *   protein-only  {600 kcal, 100 g P,  50 g C,   0 g F}
+ *   fat-only      {600 kcal,   0 g P,  50 g C,  60 g F}
+ *
+ * Write sA for the sum of the portion multipliers a day places on protein-only
+ * recipes and sB for the sum on fat-only ones, each multiplier drawn from
+ * {0.5 … 2}. Against the 2,000 kcal target the day bands are calories
+ * [1800, 2200], protein [135, 175], carbs [170, 230] and fat [50, 80], so:
+ *
+ *   protein  100·sA ≤ 175   ⇒  sA ≤ 1.75
+ *   fat       60·sB ≤  80   ⇒  sB ≤ 4/3
+ *   carbs     50·(sA + sB) ≥ 170  ⇒  sA + sB ≥ 3.4
+ *
+ * and sA + sB ≤ 1.75 + 4/3 = 3.083…, which is below 3.4. No assignment closes
+ * a day — asserted by enumeration in "the jointly-infeasible pool" below rather
+ * than left to this comment.
+ *
+ * What the bound sees at the first slot is the other half of the fixture: over
+ * three slots the pool can contribute 0–600 g protein, 0–360 g fat, 900–3,600
+ * kcal and 75–300 g carbs, and every band lies inside its own interval. The
+ * bound therefore admits the first slot, the search places its way through
+ * breakfast and lunch, and only at dinner — where the remaining contribution is
+ * zero and the bound becomes the day tolerance itself — is every candidate
+ * rejected. That is what spends the allowance.
+ */
+const PROTEIN_ONLY_SERVING: MealPlanMacroTotals = { calories: 600, protein: 100, carbs: 50, fat: 0 };
+const FAT_ONLY_SERVING: MealPlanMacroTotals = { calories: 600, protein: 0, carbs: 50, fat: 60 };
+
+/**
+ * Recipes per family per slot. Eight is the floor at which the day guard fires
+ * rather than the search settling; twelve leaves the fixtures margin against a
+ * future move-order change without making them slow.
+ */
+const JOINTLY_INFEASIBLE_PER_FAMILY = 12;
+
+interface JointlyInfeasibleOptions {
+    /** Cooking time, for the probe fixtures that relax a time limit. */
+    totalMinutes?: number;
+    /** Slug prefix, for fixtures that hold two of these pools at once. */
+    prefix?: string;
+    /** How many recipes per family; defaults to {@link JOINTLY_INFEASIBLE_PER_FAMILY}. */
+    perFamily?: number;
+}
+
+/** One slot's worth of the pool described above. */
+const jointlyInfeasibleSlot = (
+    slot: MealSlot,
+    { totalMinutes, prefix = '', perFamily = JOINTLY_INFEASIBLE_PER_FAMILY }: JointlyInfeasibleOptions = {},
+): PlanRecipeCandidate[] =>
+    (
+        [
+            ['p', PROTEIN_ONLY_SERVING],
+            ['f', FAT_ONLY_SERVING],
+        ] as const
+    ).flatMap(([family, nutrition]) =>
+        Array.from({ length: perFamily }, (_unused, index) =>
+            makeRecipe({
+                slug: `${prefix}${slot}-${family}${String(index).padStart(2, '0')}`,
+                slots: [slot],
+                calories: 0,
+                nutrition,
+                totalMinutes,
+            }),
+        ),
+    );
+
+/** The pool above across all three main slots. */
+const jointlyInfeasibleCatalog = (options: JointlyInfeasibleOptions = {}): PlanRecipeCandidate[] =>
+    (['breakfast', 'lunch', 'dinner'] as MealSlot[]).flatMap((slot) => jointlyInfeasibleSlot(slot, options));
 
 /** Every `(slug, version, portionMultiplier)` triple the plan placed, per slot. */
 const portableIdentities = (plan: GeneratedPlan): string[] =>
@@ -2144,7 +2236,7 @@ describe('generateWeeklyPlan', () => {
             expect(completions).toHaveLength(0);
         });
 
-        it('still finds a valid day by backtracking out of that prefix', () => {
+        it('still finds a valid day, and now without placing that prefix at all', () => {
             const result = plan(catalog());
 
             for (const day of result.days) {
@@ -2153,13 +2245,27 @@ describe('generateWeeklyPlan', () => {
             }
 
             // Every accepted day had to abandon the greedy 500 + 700 prefix.
+            // THIS is what proves the dead end was refused; the count below only
+            // says what refusing it cost.
             for (const day of result.days) {
                 const [breakfast, lunch] = day.meals;
 
                 expect(breakfast.planned.calories + lunch.planned.calories).not.toBeCloseTo(1200, 6);
             }
 
-            expect(result.evaluations).toBeGreaterThan(PLAN_DAY_COUNT * 3);
+            // One placement per meal and not a single one more — the theoretical
+            // floor for a seven-day, three-slot week. The dead-end prefix is
+            // rejected by the admissibility bound BEFORE the 700 kcal lunch is
+            // placed: with 500 already on the day and dinner able to contribute
+            // at most 1,100 more at its smallest offered portion, no completion
+            // can land inside the calorie band, and the bound says so without
+            // descending. The behaviour under test is unchanged — the greedy
+            // prefix still loses — and what changed is that losing it is free.
+            //
+            // Placement-and-unwind backtracking is therefore asserted by the
+            // week-level fixture below and by the accumulating per-day counter
+            // in `searchPlanWeek`, not here.
+            expect(result.evaluations).toBe(PLAN_DAY_COUNT * 3);
         });
     });
 
@@ -2430,24 +2536,55 @@ describe('generateWeeklyPlan', () => {
             expect(second.evaluations).toBe(first.evaluations);
         });
 
-        it('plans a recipe in two slots of one day, which §0.7.3 permits', () => {
-            // The end-to-end half of the repetition rule: this week is closed
-            // with same-day pairs, so a generator carrying the old unwritten
-            // same-day ban could not have returned it at all. Both uses are
-            // inside the weekly cap, which the test above asserts for the same
-            // week.
+        it('gives the day three distinct recipes, while §0.7.3 still permits a pair', () => {
+            // THE END-TO-END HALF OF THE SAME-DAY FIX. A user who is served the
+            // same dish at lunch and at dinner reads that as a broken plan, and
+            // the generator used to do it here — this very fixture closed its
+            // week with same-day pairs. It is now closed without one.
+            //
+            // The rule underneath is UNCHANGED, and the second assertion is what
+            // says so: §0.7.3 states repetition as exactly two clauses, a weekly
+            // cap and an adjacent-day exclusion, and a second use on the same day
+            // breaks neither. So no week the AAP permits became illegal; a
+            // preference in the move order chose between the legal weeks, which
+            // is the only place such a preference can live without narrowing the
+            // rule. The next test proves the pair is still reachable when it is
+            // the only way to close a day.
             const result = plan(catalog());
-            const daysWithARepeat = result.days.filter((day) => {
+
+            for (const day of result.days) {
                 const slugs = day.meals.map((meal) => meal.slug);
 
-                return new Set(slugs).size < slugs.length;
-            });
-
-            expect(daysWithARepeat.length).toBeGreaterThan(0);
-
-            for (const day of daysWithARepeat) {
+                expect(new Set(slugs).size).toBe(slugs.length);
                 expect(isDayWithinTolerance(day.plannedTotals, TARGETS)).toBe(true);
             }
+
+            const none: ReadonlySet<string> = new Set();
+
+            expect(violatesRepetitionRule('r', 1, none, none)).toBe(false);
+        });
+
+        it('still closes a day by repeating a recipe when that is the only way', () => {
+            // THE PREFERENCE IS NOT A BAN, proved where it is decidable.
+            //
+            // One recipe serves both lunch and dinner and nothing else does, so
+            // the ONLY assignment that closes a day repeats it: 500 + 750 + 750
+            // lands on the 2,000 target. Day 1 then has no lunch left — the two
+            // permitted uses are spent and the adjacent-day clause would refuse
+            // it anyway — so the week cannot be completed and no plan comes back
+            // to inspect. The frontier is what tells the story instead: it sits
+            // on day 1, which can only mean day 0 CLOSED, and day 0 could only
+            // close by serving one recipe twice. Were the preference a ban, day 0
+            // would be the frontier.
+            const sharedLunchAndDinner: PlanRecipeCandidate[] = [
+                ...['b1', 'b2'].map((slug) => makeRecipe({ slug, slots: ['breakfast'], calories: 500 })),
+                makeRecipe({ slug: 'shared', slots: ['lunch', 'dinner'], calories: 750 }),
+            ];
+
+            const outcome = searchFor(sharedLunchAndDinner);
+
+            expect(outcome.days).toBeNull();
+            expect(outcome.frontierDayIndex).toBe(1);
         });
 
         it('keeps the day-after exclusion for a recipe whose same-day pair was unwound', () => {
@@ -2477,19 +2614,11 @@ describe('generateWeeklyPlan', () => {
     });
 
     describe('the budget fixture', () => {
-        // Twenty recipes per slot, none of which can reach the day target at any
-        // offered portion: the search has plenty to try and nothing that works,
-        // so it spends its per-day allowance and stops.
-        const catalog = (): PlanRecipeCandidate[] =>
-            (['breakfast', 'lunch', 'dinner'] as MealSlot[]).flatMap((slot) =>
-                Array.from({ length: 20 }, (_unused, index) =>
-                    makeRecipe({
-                        slug: `${slot}-${String(index).padStart(2, '0')}`,
-                        slots: [slot],
-                        calories: 60 + index,
-                    }),
-                ),
-            );
+        // Twenty-four recipes per slot, no assignment of which closes a day, and
+        // no band the bound can rule out on its own: the search has plenty to
+        // try and nothing that works, so it spends its per-day allowance and
+        // stops. See "the jointly-infeasible pool" for the arithmetic.
+        const catalog = jointlyInfeasibleCatalog;
 
         it('reports exhaustion as an infeasible week, never as a server failure', () => {
             let thrown: unknown;
@@ -2512,30 +2641,26 @@ describe('generateWeeklyPlan', () => {
         });
     });
 
-    describe('the thin-slot exhaustion fixture', () => {
-        // Twenty breakfasts and twenty lunches that can never reach the day
-        // target, plus only THREE dinners — one short of
-        // MIN_ELIGIBLE_RECIPES_PER_SLOT. Both things are true at once, which is
-        // the whole point: the catalog is thin AND the search ran out of
-        // evaluations, so a verdict built from the counts alone would blame the
-        // dinner shelf for a week whose numbers were never settled.
+    describe('the thin-slot fixture', () => {
+        // The jointly-infeasible pool at breakfast and lunch, plus only THREE
+        // dinners — one short of MIN_ELIGIBLE_RECIPES_PER_SLOT, and all of them
+        // from the fat-only family, which keeps the pool's arithmetic intact.
+        //
+        // WHAT THIS FIXTURE NOW SHOWS, which is not what it used to. It was
+        // built when a pool like this exhausted an allowance: the catalog was
+        // thin AND the numbers were never settled, so the verdict had to name
+        // both. The day is now recognised as unfillable before it is paid for,
+        // so the search SETTLES — and the verdict follows the shipped gate to
+        // the shelf alone, because a settled refusal on a thin slot has a
+        // simpler story than one that ran out of room to look. The tolerance row
+        // belongs to the pools whose slots are all adequately stocked and whose
+        // numbers still cannot be met; the protein-scarce and 3,000-kcal cases
+        // below pin it there.
         const catalog = (): PlanRecipeCandidate[] => [
-            ...Array.from({ length: 20 }, (_unused, index) =>
-                makeRecipe({
-                    slug: `breakfast-${String(index).padStart(2, '0')}`,
-                    slots: ['breakfast'],
-                    calories: 60 + index,
-                }),
-            ),
-            ...Array.from({ length: 20 }, (_unused, index) =>
-                makeRecipe({
-                    slug: `lunch-${String(index).padStart(2, '0')}`,
-                    slots: ['lunch'],
-                    calories: 60 + index,
-                }),
-            ),
+            ...jointlyInfeasibleSlot('breakfast'),
+            ...jointlyInfeasibleSlot('lunch'),
             ...['dinner-0', 'dinner-1', 'dinner-2'].map((slug) =>
-                makeRecipe({ slug, slots: ['dinner'], calories: 100 }),
+                makeRecipe({ slug, slots: ['dinner'], calories: 0, nutrition: FAT_ONLY_SERVING }),
             ),
         ];
 
@@ -2551,7 +2676,7 @@ describe('generateWeeklyPlan', () => {
             throw new Error('expected NoMatchingMealsError');
         };
 
-        it('is genuinely thin in one slot and genuinely exhausted', () => {
+        it('is genuinely thin in one slot, and settles rather than exhausting', () => {
             const preferences = makePreferences();
             const candidates = buildPlanCandidates(catalog(), preferences, derivePlanSeed(makeSeedInputs()));
 
@@ -2559,38 +2684,41 @@ describe('generateWeeklyPlan', () => {
             expect(eligibleRecipeCountForSlot(candidates, preferences, 'dinner')).toBeLessThan(
                 MIN_ELIGIBLE_RECIPES_PER_SLOT,
             );
-            expect(searchFor(catalog()).exhausted).toBe(true);
+
+            const outcome = searchFor(catalog());
+
+            expect(outcome.days).toBeNull();
+            expect(outcome.exhausted).toBe(false);
+            expect(outcome.exhaustedBy).toBeNull();
+            expect(outcome.evaluations).toBeLessThan(MAX_EVALUATIONS_PER_DAY);
         });
 
-        it('reports the thin shelf AND the tolerance, not the shelf alone', () => {
+        it('reports the thin shelf, the row a settled refusal can stand behind', () => {
             const keys = failure().limitingConstraints.map((constraint) => constraint.constraintKey);
 
-            // Order is the documented one: coverage is the more limiting row and
-            // comes first, but it is no longer the only row.
-            expect(keys).toEqual(['catalog_coverage', 'nutrition_tolerance']);
-            expect(failure().limitingConstraints).toEqual(
-                expect.arrayContaining([
-                    {
-                        constraintKey: 'nutrition_tolerance',
-                        value: CALORIE_TOLERANCE_RATIO * 100,
-                        unit: 'percent',
-                        slots: [],
-                        editStep: 'goal',
-                    },
-                ]),
-            );
+            // The shipped gate: a thin slot is the whole story unless the search
+            // ran out of room to look, and this one did not — it proved the day
+            // unfillable. Adding the band here would send the user to edit a
+            // target while a slot one recipe short of the documented minimum is
+            // the thing they can actually act on.
+            expect(keys).toEqual(['catalog_coverage']);
         });
 
         it('carries the search frontier on the error, where the wire cannot', () => {
             const thrown = failure();
 
             expect(thrown.searchDiagnostics).toEqual({
-                exhausted: true,
-                exhaustedBy: 'day',
+                exhausted: false,
+                exhaustedBy: null,
                 frontierDayIndex: 0,
                 frontierDate: START_DATE,
-                evaluations: MAX_EVALUATIONS_PER_DAY,
+                // Settled, so the spend is a handful of placements rather than a
+                // day's whole allowance. Pinned as a bound rather than a number:
+                // the claim is "it did not pay for this proof", and the exact
+                // count is move order's business.
+                evaluations: expect.any(Number),
             });
+            expect(thrown.searchDiagnostics?.evaluations).toBeLessThan(MAX_EVALUATIONS_PER_DAY);
             expect(thrown.allergiesKept).toBe(true);
             // Diagnostic and optional: a caller that never ran a search still
             // raises the same error, which is what keeps the field off the
@@ -2599,38 +2727,37 @@ describe('generateWeeklyPlan', () => {
         });
     });
 
-    describe('the empty-slot exhaustion fixture', () => {
+    describe('the empty-slot fixture', () => {
         // The sibling case of the fixture above, and the boundary of what
         // exhaustion reopens: dinner has NO recipes, so the week is impossible
-        // whatever the targets say — yet breakfast and lunch have enough
-        // candidates to spend the whole per-day allowance being placed and
-        // unplaced before the search gives up. Exhaustion is therefore true
-        // here too, and the tolerance row must still stay away: a band cannot
-        // be the open question for a slot nothing can fill, and offering it
-        // would send the user to edit a target that was never the problem.
+        // whatever the targets say. Breakfast and lunch carry the same
+        // jointly-infeasible pool, so the only difference from the fixture above
+        // is the slot at zero — and that difference is now visible in the cost.
+        // The admissibility bound reads an unfillable slot as unreachable, so
+        // the FIRST breakfast candidate is rejected before it is placed and the
+        // search settles at zero evaluations instead of spending an allowance
+        // discovering by hand what arithmetic already answered.
+        //
+        // The verdict is the invariant either way: the tolerance row must stay
+        // away, because a band cannot be the open question for a slot nothing
+        // can fill, and offering it would send the user to edit a target that
+        // was never the problem. That rule does not depend on how the search
+        // ended, which the unit case at the end of this block pins directly.
         const catalog = (): PlanRecipeCandidate[] => [
-            ...Array.from({ length: 20 }, (_unused, index) =>
-                makeRecipe({
-                    slug: `breakfast-${String(index).padStart(2, '0')}`,
-                    slots: ['breakfast'],
-                    calories: 60 + index,
-                }),
-            ),
-            ...Array.from({ length: 20 }, (_unused, index) =>
-                makeRecipe({
-                    slug: `lunch-${String(index).padStart(2, '0')}`,
-                    slots: ['lunch'],
-                    calories: 60 + index,
-                }),
-            ),
+            ...jointlyInfeasibleSlot('breakfast'),
+            ...jointlyInfeasibleSlot('lunch'),
         ];
 
-        it('exhausts the budget even with nothing to put in the slot', () => {
+        it('proves the week impossible without spending an evaluation', () => {
             const outcome = searchFor(catalog());
 
             expect(outcome.days).toBeNull();
-            expect(outcome.exhausted).toBe(true);
-            expect(outcome.exhaustedBy).toBe('day');
+            // Settled, not exhausted: an unfillable slot makes every branch
+            // provably uncloseable, and the bound says so at the first slot.
+            expect(outcome.exhausted).toBe(false);
+            expect(outcome.exhaustedBy).toBeNull();
+            expect(outcome.evaluations).toBe(0);
+            expect(outcome.aborted).toBe(false);
         });
 
         it('reports the uncovered slot alone, never the tolerance band', () => {
@@ -2653,9 +2780,35 @@ describe('generateWeeklyPlan', () => {
                     editStep: 'schedule',
                 },
             ]);
-            // The diagnostics still travel — the search did run out, and a log
-            // reading "exhausted" beside a slot at zero is the true story.
-            expect(failure.searchDiagnostics?.exhausted).toBe(true);
+            // The diagnostics still travel, and they now say the search
+            // finished rather than ran out — which is the true story for a slot
+            // at zero.
+            expect(failure.searchDiagnostics?.exhausted).toBe(false);
+            expect(failure.searchDiagnostics?.evaluations).toBe(0);
+        });
+
+        it('withholds the tolerance row for an uncovered slot even when the search DID exhaust', () => {
+            // The rule the fixture above can no longer reach through a real
+            // search, asserted where it still lives: the verdict is handed an
+            // exhausted search over a catalog with an empty slot, and the
+            // tolerance row must still be absent. A gate that reopened the band
+            // on exhaustion alone would add it here.
+            const verdict = analyzeLimitingConstraints({
+                seedInputs: makeSeedInputs(),
+                preferences: makePreferences(),
+                targets: TARGETS,
+                recipes: catalog(),
+                diagnostics: {
+                    exhausted: true,
+                    exhaustedBy: 'day',
+                    frontierDayIndex: 0,
+                    evaluations: MAX_EVALUATIONS_PER_DAY,
+                },
+            });
+
+            expect(verdict.constraints.map((constraint) => constraint.constraintKey)).toEqual([
+                'slot_coverage',
+            ]);
         });
     });
 
@@ -2720,6 +2873,1107 @@ describe('generateWeeklyPlan', () => {
 });
 
 /* ---------------------------------------------------------------------------
+ * The admissibility bound
+ *
+ * The search prunes a branch whose remaining slots PROVABLY cannot bring the
+ * day inside its bands. Three properties make that safe, and each is asserted
+ * below rather than argued:
+ *
+ *  * ONE derivation of the bands. `dayToleranceBands` is read both by
+ *    `evaluateDayTolerance`, which judges a finished day, and by the bound,
+ *    which asks whether a partial day can still reach it. Written twice they
+ *    would drift, and a drifted bound refuses weeks that fit.
+ *  * OPTIMISM. The per-slot bounds are taken over each slot's WHOLE pool, a
+ *    superset of what any given day may draw on, so a false answer means no
+ *    completion existed — under that pool or any subset of it.
+ *  * EQUIVALENCE AT THE LAST SLOT. With nothing left to place the remaining
+ *    contribution is zero, and the bound becomes exactly the day tolerance —
+ *    which is what makes the prune "the acceptance test asked one step before a
+ *    placement that would have had to be undone".
+ * ------------------------------------------------------------------------- */
+
+describe('dayToleranceBands', () => {
+    const bands = (): DayToleranceBands => dayToleranceBands(TARGETS);
+
+    it('derives each band from its own policy constant', () => {
+        const subject = bands();
+
+        expect(subject.calories.low).toBeCloseTo(
+            TARGETS.calories - CALORIE_TOLERANCE_RATIO * TARGETS.calories,
+            6,
+        );
+        expect(subject.calories.high).toBeCloseTo(
+            TARGETS.calories + CALORIE_TOLERANCE_RATIO * TARGETS.calories,
+            6,
+        );
+        expect(subject.protein.low).toBeCloseTo(TARGETS.protein - PROTEIN_TOLERANCE_UNDER_G, 6);
+        expect(subject.protein.high).toBeCloseTo(TARGETS.protein + PROTEIN_TOLERANCE_OVER_G, 6);
+        expect(subject.carbs.low).toBeCloseTo(TARGETS.carbs - MACRO_TOLERANCE_RATIO * TARGETS.carbs, 6);
+        expect(subject.carbs.high).toBeCloseTo(TARGETS.carbs + MACRO_TOLERANCE_RATIO * TARGETS.carbs, 6);
+        expect(subject.fat.low).toBeCloseTo(TARGETS.fat - MACRO_TOLERANCE_ABSOLUTE_G, 6);
+        expect(subject.fat.high).toBeCloseTo(TARGETS.fat + MACRO_TOLERANCE_ABSOLUTE_G, 6);
+    });
+
+    it('is asymmetric on protein alone', () => {
+        const subject = bands();
+        const spread = (band: { low: number; high: number }, target: number) => [
+            target - band.low,
+            band.high - target,
+        ];
+
+        const [proteinUnder, proteinOver] = spread(subject.protein, TARGETS.protein);
+
+        expect(proteinOver).toBeGreaterThan(proteinUnder);
+
+        for (const [band, target] of [
+            [subject.calories, TARGETS.calories],
+            [subject.carbs, TARGETS.carbs],
+            [subject.fat, TARGETS.fat],
+        ] as const) {
+            const [under, over] = spread(band, target);
+
+            expect(over).toBeCloseTo(under, 6);
+        }
+    });
+
+    it('takes the wider of the absolute and the proportional macro band', () => {
+        // Carbs at 200 g: the ratio gives 30 g and wins. Fat at 65 g: the ratio
+        // gives 9.75 g and the 15 g floor wins. Both from one target, so the
+        // `Math.max` is doing the choosing rather than the target's size.
+        const subject = bands();
+
+        expect(subject.carbs.high - TARGETS.carbs).toBeCloseTo(MACRO_TOLERANCE_RATIO * TARGETS.carbs, 6);
+        expect(subject.fat.high - TARGETS.fat).toBeCloseTo(MACRO_TOLERANCE_ABSOLUTE_G, 6);
+
+        // And the other way round for a target large enough that the ratio wins
+        // on fat too.
+        const fatHeavy = dayToleranceBands({ ...TARGETS, fat: 200 });
+
+        expect(fatHeavy.fat.high - 200).toBeCloseTo(MACRO_TOLERANCE_RATIO * 200, 6);
+    });
+
+    it('refuses a target that cannot define a band, naming the field', () => {
+        // Same guard, same field names and same order as the day-tolerance
+        // reader — one derivation means one error too, so a caller cannot be
+        // told a different story depending on which reader it reached first.
+        const fieldOf = (targets: MealPlanMacroTotals): string => {
+            try {
+                dayToleranceBands(targets);
+            } catch (error) {
+                if (error instanceof MealPlanInputError) {
+                    return error.field;
+                }
+
+                throw error;
+            }
+
+            throw new Error('expected a MealPlanInputError');
+        };
+
+        expect(fieldOf({ ...TARGETS, calories: 0 })).toBe('targets.calories');
+        expect(fieldOf({ ...TARGETS, protein: Number.NaN })).toBe('targets.protein');
+        expect(fieldOf({ ...TARGETS, carbs: -1 })).toBe('targets.carbs');
+        expect(fieldOf({ ...TARGETS, fat: Number.POSITIVE_INFINITY })).toBe('targets.fat');
+        // And calories is checked first, so a targets object that is wrong in
+        // two places is reported the same way by both readers.
+        expect(fieldOf({ ...TARGETS, calories: 0, fat: 0 })).toBe('targets.calories');
+    });
+
+    it('is the same judgement evaluateDayTolerance makes, on every edge it defines', () => {
+        // The anti-drift assertion. A day sitting exactly on a bound is inside;
+        // one a whole gram or kcal past it is outside; and `evaluateDayTolerance`
+        // must agree with the bands at both, for all four nutrients and both
+        // ends — which it can only do while the two read one derivation.
+        const subject = bands();
+        const onTarget = { ...TARGETS };
+
+        for (const key of ['calories', 'protein', 'carbs', 'fat'] as const) {
+            // The bands carry `TOLERANCE_EPSILON` inside their bounds, so the
+            // bound itself is the last accepted value and every reader compares
+            // strictly against it.
+            const low = subject[key].low;
+            const high = subject[key].high;
+
+            expect(isDayWithinTolerance({ ...onTarget, [key]: low }, TARGETS)).toBe(true);
+            expect(isDayWithinTolerance({ ...onTarget, [key]: high }, TARGETS)).toBe(true);
+            expect(isDayWithinTolerance({ ...onTarget, [key]: low - 1 }, TARGETS)).toBe(false);
+            expect(isDayWithinTolerance({ ...onTarget, [key]: high + 1 }, TARGETS)).toBe(false);
+        }
+    });
+});
+
+describe('slotContributionBounds', () => {
+    /** One slot's real pool, built the way the search builds it. */
+    const poolFor = (recipes: PlanRecipeCandidate[], slot: MealSlot): PlanCandidate[] => {
+        const preferences = makePreferences();
+
+        return candidatesForSlot(
+            buildPlanCandidates(recipes, preferences, derivePlanSeed(makeSeedInputs())),
+            preferences,
+            slot,
+        );
+    };
+
+    it('reads an empty pool as unreachable, and says so without pretending to a sum', () => {
+        const subject = slotContributionBounds([]);
+
+        expect(subject.reachable).toBe(false);
+        expect(subject.bounded).toBe(true);
+        expect(subject.min).toEqual(zeroTotals);
+        expect(subject.max).toEqual(zeroTotals);
+    });
+
+    it('spans the pool per nutrient, at the portions the policy offers', () => {
+        // One recipe at seven multipliers: the extremes are its serving scaled
+        // by the smallest and the largest.
+        const pool = poolFor([makeRecipe({ slug: 'b1', slots: ['breakfast'], calories: 500 })], 'breakfast');
+        const subject = slotContributionBounds(pool);
+        const smallest = Math.min(...MAIN_SLOT_PORTION_MULTIPLIERS);
+        const largest = Math.max(...MAIN_SLOT_PORTION_MULTIPLIERS);
+
+        expect(subject.reachable).toBe(true);
+        expect(subject.bounded).toBe(true);
+        expect(subject.min.calories).toBeCloseTo(500 * smallest, 6);
+        expect(subject.max.calories).toBeCloseTo(500 * largest, 6);
+    });
+
+    it('takes each nutrient independently, so a mixed pool is not one recipe scaled', () => {
+        const pool = poolFor(
+            [
+                makeRecipe({ slug: 'p', slots: ['breakfast'], calories: 0, nutrition: PROTEIN_ONLY_SERVING }),
+                makeRecipe({ slug: 'f', slots: ['breakfast'], calories: 0, nutrition: FAT_ONLY_SERVING }),
+            ],
+            'breakfast',
+        );
+        const subject = slotContributionBounds(pool);
+        const smallest = Math.min(...MAIN_SLOT_PORTION_MULTIPLIERS);
+        const largest = Math.max(...MAIN_SLOT_PORTION_MULTIPLIERS);
+
+        // Protein's floor comes from the fat-only recipe and its ceiling from
+        // the protein-only one — no single candidate supplies both.
+        expect(subject.min.protein).toBeCloseTo(0, 6);
+        expect(subject.max.protein).toBeCloseTo(PROTEIN_ONLY_SERVING.protein * largest, 6);
+        expect(subject.min.fat).toBeCloseTo(0, 6);
+        expect(subject.max.fat).toBeCloseTo(FAT_ONLY_SERVING.fat * largest, 6);
+        // Calories and carbs are shared, so they scale with the portions alone.
+        expect(subject.min.calories).toBeCloseTo(PROTEIN_ONLY_SERVING.calories * smallest, 6);
+        expect(subject.max.carbs).toBeCloseTo(PROTEIN_ONLY_SERVING.carbs * largest, 6);
+    });
+
+    it('declines to bound a pool holding a value that is not a number', () => {
+        // The bound must not conclude from a NaN: the day-total guard is what
+        // reports a corrupt candidate, and pruning on one would turn a data
+        // fault into a silent refusal.
+        const corrupt: PlanCandidate[] = [
+            {
+                recipe: makeRecipe({ slug: 'x', slots: ['breakfast'], calories: 500 }),
+                portionMultiplier: 1,
+                nutrition: { calories: Number.NaN, protein: 10, carbs: 10, fat: 10 },
+                shuffleRank: 0,
+            },
+        ];
+        const subject = slotContributionBounds(corrupt);
+
+        expect(subject.reachable).toBe(true);
+        expect(subject.bounded).toBe(false);
+    });
+});
+
+describe('remainingContributionBounds', () => {
+    const slotBounds = (
+        overrides: Partial<RemainingContributionBounds> = {},
+    ): RemainingContributionBounds => ({
+        reachable: true,
+        bounded: true,
+        min: { calories: 100, protein: 10, carbs: 20, fat: 5 },
+        max: { calories: 200, protein: 20, carbs: 40, fat: 10 },
+        ...overrides,
+    });
+
+    it('accumulates from the end of the day forwards', () => {
+        const suffixes = remainingContributionBounds([slotBounds(), slotBounds(), slotBounds()]);
+
+        expect(suffixes).toHaveLength(4);
+        expect(suffixes[0].min.calories).toBeCloseTo(300, 6);
+        expect(suffixes[0].max.calories).toBeCloseTo(600, 6);
+        expect(suffixes[1].min.calories).toBeCloseTo(200, 6);
+        expect(suffixes[2].min.calories).toBeCloseTo(100, 6);
+    });
+
+    it('ends on an empty tail that adds nothing and blocks nothing', () => {
+        // Entry `slots.length` is what the LAST slot's candidates are judged
+        // against, and it has to be the zero element for the bound to collapse
+        // onto the day tolerance there.
+        const suffixes = remainingContributionBounds([slotBounds()]);
+        const tail = suffixes[1];
+
+        expect(tail.reachable).toBe(true);
+        expect(tail.bounded).toBe(true);
+        expect(tail.min).toEqual(zeroTotals);
+        expect(tail.max).toEqual(zeroTotals);
+    });
+
+    it('carries one unreachable slot into every suffix that contains it', () => {
+        const suffixes = remainingContributionBounds([
+            slotBounds(),
+            slotBounds({ reachable: false }),
+            slotBounds(),
+        ]);
+
+        expect(suffixes[0].reachable).toBe(false);
+        expect(suffixes[1].reachable).toBe(false);
+        // …and not into the ones after it: slot 2 is fillable on its own.
+        expect(suffixes[2].reachable).toBe(true);
+        expect(suffixes[3].reachable).toBe(true);
+    });
+
+    it('carries one unbounded slot the same way', () => {
+        const suffixes = remainingContributionBounds([slotBounds({ bounded: false }), slotBounds()]);
+
+        expect(suffixes[0].bounded).toBe(false);
+        expect(suffixes[1].bounded).toBe(true);
+    });
+});
+
+describe('canReachDayBands', () => {
+    const bands = dayToleranceBands(TARGETS);
+    const zeroRemaining: RemainingContributionBounds = {
+        reachable: true,
+        bounded: true,
+        min: zeroTotals,
+        max: zeroTotals,
+    };
+    const remaining = (
+        min: MealPlanMacroTotals,
+        max: MealPlanMacroTotals,
+    ): RemainingContributionBounds => ({ reachable: true, bounded: true, min, max });
+
+    it('refuses a branch whose remaining slots cannot all be filled', () => {
+        const unfillable: RemainingContributionBounds = { ...zeroRemaining, reachable: false };
+
+        // Even a day already exactly on its targets: a slot with nothing in it
+        // cannot be filled, so no completion of this branch exists.
+        expect(canReachDayBands({ ...TARGETS }, unfillable, bands)).toBe(false);
+    });
+
+    it('declines to conclude when the remainder is not bounded', () => {
+        const unbounded: RemainingContributionBounds = { ...zeroRemaining, bounded: false };
+
+        expect(canReachDayBands({ calories: 99999, protein: 0, carbs: 0, fat: 0 }, unbounded, bands)).toBe(
+            true,
+        );
+    });
+
+    it('declines to conclude when the running total is not a number', () => {
+        expect(
+            canReachDayBands({ calories: Number.NaN, protein: 0, carbs: 0, fat: 0 }, zeroRemaining, bands),
+        ).toBe(true);
+    });
+
+    it('refuses a branch whose least possible total already overshoots', () => {
+        // 2,000 kcal on the day and 400 more to come at the very least: the
+        // calorie band tops out at 2,200.
+        const total = { ...zeroTotals, calories: 2000 };
+        const floorAhead = remaining(
+            { calories: 400, protein: 0, carbs: 0, fat: 0 },
+            { calories: 900, protein: 0, carbs: 0, fat: 0 },
+        );
+
+        expect(canReachDayBands(total, floorAhead, bands)).toBe(false);
+    });
+
+    it('refuses a branch whose greatest possible total still undershoots', () => {
+        const total = { ...zeroTotals, protein: 10 };
+        const ceilingAhead = remaining(
+            { calories: 0, protein: 0, carbs: 0, fat: 0 },
+            { calories: 0, protein: 20, carbs: 0, fat: 0 },
+        );
+
+        // 10 g of protein and at most 20 g to come cannot reach the 135 g floor.
+        expect(canReachDayBands(total, ceilingAhead, bands)).toBe(false);
+    });
+
+    it('admits a branch that can still land inside every band', () => {
+        const half = {
+            calories: TARGETS.calories / 2,
+            protein: TARGETS.protein / 2,
+            carbs: TARGETS.carbs / 2,
+            fat: TARGETS.fat / 2,
+        };
+
+        expect(canReachDayBands(half, remaining(half, half), bands)).toBe(true);
+    });
+
+    it('refuses on ANY single nutrient, not on calories alone', () => {
+        // The property the whole fix rests on: a branch that is fine on
+        // calories and hopeless on protein is still hopeless, and a bound that
+        // only looked at calories would have descended into it.
+        const total = { calories: 1000, protein: 0, carbs: 100, fat: 30 };
+        const ahead = remaining(
+            { calories: 900, protein: 0, carbs: 80, fat: 25 },
+            { calories: 1100, protein: 5, carbs: 120, fat: 40 },
+        );
+
+        expect(total.calories + ahead.max.calories).toBeGreaterThan(bands.calories.low);
+        expect(canReachDayBands(total, ahead, bands)).toBe(false);
+    });
+
+    it('becomes the day tolerance itself once nothing is left to place', () => {
+        // THE EQUIVALENCE. At the last slot the two must be the same predicate,
+        // which is what makes the prune the acceptance test asked one placement
+        // early. Swept across every band edge and well past both of them.
+        const samples: MealPlanMacroTotals[] = [];
+
+        for (const key of ['calories', 'protein', 'carbs', 'fat'] as const) {
+            for (const offset of [-200, -50, -1, 0, 1, 50, 200]) {
+                samples.push({ ...TARGETS, [key]: TARGETS[key] + offset });
+            }
+        }
+
+        for (const sample of samples) {
+            expect(canReachDayBands(sample, zeroRemaining, bands)).toBe(
+                isDayWithinTolerance(sample, TARGETS),
+            );
+        }
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * someCandidateClosesDay — the LAST slot judged exactly, not by interval
+ *
+ * `canReachDayBands` bounds each nutrient on its own, which is what makes it
+ * cheap and what makes it loose: it admits a remainder no single candidate
+ * actually has, because the nutrients that would need to arrive together can
+ * each arrive separately. One slot from the end that looseness has a price, so
+ * the final slot is asked the exact question instead.
+ * ------------------------------------------------------------------------- */
+
+describe('someCandidateClosesDay', () => {
+    const bands = dayToleranceBands(TARGETS);
+    const candidateOf = (nutrition: MealPlanMacroTotals, slug = 'c'): PlanCandidate => ({
+        recipe: makeRecipe({ slug, calories: 0, nutrition }),
+        portionMultiplier: 1,
+        nutrition,
+        shuffleRank: 0,
+    });
+
+    it('is true when one candidate lands the day inside every band', () => {
+        const half: MealPlanMacroTotals = { calories: 1000, protein: 75, carbs: 100, fat: 32 };
+
+        expect(someCandidateClosesDay(half, [candidateOf(half)], bands)).toBe(true);
+    });
+
+    it('is false when every candidate misses a band', () => {
+        const total: MealPlanMacroTotals = { calories: 1000, protein: 75, carbs: 100, fat: 32 };
+        // Each of these overshoots or undershoots the calorie band on its own.
+        const pool = [
+            candidateOf({ calories: 50, protein: 75, carbs: 100, fat: 33 }, 'tiny'),
+            candidateOf({ calories: 2000, protein: 75, carbs: 100, fat: 33 }, 'huge'),
+        ];
+
+        expect(someCandidateClosesDay(total, pool, bands)).toBe(false);
+    });
+
+    it('is false for a slot with nothing in it', () => {
+        expect(someCandidateClosesDay(zeroTotals, [], bands)).toBe(false);
+    });
+
+    it('declines to conclude when the running total is not a number', () => {
+        // Same contract as the interval bound: a non-finite total is a data
+        // fault for `computeDayTotals` to name, not a day to rule out here.
+        const broken: MealPlanMacroTotals = { calories: Number.NaN, protein: 0, carbs: 0, fat: 0 };
+
+        expect(someCandidateClosesDay(broken, [candidateOf(zeroTotals)], bands)).toBe(true);
+    });
+
+    it('rejects what the interval bound admits, which is the whole reason it exists', () => {
+        // THE DIVERGENCE, stated as a single case. The day needs 1,000 more
+        // kcal, 75 g more protein, 100 g more carbs and 33 g more fat, and the
+        // pool holds one candidate carrying the calories and carbs with no
+        // protein or fat, and another carrying the protein and fat with no
+        // calories or carbs. Every nutrient is therefore reachable one at a
+        // time, so the interval bound admits the branch — but no SINGLE
+        // candidate closes the day, and one slot from the end that is the only
+        // question worth asking.
+        const total: MealPlanMacroTotals = { calories: 1000, protein: 75, carbs: 100, fat: 32 };
+        const pool = [
+            candidateOf({ calories: 1000, protein: 0, carbs: 100, fat: 0 }, 'energy'),
+            candidateOf({ calories: 0, protein: 75, carbs: 0, fat: 33 }, 'macros'),
+        ];
+        const remainder = remainingContributionBounds([slotContributionBounds(pool)]);
+
+        expect(canReachDayBands(total, remainder[0], bands)).toBe(true);
+        expect(someCandidateClosesDay(total, pool, bands)).toBe(false);
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * dayHasFeasibleAssignment — the day's own dead end, recognised before it is
+ * paid for
+ *
+ * Days earlier in the week spend recipes' two permitted uses, so a day late in
+ * a tight week can be genuinely unfillable. Running an allowance out ENDS the
+ * search (§0.7.3), so discovering that by placing would take with it every week
+ * reachable by changing an earlier day — the false refusal this work removes.
+ * ------------------------------------------------------------------------- */
+
+describe('dayHasFeasibleAssignment', () => {
+    const bands = dayToleranceBands(TARGETS);
+    const third: MealPlanMacroTotals = { calories: 666, protein: 50, carbs: 67, fat: 22 };
+    const candidateOf = (nutrition: MealPlanMacroTotals, slug: string, recipeId = slug): PlanCandidate => ({
+        recipe: { ...makeRecipe({ slug, calories: 0, nutrition }), recipe_id: recipeId },
+        portionMultiplier: 1,
+        nutrition,
+        shuffleRank: 0,
+    });
+
+    it('is true when an assignment closes the day', () => {
+        const pools = [
+            [candidateOf(third, 'b')],
+            [candidateOf(third, 'l')],
+            [candidateOf(third, 'd')],
+        ];
+
+        expect(dayHasFeasibleAssignment(pools, bands)).toBe(true);
+    });
+
+    it('is false when no assignment closes the day', () => {
+        const tiny: MealPlanMacroTotals = { calories: 100, protein: 5, carbs: 10, fat: 2 };
+        const pools = [
+            [candidateOf(tiny, 'b')],
+            [candidateOf(tiny, 'l')],
+            [candidateOf(tiny, 'd')],
+        ];
+
+        expect(dayHasFeasibleAssignment(pools, bands)).toBe(false);
+    });
+
+    it('is false for a day with no slots and for a slot with nothing in it', () => {
+        expect(dayHasFeasibleAssignment([], bands)).toBe(false);
+        expect(dayHasFeasibleAssignment([[candidateOf(third, 'b')], []], bands)).toBe(false);
+    });
+
+    it('will not serve one recipe more times in a day than the week allows', () => {
+        // THE ACCOUNTING, AND WHY IT IS NOT OPTIONAL. One recipe is eligible for
+        // all three slots and the only arithmetic that closes the day uses it
+        // three times — one more than §0.7.3 permits in a whole week. Without
+        // the allowance this walk would call the day feasible, and the search
+        // would then pay its entire allowance discovering otherwise, which is
+        // exactly the cost this predicate exists to avoid.
+        const shared = candidateOf(third, 'shared', 'shared-recipe');
+
+        expect(dayHasFeasibleAssignment([[shared], [shared], [shared]], bands)).toBe(false);
+
+        // Two of the three slots on that recipe is inside the cap, so a day the
+        // rule does permit is still recognised.
+        const pools = [[shared], [shared], [candidateOf(third, 'other', 'other-recipe')]];
+
+        expect(dayHasFeasibleAssignment(pools, bands)).toBe(true);
+    });
+
+    it('reads the uses the week has already spent', () => {
+        const shared = candidateOf(third, 'shared', 'shared-recipe');
+        const pools = [[shared], [shared], [candidateOf(third, 'other', 'other-recipe')]];
+
+        // Both uses still available: the pair is available too.
+        expect(dayHasFeasibleAssignment(pools, bands, new Map())).toBe(true);
+
+        // One already spent earlier in the week leaves room for one, not two.
+        expect(dayHasFeasibleAssignment(pools, bands, new Map([['shared-recipe', 1]]))).toBe(false);
+
+        // Spent out entirely, and the day cannot use it at all.
+        expect(
+            dayHasFeasibleAssignment(pools, bands, new Map([['shared-recipe', MAX_RECIPE_USES_PER_WEEK]])),
+        ).toBe(false);
+    });
+
+    it('declines to conclude once the walk has done the work it is allowed', () => {
+        // THE WORK BOUND, and the honest shape of what it costs. The
+        // jointly-infeasible pool closes no day — the block below proves that by
+        // enumeration — and reduced to its distinct (family, portion) classes the
+        // walk settles it and answers `false`. At full size the same pool is the
+        // same arithmetic with far more candidates carrying it, the walk runs out
+        // of the work it is allowed, and it answers `true`: "explore it", never
+        // "a day exists". The search then settles the day the ordinary way, which
+        // is why declining is the safe direction and why the bound can be set by
+        // measurement rather than by proof.
+        const preferences = makePreferences();
+        const candidates = buildPlanCandidates(
+            jointlyInfeasibleCatalog(),
+            preferences,
+            derivePlanSeed(makeSeedInputs()),
+        );
+        const fullPools = (['breakfast', 'lunch', 'dinner'] as MealSlot[]).map((slot) =>
+            candidatesForSlot(candidates, preferences, slot),
+        );
+        const classReduced = fullPools.map((pool) => {
+            const byClass = new Map<string, PlanCandidate>();
+
+            for (const candidate of pool) {
+                const key = `${candidate.nutrition.protein > 0 ? 'p' : 'f'}:${candidate.portionMultiplier}`;
+
+                if (!byClass.has(key)) {
+                    byClass.set(key, candidate);
+                }
+            }
+
+            return [...byClass.values()];
+        });
+
+        expect(dayHasFeasibleAssignment(classReduced, bands)).toBe(false);
+        expect(dayHasFeasibleAssignment(fullPools, bands)).toBe(true);
+    });
+});
+
+describe("the week's variety tier in the move order", () => {
+    /**
+     * `perSlot` interchangeable recipes in each main slot, every day summing to
+     * exactly 2,000 kcal on the target's own ratio.
+     *
+     * Interchangeable is the point: the candidates in a slot score IDENTICALLY,
+     * so nothing but the tiers and the shuffle tie-break can separate them, and
+     * what the week does with them is attributable to the order alone. Their
+     * ingredient identities are disjoint by construction (see
+     * {@link makeRecipe}), so `reuseBonus` is zero for every one of them and
+     * cannot be the thing doing the separating either.
+     */
+    const wideCatalog = (perSlot: number): PlanRecipeCandidate[] => [
+        ...Array.from({ length: perSlot }, (_unused, index) =>
+            makeRecipe({ slug: `wb${index}`, slots: ['breakfast'], calories: 500 }),
+        ),
+        ...Array.from({ length: perSlot }, (_unused, index) =>
+            makeRecipe({ slug: `wl${index}`, slots: ['lunch'], calories: 700 }),
+        ),
+        ...Array.from({ length: perSlot }, (_unused, index) =>
+            makeRecipe({ slug: `wd${index}`, slots: ['dinner'], calories: 800 }),
+        ),
+    ];
+
+    /** How many times each `slug` the week planned was planned. */
+    const usesBySlug = (outcome: PlanSearchOutcome): Map<string, number> => {
+        const uses = new Map<string, number>();
+
+        for (const day of outcome.days ?? []) {
+            for (const meal of day) {
+                uses.set(meal.slug, (uses.get(meal.slug) ?? 0) + 1);
+            }
+        }
+
+        return uses;
+    };
+
+    /** The distinct recipes the week planned in `slot`. */
+    const distinctIn = (outcome: PlanSearchOutcome, slot: MealSlot): Set<string> =>
+        new Set(
+            (outcome.days ?? []).flatMap((day) =>
+                day.filter((meal) => meal.slot === slot).map((meal) => meal.slug),
+            ),
+        );
+
+    it.each([7, 10])(
+        'reaches past the first four recipes of a %i-deep slot, rather than spending each twice',
+        (perSlot) => {
+            const outcome = searchFor(wideCatalog(perSlot));
+
+            expect(outcome.days).toHaveLength(PLAN_DAY_COUNT);
+            expect(outcome.exhausted).toBe(false);
+
+            // SEVEN DAYS, SEVEN DISHES. With the week tier removed and
+            // everything else untouched, this same pool is answered with FOUR
+            // distinct dishes per slot, each planned twice — measured, at both
+            // depths. The scored order cannot separate identical candidates, so
+            // the shuffle tie-break decides, and the recipe that won day 0 wins
+            // again on day 2 the moment the adjacent-day clause stops blocking
+            // it. §0.7.3 makes a recipe's two weekly uses a scarce resource;
+            // front-loading them is what left the later days of a large target
+            // with nothing able to reach the band, which is the refusal band
+            // this work removed. Trying an unused recipe first is the
+            // least-constraining choice and defers that spending instead.
+            for (const slot of ['breakfast', 'lunch', 'dinner'] as MealSlot[]) {
+                expect(distinctIn(outcome, slot).size).toBe(PLAN_DAY_COUNT);
+            }
+
+            expect(Math.max(...usesBySlug(outcome).values())).toBe(1);
+        },
+    );
+
+    it('still plans a recipe twice when the corpus leaves nothing else', () => {
+        // FOUR recipes per slot and seven days: the weekly cap of two uses is
+        // the only thing that makes this week possible at all (4 x 2 = 8 >= 7),
+        // so reuse is not a preference here but an arithmetic necessity. The
+        // tier is an ORDER, not a clause -- a used recipe sorts behind an
+        // unused one and is still offered, still reached, and still taken. Were
+        // it a ban, this week would be refused.
+        const outcome = searchFor(wideCatalog(4));
+
+        expect(outcome.days).toHaveLength(PLAN_DAY_COUNT);
+        expect(outcome.exhausted).toBe(false);
+
+        const uses = usesBySlug(outcome);
+
+        expect(Math.max(...uses.values())).toBe(2);
+
+        // And the cap §0.7.3 does state still binds, on every recipe.
+        for (const count of uses.values()) {
+            expect(count).toBeLessThanOrEqual(MAX_RECIPE_USES_PER_WEEK);
+        }
+
+        // Spread as far as four recipes over seven days allows: all four used,
+        // three of them twice. Deferring reuse cannot invent a fifth dish.
+        for (const slot of ['breakfast', 'lunch', 'dinner'] as MealSlot[]) {
+            expect(distinctIn(outcome, slot).size).toBe(4);
+        }
+    });
+
+    it('keeps every day it varies inside the day tolerance', () => {
+        // Variety is a preference among LEGAL weeks and may not buy itself a
+        // day outside the bands, so the week the tier chose is held to the same
+        // tolerance as every other planned week in this suite.
+        const outcome = searchFor(wideCatalog(7));
+
+        expect(outcome.days).toHaveLength(PLAN_DAY_COUNT);
+
+        for (const day of outcome.days ?? []) {
+            expect(day).toHaveLength(3);
+            expect(isDayWithinTolerance(computeDayTotals(day), TARGETS)).toBe(true);
+        }
+    });
+});
+
+
+
+describe('a maintain- and gain-sized week over an off-ratio catalog', () => {
+    // THE REGRESSION TEST FOR THE REFUSAL BAND. Generation used to answer
+    // `422 no_matching_meals` for every daily target from about 2,200 kcal
+    // upwards — every `maintain` and every `gain` goal — and to name
+    // `nutrition_tolerance` and `portion_limits` as the reason while
+    // tolerance-satisfying weeks demonstrably existed. The band was not even
+    // monotonic: neighbouring targets planned while the ones between them did
+    // not, because whether a target planned depended on how much of the day
+    // allowance the guidance-ordered search happened to spend on branches that
+    // could never close.
+    //
+    // Reproducing the exact 2,000-evaluation exhaustion needs the real seeded
+    // corpus, and that is asserted over HTTP in `api/plans.test.ts`. What this
+    // fixture pins is the property the fix has to keep: a catalog of ordinary
+    // off-ratio recipes plans a whole week at maintain and gain sized targets,
+    // every day inside its own bands.
+    //
+    // The recipes are deliberately NOT `proportional`, so the day tolerance
+    // binds on all four macros at once rather than collapsing onto calories —
+    // a scramble is fat-heavy and carb-light, a yogurt bowl is protein-heavy
+    // and fat-light, and a day has to mix them.
+    const varied = (): PlanRecipeCandidate[] => {
+        const recipe = (
+            slug: string,
+            slot: MealSlot,
+            nutrition: MealPlanMacroTotals,
+        ): PlanRecipeCandidate => makeRecipe({ slug, slots: [slot], calories: 0, nutrition });
+
+        return [
+            recipe('oats-berries', 'breakfast', { calories: 420, protein: 14, carbs: 68, fat: 10 }),
+            recipe('eggs-toast', 'breakfast', { calories: 450, protein: 28, carbs: 32, fat: 22 }),
+            recipe('yogurt-bowl', 'breakfast', { calories: 380, protein: 32, carbs: 40, fat: 8 }),
+            recipe('protein-smoothie', 'breakfast', { calories: 400, protein: 35, carbs: 45, fat: 6 }),
+            recipe('sausage-muffins', 'breakfast', { calories: 480, protein: 30, carbs: 12, fat: 34 }),
+            recipe('chicken-rice-bowl', 'lunch', { calories: 620, protein: 48, carbs: 68, fat: 16 }),
+            recipe('tuna-bean-salad', 'lunch', { calories: 540, protein: 42, carbs: 45, fat: 18 }),
+            recipe('lentil-soup', 'lunch', { calories: 480, protein: 24, carbs: 66, fat: 12 }),
+            recipe('turkey-wrap', 'lunch', { calories: 560, protein: 38, carbs: 52, fat: 20 }),
+            recipe('salmon-quinoa', 'lunch', { calories: 650, protein: 44, carbs: 50, fat: 28 }),
+            recipe('beef-rice', 'dinner', { calories: 700, protein: 50, carbs: 72, fat: 22 }),
+            recipe('roast-chicken-veg', 'dinner', { calories: 620, protein: 52, carbs: 40, fat: 24 }),
+            recipe('shrimp-rice-bowl', 'dinner', { calories: 580, protein: 40, carbs: 62, fat: 16 }),
+            recipe('tofu-stirfry', 'dinner', { calories: 520, protein: 30, carbs: 58, fat: 18 }),
+            recipe('turkey-meatballs', 'dinner', { calories: 640, protein: 46, carbs: 48, fat: 26 }),
+        ];
+    };
+
+    /** The AAP's 30/30/40 split, which is what the targets screen confirms. */
+    const targetsAt = (calories: number): MealPlanMacroTotals => ({
+        calories,
+        protein: Math.round((0.3 * calories) / 4),
+        carbs: Math.round((0.4 * calories) / 4),
+        fat: Math.round((0.3 * calories) / 9),
+    });
+
+    // 1,900 is a loss-sized target and planned before the fix; 2,200, 2,400 and
+    // 2,700 are the maintain and gain sized ones the QA sweep found refused,
+    // including the two the band skipped over while their neighbours worked.
+    const CALORIE_LEVELS = [1900, 2100, 2200, 2300, 2400, 2500, 2600, 2700] as const;
+
+    it.each(CALORIE_LEVELS)('plans a whole week at %d kcal a day', (calories) => {
+        const targets = targetsAt(calories);
+        const result = generateWeeklyPlan({
+            seedInputs: makeSeedInputs(),
+            preferences: makePreferences(),
+            targets,
+            recipes: varied(),
+        });
+
+        expect(result.days).toHaveLength(PLAN_DAY_COUNT);
+
+        for (const day of result.days) {
+            expect(day.meals).toHaveLength(3);
+            expect(isDayWithinTolerance(day.plannedTotals, targets)).toBe(true);
+        }
+    });
+
+    it.each(CALORIE_LEVELS)('gives every day of the %d kcal week three different recipes', (calories) => {
+        // The variety rule holds across the band too: this catalog has enough
+        // in every slot, so no day needs one recipe twice.
+        const result = generateWeeklyPlan({
+            seedInputs: makeSeedInputs(),
+            preferences: makePreferences(),
+            targets: targetsAt(calories),
+            recipes: varied(),
+        });
+
+        for (const day of result.days) {
+            const slugs = day.meals.map((meal) => meal.slug);
+
+            expect(new Set(slugs).size).toBe(slugs.length);
+        }
+    });
+
+    it('binds on all four macros, so the band above is not a calorie window', () => {
+        // Guards the fixture itself: were these recipes on the target's own
+        // ratio, every assertion above would reduce to "the calories add up"
+        // and the four-dimensional tolerance would go untested. At least one
+        // planned day has to sit off the ratio on a macro.
+        const targets = targetsAt(2400);
+        const result = generateWeeklyPlan({
+            seedInputs: makeSeedInputs(),
+            preferences: makePreferences(),
+            targets,
+            recipes: varied(),
+        });
+
+        const offRatio = result.days.filter((day) => {
+            const onRatioProtein = (day.plannedTotals.calories * targets.protein) / targets.calories;
+
+            return Math.abs(day.plannedTotals.protein - onRatioProtein) > 1;
+        });
+
+        expect(offRatio.length).toBeGreaterThan(0);
+    });
+
+    it('refuses a target the catalog genuinely cannot reach, rather than everything above a threshold', () => {
+        // The other half of the finding: the fix must not make the generator
+        // agreeable. A target far beyond what five recipes a slot can supply at
+        // their largest offered portion is still refused, and refused as an
+        // infeasible week.
+        const targets = targetsAt(6000);
+        let thrown: unknown;
+
+        try {
+            generateWeeklyPlan({
+                seedInputs: makeSeedInputs(),
+                preferences: makePreferences(),
+                targets,
+                recipes: varied(),
+            });
+        } catch (error) {
+            thrown = error;
+        }
+
+        expect(thrown).toBeInstanceOf(NoMatchingMealsError);
+        expect((thrown as NoMatchingMealsError).allergiesKept).toBe(true);
+    });
+});
+
+describe('a protein-scarce catalog — the refusal band, reproduced', () => {
+    /*
+     * THE FIXTURE THAT ACTUALLY REPRODUCED THE FINDING, and the reason the
+     * off-ratio block above is not the whole guard.
+     *
+     * A wide catalog plans a maintain-sized week on the first candidate it
+     * tries, so it never exercised the fault — before and after, it closes in
+     * twenty-one placements. What the real seeded corpus has, and what this pool
+     * copies, is a THIN feasible region: the recipes carry about 0.065 g of
+     * protein per kcal where the target's own ratio wants 0.075, so a day
+     * reaches its protein band only through the few combinations that lean on
+     * the highest-protein dishes at large portions — and those are exactly the
+     * combinations the calorie-guidance order tries LAST. Every earlier prefix
+     * is calorie-plausible and protein-short, and the old search placed each one
+     * before discovering it, then unwound.
+     *
+     * Measured on this pool, against the module as it stood before the fix and
+     * as it stands now (targets on §0.7.3's 30/30/40 split, same seed):
+     *
+     *   kcal   before                                  after
+     *   2,000  planned,   462 evaluations              planned,    35
+     *   2,100  planned, 1,428 evaluations              planned,    48
+     *   2,200  REFUSED, 2,040, day budget spent        planned,   498
+     *   2,300  REFUSED, 2,017, day budget spent        planned,   129
+     *   2,400  REFUSED, 2,020, day budget spent        planned,   226
+     *
+     * which is the finding in both of its halves: everything from 2,200 up
+     * refused — every `maintain` and `gain` goal — and the refusals arriving as
+     * `nutrition_tolerance` and `portion_limits`, naming the day bands for weeks
+     * that satisfy them. 2,500 and above stay refused on this pool even now,
+     * deliberately and honestly: the search proves nothing there, it runs out of
+     * the day allowance §0.7.3 sets, and reporting that as a 422 is what the
+     * policy asks for. The pool is tuned to sit right on that edge, which is
+     * what makes it a regression test rather than a demonstration.
+     */
+    const PROTEIN_SCARCE: readonly (readonly [string, MealSlot, number, number, number, number])[] = [
+        ['oats-berries', 'breakfast', 420, 12.6, 68, 10],
+        ['eggs-toast', 'breakfast', 450, 25.2, 32, 22],
+        ['yogurt-bowl', 'breakfast', 380, 28.8, 40, 8],
+        ['protein-smoothie', 'breakfast', 400, 31.5, 45, 6],
+        ['sausage-muffins', 'breakfast', 480, 27, 12, 34],
+        ['chicken-rice-bowl', 'lunch', 620, 43.2, 68, 16],
+        ['tuna-bean-salad', 'lunch', 540, 37.8, 45, 18],
+        ['lentil-soup', 'lunch', 480, 21.6, 66, 12],
+        ['turkey-wrap', 'lunch', 560, 34.2, 52, 20],
+        ['salmon-quinoa', 'lunch', 650, 39.6, 50, 28],
+        ['beef-rice', 'dinner', 700, 45, 72, 22],
+        ['roast-chicken-veg', 'dinner', 620, 46.8, 40, 24],
+        ['shrimp-rice-bowl', 'dinner', 580, 36, 62, 16],
+        ['tofu-stirfry', 'dinner', 520, 27, 58, 18],
+        ['turkey-meatballs', 'dinner', 640, 41.4, 48, 26],
+    ];
+
+    const proteinScarce = (proteinScale = 1): PlanRecipeCandidate[] =>
+        PROTEIN_SCARCE.map(([slug, slot, calories, protein, carbs, fat]) =>
+            makeRecipe({
+                slug,
+                slots: [slot],
+                calories: 0,
+                nutrition: { calories, protein: protein * proteinScale, carbs, fat },
+            }),
+        );
+
+    const targetsAt = (calories: number): MealPlanMacroTotals => ({
+        calories,
+        protein: Math.round((0.3 * calories) / 4),
+        carbs: Math.round((0.4 * calories) / 4),
+        fat: Math.round((0.3 * calories) / 9),
+    });
+
+    /** `searchFor` pins `TARGETS`; this block's whole subject is other targets. */
+    const searchAt = (
+        recipes: PlanRecipeCandidate[],
+        targets: MealPlanMacroTotals,
+        budget?: PlanSearchBudget,
+    ): PlanSearchOutcome => {
+        const seedInputs = makeSeedInputs();
+        const preferences = makePreferences();
+        const slots = resolveSlotSchedule(preferences.meal_schedule, preferences.meal_times);
+        const candidates = buildPlanCandidates(recipes, preferences, derivePlanSeed(seedInputs));
+
+        return searchPlanWeek({
+            dates: planDatesFrom(seedInputs.startDate),
+            slots,
+            candidatesBySlot: new Map(
+                slots.map(
+                    (slot) => [slot.slot, candidatesForSlot(candidates, preferences, slot.slot)] as const,
+                ),
+            ),
+            targets,
+            userBudgetTier: resolveUserBudgetTier(
+                preferences.budget,
+                preferences.no_budget_preference,
+                preferences.meal_schedule,
+            ),
+            budget,
+        });
+    };
+
+    // The three targets the band refused, plus the two below it that always
+    // worked — so a future change that trades the band for the targets under it
+    // fails here rather than looking like progress.
+    const RECOVERED_LEVELS = [2000, 2100, 2200, 2300, 2400] as const;
+
+    it.each(RECOVERED_LEVELS)('plans a whole week at %d kcal a day', (calories) => {
+        const targets = targetsAt(calories);
+        const result = generateWeeklyPlan({
+            seedInputs: makeSeedInputs(),
+            preferences: makePreferences(),
+            targets,
+            recipes: proteinScarce(),
+        });
+
+        expect(result.days).toHaveLength(PLAN_DAY_COUNT);
+
+        for (const day of result.days) {
+            expect(isDayWithinTolerance(day.plannedTotals, targets)).toBe(true);
+        }
+    });
+
+    it.each(RECOVERED_LEVELS)(
+        'closes the %d kcal week well inside one day’s allowance',
+        (calories) => {
+            // The cost, not just the verdict. Each of these weeks used to spend
+            // the whole per-day allowance and refuse; the bound now finds them in
+            // a small fraction of it, and asserting that is what keeps a future
+            // change from buying the verdict back with the budget.
+            const outcome = searchAt(proteinScarce(), targetsAt(calories));
+
+            expect(outcome.days).not.toBeNull();
+            expect(outcome.exhausted).toBe(false);
+            expect(outcome.evaluations).toBeLessThan(MAX_EVALUATIONS_PER_DAY);
+        },
+    );
+
+    it.each(RECOVERED_LEVELS)('gives every day of the %d kcal week three different recipes', (calories) => {
+        const result = generateWeeklyPlan({
+            seedInputs: makeSeedInputs(),
+            preferences: makePreferences(),
+            targets: targetsAt(calories),
+            recipes: proteinScarce(),
+        });
+
+        for (const day of result.days) {
+            const slugs = day.meals.map((meal) => meal.slug);
+
+            expect(new Set(slugs).size).toBe(slugs.length);
+        }
+    });
+
+    it('settles a pool that truly cannot reach the protein band, instead of exhausting on it', () => {
+        // THE OTHER THING THE BOUND BOUGHT: a truthful refusal. Scale the same
+        // pool's protein down until no week exists and the old search still
+        // spent its entire day allowance before giving up — so the 422 it
+        // produced could not distinguish "no week exists" from "I ran out of
+        // time looking". The bound proves the case instead: the search SETTLES,
+        // `exhausted` is false, and the verdict is a demonstrated one.
+        const outcome = searchAt(proteinScarce(0.7), targetsAt(2200));
+
+        expect(outcome.days).toBeNull();
+        expect(outcome.exhausted).toBe(false);
+        expect(outcome.exhaustedBy).toBeNull();
+        expect(outcome.evaluations).toBeLessThan(MAX_EVALUATIONS_PER_DAY);
+    });
+
+    it('plans the 2,600 kcal week the widest budget could not reach', () => {
+        // THE LEVEL THAT MOVED LAST, and the reason it gets its own case rather
+        // than joining the list above. 2,600 on this pool was out of reach even
+        // at a million evaluations a day: the greedy order spent both permitted
+        // uses of the calorie-dense recipes inside the first four days, and no
+        // budget buys back a week those four days have already ruled out. The
+        // same-week variety order stops spending them, so the week is found
+        // inside policy — but it is the dearest of these levels, so the claim
+        // here is the PLAN allowance rather than the tight per-day one the
+        // cheaper levels meet.
+        const targets = targetsAt(2600);
+        const outcome = searchAt(proteinScarce(), targets);
+
+        expect(outcome.days).toHaveLength(PLAN_DAY_COUNT);
+        expect(outcome.exhausted).toBe(false);
+        expect(outcome.evaluations).toBeLessThan(MAX_EVALUATIONS_PER_PLAN);
+
+        const result = generateWeeklyPlan({
+            seedInputs: makeSeedInputs(),
+            preferences: makePreferences(),
+            targets,
+            recipes: proteinScarce(),
+        });
+
+        for (const day of result.days) {
+            const slugs = day.meals.map((meal) => meal.slug);
+
+            expect(isDayWithinTolerance(day.plannedTotals, targets)).toBe(true);
+            expect(new Set(slugs).size).toBe(slugs.length);
+        }
+    });
+
+    it('reports an exhausted search as exhausted rather than as a proof', () => {
+        // DISTINGUISHABILITY IS THE PROPERTY, and it is the one the finding was
+        // really about: a refusal that ran out of room must never wear the same
+        // face as a refusal that was proved. The test above holds the proved
+        // side — `exhausted: false` on a pool with no week. This holds the other
+        // side, and it has to move the wall to do it: 2,600 on this pool used to
+        // be the exhaustion case and now plans inside policy, so the only honest
+        // way to stand a pool against a budget is to shrink the budget rather
+        // than to hunt for a target that happens to sit just out of reach.
+        const outcome = searchAt(proteinScarce(), targetsAt(2600), {
+            perDay: 40,
+            perPlan: MAX_EVALUATIONS_PER_PLAN,
+        });
+
+        expect(outcome.days).toBeNull();
+        expect(outcome.exhausted).toBe(true);
+        expect(outcome.exhaustedBy).toBe('day');
+        // `evaluations` is the WEEK's spend, not the frontier day's: earlier days
+        // closed and were charged for it, so the total sits above the day cap
+        // that fired. The guard named above is the claim; the number is not.
+        expect(outcome.evaluations).toBeGreaterThanOrEqual(40);
+    });
+});
+
+describe('the jointly-infeasible pool', () => {
+    // The fixture the budget, exhaustion and probe blocks are built from,
+    // asserting its own two premises so neither can rot into the opposite of
+    // what those blocks need. See its definition for the arithmetic.
+    const pools = (): PlanCandidate[][] => {
+        const preferences = makePreferences();
+        const candidates = buildPlanCandidates(
+            jointlyInfeasibleCatalog(),
+            preferences,
+            derivePlanSeed(makeSeedInputs()),
+        );
+
+        return (['breakfast', 'lunch', 'dinner'] as MealSlot[]).map((slot) =>
+            candidatesForSlot(candidates, preferences, slot),
+        );
+    };
+
+    it('closes no day at all, by enumeration rather than by assertion', () => {
+        // Every distinct (family, portion) class in every slot, against the
+        // real day tolerance. The pool is interchangeable within a family, so
+        // the classes are the whole search space.
+        const classesOf = (pool: PlanCandidate[]): PlanCandidate[] => {
+            const byClass = new Map<string, PlanCandidate>();
+
+            for (const candidate of pool) {
+                const key = `${candidate.nutrition.protein > 0 ? 'p' : 'f'}:${candidate.portionMultiplier}`;
+
+                if (!byClass.has(key)) {
+                    byClass.set(key, candidate);
+                }
+            }
+
+            return [...byClass.values()];
+        };
+
+        const [breakfasts, lunches, dinners] = pools().map(classesOf);
+        let feasible = 0;
+
+        for (const breakfast of breakfasts) {
+            for (const lunch of lunches) {
+                for (const dinner of dinners) {
+                    const totals = computeDayTotals([
+                        { planned: breakfast.nutrition },
+                        { planned: lunch.nutrition },
+                        { planned: dinner.nutrition },
+                    ]);
+
+                    if (isDayWithinTolerance(totals, TARGETS)) {
+                        feasible += 1;
+                    }
+                }
+            }
+        }
+
+        expect(breakfasts).toHaveLength(2 * MAIN_SLOT_PORTION_MULTIPLIERS.length);
+        expect(feasible).toBe(0);
+    });
+
+    it('is invisible to the admissibility bound at the first slot', () => {
+        // The second premise, and the one that makes the pool spend an
+        // allowance: every band is individually inside what the three slots
+        // could contribute, so nothing is provably impossible before anything
+        // is placed. A pool that missed on one nutrient would be cut here and
+        // the budget fixtures would assert a spend that never happened.
+        const suffixes = remainingContributionBounds(pools().map(slotContributionBounds));
+
+        expect(canReachDayBands(zeroTotals, suffixes[0], dayToleranceBands(TARGETS))).toBe(true);
+    });
+});
+
+/* ---------------------------------------------------------------------------
  * searchPlanWeek — the two evaluation guards, told apart
  *
  * Under the shipped policy the per-plan cap is exactly seven per-day caps, so a
@@ -2730,17 +3984,13 @@ describe('generateWeeklyPlan', () => {
  * ------------------------------------------------------------------------- */
 
 describe('searchPlanWeek', () => {
-    /** Twenty recipes per slot, none of which can reach the day target. */
-    const unreachableCatalog = (): PlanRecipeCandidate[] =>
-        (['breakfast', 'lunch', 'dinner'] as MealSlot[]).flatMap((slot) =>
-            Array.from({ length: 20 }, (_unused, index) =>
-                makeRecipe({
-                    slug: `${slot}-${String(index).padStart(2, '0')}`,
-                    slots: [slot],
-                    calories: 60 + index,
-                }),
-            ),
-        );
+    /**
+     * Twenty-four recipes per slot, no assignment of which closes a day and no
+     * band the bound can rule out early — the pool a budget guard needs, since
+     * a catalog that misses on one nutrient is now rejected before anything is
+     * placed. See "the jointly-infeasible pool".
+     */
+    const unclosableCatalog = jointlyInfeasibleCatalog;
 
     /**
      * Four breakfasts, four lunches and only THREE dinners. Three recipes used
@@ -2770,13 +4020,37 @@ describe('searchPlanWeek', () => {
         makeRecipe({ slug: 'd1', slots: ['dinner'], calories: 800 }),
     ];
 
-    it('spends exactly the per-day allowance on a day that cannot close', () => {
-        const outcome = searchFor(unreachableCatalog());
+    it('settles a day that cannot close without spending its allowance', () => {
+        // WHAT CHANGED, AND WHY THIS IS THE STRONGER CLAIM. This pool closes no
+        // day at all, and the search used to prove that the only way it could —
+        // by placing until the day's 2,000 evaluations were gone. Running an
+        // allowance out ENDS the search (§0.7.3), so one such day took with it
+        // every week reachable by changing an earlier day, which is the false
+        // refusal this work removes. The day is now recognised before it is
+        // paid for, so the refusal is a settled proof rather than a wall: no
+        // exhaustion, no guard named, and a spend far below the allowance.
+        const outcome = searchFor(unclosableCatalog());
+
+        expect(outcome.days).toBeNull();
+        expect(outcome.exhausted).toBe(false);
+        expect(outcome.exhaustedBy).toBeNull();
+        expect(outcome.evaluations).toBeLessThan(MAX_EVALUATIONS_PER_DAY);
+        expect(outcome.frontierDayIndex).toBe(0);
+        expect(outcome.aborted).toBe(false);
+    });
+
+    it('names the day guard when one day spends its whole allowance', () => {
+        // Exhaustion is still reachable and still reported — it just takes a day
+        // the search cannot finish inside its allowance rather than one that
+        // cannot be finished at all. A one-evaluation day allowance is the
+        // smallest pool-independent way to stand a day up against its own wall:
+        // the first placement is charged, and the second slot meets the guard.
+        const outcome = searchFor(feasibleCatalog(), { perDay: 1, perPlan: MAX_EVALUATIONS_PER_PLAN });
 
         expect(outcome.days).toBeNull();
         expect(outcome.exhausted).toBe(true);
         expect(outcome.exhaustedBy).toBe('day');
-        expect(outcome.evaluations).toBe(MAX_EVALUATIONS_PER_DAY);
+        expect(outcome.evaluations).toBe(1);
         expect(outcome.frontierDayIndex).toBe(0);
         expect(outcome.aborted).toBe(false);
     });
@@ -2860,12 +4134,28 @@ describe('searchPlanWeek', () => {
     });
 
     it('falls back to the shipped policy for a budget it was not given', () => {
-        // An empty budget object is the production case spelled out: neither
-        // cap is supplied, so both constants apply and the week still plans.
+        // Proved by EQUIVALENCE rather than by a pool that happens to stop on a
+        // policy number. A fixture built to hit exactly 2,000 only says "the
+        // default is 2,000" for as long as that fixture keeps spending an
+        // allowance — which is precisely what this work stopped it doing. Asking
+        // instead whether an unsupplied cap behaves the same as the constant
+        // supplied by hand is the claim itself, and it holds for any pool.
+        const omitted = searchFor(singleDinnerRecipe(), {});
+        const spelledOut = searchFor(singleDinnerRecipe(), {
+            perDay: MAX_EVALUATIONS_PER_DAY,
+            perPlan: MAX_EVALUATIONS_PER_PLAN,
+        });
+
+        expect(omitted).toEqual(spelledOut);
+
+        // A partial budget takes the constant for the half it left out: supply
+        // only the plan cap and the day cap must still be the shipped one, which
+        // a smaller day cap visibly changes.
+        expect(searchFor(singleDinnerRecipe(), { perPlan: MAX_EVALUATIONS_PER_PLAN })).toEqual(spelledOut);
+        expect(searchFor(singleDinnerRecipe(), { perDay: 25 }).evaluations).toBe(25);
+
+        // And the production case spelled out: neither cap supplied, week plans.
         expect(searchFor(feasibleCatalog(), {}).days).toHaveLength(PLAN_DAY_COUNT);
-        expect(searchFor(unreachableCatalog(), { perPlan: MAX_EVALUATIONS_PER_PLAN }).evaluations).toBe(
-            MAX_EVALUATIONS_PER_DAY,
-        );
     });
 });
 
@@ -3038,14 +4328,33 @@ describe('searchPlanWeek — same-day repetition', () => {
         });
     });
 
-    describe('a same-day pair that is partly unwound', () => {
-        // THE REFERENCE-COUNTING REGRESSION GUARD, and it is a real one: with
-        // the per-day membership held as a plain set — added on every placement
-        // and deleted on every unwind — this three-day search comes back with
-        // `protein-bd` on day 1 AND day 2, because unwinding the second of a
-        // same-day pair erased the recipe from the day while the first was still
-        // placed, and day 2's adjacent-day exclusion then could not see it.
-        // Counting the placements per day is what keeps that exclusion true.
+    describe('a week the variety pass closes without a pair', () => {
+        // The same catalog that used to be THE REFERENCE-COUNTING GUARD, kept
+        // for what it now states — and the record of why it states something
+        // else.
+        //
+        // It was built so that a same-day pair was placed, partly unwound, and
+        // the following day still had to refuse the recipe left behind: held as
+        // a plain set rather than a count, the per-day membership lost the
+        // recipe on the unwind and day 2 planned a consecutive-day repeat. That
+        // scenario cannot arise any more, and not because the bookkeeping
+        // changed — it is still a count. Under the two-pass variety rule a pair
+        // is only ever placed by the permissive pass, the permissive pass only
+        // runs on a day the strict pass could not close, and such a day has no
+        // three-distinct assignment at all — so an ACCEPTED day that contains a
+        // pair always spends that recipe's weekly cap, and the day after
+        // excludes it by the cap whatever the day-membership says.
+        //
+        // The bookkeeping is still exercised, in the opposite direction and far
+        // more often: the strict pass excludes a recipe already placed today
+        // from the day's later slots, so every backtrack must RESTORE it. A
+        // count that failed to decrement would refuse weeks the feasible and
+        // week-level fixtures plan, and a pair reaching the weekly cap is
+        // asserted in the sibling block above.
+        //
+        // What this catalog proves now is the variety rule itself: with 262
+        // three-distinct assignments available to a fresh day, all three days
+        // close without a pair even though §0.7.3 would permit one.
         const catalog = (): PlanRecipeCandidate[] => [
             makeRecipe({
                 slug: 'lean-bld',
@@ -3078,15 +4387,64 @@ describe('searchPlanWeek — same-day repetition', () => {
             return outcome.days as PlannedMealAssignment[][];
         };
 
-        it('places a same-day pair, so the unwind path is exercised', () => {
+        it('gives every day three different recipes, though a pair would be legal', () => {
+            // The end-to-end statement of the variety rule, and the regression
+            // guard for the same-day repeats this generator used to ship: a day
+            // serves one dish twice only when, given the days before it, it
+            // cannot be filled any other way. Here it always can.
             const days = week();
-            const paired = days.filter((day) => {
+
+            for (const day of days) {
                 const slugs = day.map((meal) => meal.slug);
 
-                return new Set(slugs).size < slugs.length;
-            });
+                expect(new Set(slugs).size).toBe(slugs.length);
+            }
+        });
 
-            expect(paired.length).toBeGreaterThan(0);
+        it('had a same-day pair available and did not take it', () => {
+            // Which makes the assertion above a choice rather than an accident:
+            // pairs close this day too, and the search prefers the variety.
+            const [breakfasts, lunches, dinners] = (['breakfast', 'lunch', 'dinner'] as MealSlot[]).map(
+                (slot) => {
+                    const preferences = makePreferences();
+                    const candidates = buildPlanCandidates(
+                        catalog(),
+                        preferences,
+                        derivePlanSeed(makeSeedInputs()),
+                    );
+
+                    return candidatesForSlot(candidates, preferences, slot);
+                },
+            );
+            let withAPair = 0;
+
+            for (const breakfast of breakfasts) {
+                for (const lunch of lunches) {
+                    for (const dinner of dinners) {
+                        const totals = computeDayTotals([
+                            { planned: breakfast.nutrition },
+                            { planned: lunch.nutrition },
+                            { planned: dinner.nutrition },
+                        ]);
+
+                        if (!isDayWithinTolerance(totals, TARGETS)) {
+                            continue;
+                        }
+
+                        const recipeIds = new Set([
+                            breakfast.recipe.recipe_id,
+                            lunch.recipe.recipe_id,
+                            dinner.recipe.recipe_id,
+                        ]);
+
+                        if (recipeIds.size < 3) {
+                            withAPair += 1;
+                        }
+                    }
+                }
+            }
+
+            expect(withAPair).toBeGreaterThan(0);
         });
 
         it('refuses the paired recipe on the following day', () => {
@@ -3471,23 +4829,16 @@ describe('analyzeLimitingConstraints', () => {
 
     describe('the request-scoped probe budget', () => {
         /**
-         * Sixty recipes no portion of which can reach the day target, all at 45
-         * cooking minutes. Against a 30-minute limit every slot is EMPTY, so the
-         * relaxation to the 45-minute tier is the probe that runs — and it
-         * searches a catalog it cannot close, which is what makes it spend
-         * whatever allowance it is given instead of a handful of evaluations.
+         * The jointly-infeasible pool at 45 cooking minutes. Against a
+         * 30-minute limit every slot is EMPTY, so the relaxation to the
+         * 45-minute tier is the probe that runs — and it searches a catalog it
+         * cannot close, which is what makes it spend whatever allowance it is
+         * given instead of a handful of evaluations. A pool that missed the
+         * target on calories alone would not: the bound would settle it, and
+         * these tests would be asserting a spend that never happened.
          */
         const unclosableAt45Minutes = (): PlanRecipeCandidate[] =>
-            (['breakfast', 'lunch', 'dinner'] as MealSlot[]).flatMap((slot) =>
-                Array.from({ length: 20 }, (_unused, index) =>
-                    makeRecipe({
-                        slug: `${slot}-${String(index).padStart(2, '0')}`,
-                        slots: [slot],
-                        calories: 60 + index,
-                        totalMinutes: 45,
-                    }),
-                ),
-            );
+            jointlyInfeasibleCatalog({ totalMinutes: 45 });
 
         /** Two relaxations to probe, in the order the verdict tries them. */
         const twoProbePreferences = makePreferences({
@@ -3561,22 +4912,19 @@ describe('analyzeLimitingConstraints', () => {
             // catalog of its own to burn through.
             const bothHalvesSpend = (): PlanRecipeCandidate[] => [
                 ...unclosableAt45Minutes(),
-                ...(['breakfast', 'lunch', 'dinner'] as MealSlot[]).flatMap((slot) =>
-                    Array.from({ length: 20 }, (_unused, index) =>
-                        makeRecipe({
-                            slug: `quick-${slot}-${String(index).padStart(2, '0')}`,
-                            slots: [slot],
-                            calories: 60 + index,
-                            totalMinutes: 20,
-                        }),
-                    ),
-                ),
+                ...jointlyInfeasibleCatalog({ totalMinutes: 20, prefix: 'quick-' }),
             ];
 
             const primary = searchFor(bothHalvesSpend(), undefined, twoProbePreferences);
 
+            // The precondition this needs is a FAILED primary search, which is
+            // what hands its spend to the analysis. Whether that failure was a
+            // spent allowance or a settled proof is not part of the claim — and
+            // it is no longer a spent allowance here, because a day that cannot
+            // close is now recognised before it is paid for. The per-plan bound
+            // covers both halves either way, which is the statement §0.7.3 makes
+            // about a request and the one asserted below.
             expect(primary.days).toBeNull();
-            expect(primary.exhausted).toBe(true);
 
             const verdict = analyzeLimitingConstraints({
                 seedInputs: makeSeedInputs(),

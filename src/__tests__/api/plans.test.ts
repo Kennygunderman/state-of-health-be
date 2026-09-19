@@ -117,6 +117,11 @@ import {
     getMealPlanDay,
     regeneratePlan,
 } from '../../services/mealPlan.service';
+// The module OBJECT, because `jest.spyOn` needs one to install the spy on: the
+// cases that count what `GET /plans/current` resolves wrap `getTargets` in
+// place, which a named import gives no handle to. The same arrangement
+// `api/swaps.test.ts` uses to count what a commit resolves under its lock.
+import * as targetsService from '../../services/targets.service';
 import type {
     AffectedMealsResponse,
     CurrentMealPlanResponse,
@@ -1077,6 +1082,205 @@ describe('POST /api/meal-planning/plans', () => {
             expect(constraints.map((constraint) => constraint.constraintKey)).toContain('slot_coverage');
             expect(await storedPlans()).toHaveLength(0);
             expect(await storedActions()).toHaveLength(0);
+        });
+    });
+
+    /* -----------------------------------------------------------------------
+     * A week at maintain and gain sized targets — THE REFUSAL-BAND REGRESSION
+     * --------------------------------------------------------------------- */
+
+    describe('a maintain- or gain-sized target over a varied catalog', () => {
+        // WHAT THIS GUARDS. `POST /api/meal-planning/plans` used to answer
+        // `422 no_matching_meals` for every daily target from roughly 2,200 kcal
+        // upwards — which is every `maintain` and every `gain` goal — and to name
+        // `nutrition_tolerance` and `portion_limits` as the reason while weeks
+        // satisfying the day bands demonstrably existed. The refusals were not
+        // even monotonic in the target: 2,200 and 2,400 were refused while the
+        // targets either side of them published.
+        //
+        // WHY IT HAS TO BE HERE AND NOT ONLY IN THE LOGIC SUITE. Every other
+        // generator world in this file seeds `PLANNABLE_RECIPE_COUNT` clones of
+        // ONE recipe shape, which is deliberate — it makes the grocery and
+        // determinism assertions measure themselves rather than the seed — but a
+        // pool of identical recipes is also the one pool the fault could not
+        // occur in. That difference is a property of the FIXTURE, so a case that
+        // does not seed a varied one cannot hold this line however it is
+        // written. The pure-function half of the guard, over the same figures and
+        // with the before-and-after evaluation counts, is in
+        // `mealPlan.logic.test.ts` under "a protein-scarce catalog — the refusal
+        // band, reproduced"; this case is the one that proves the STATUS the
+        // route puts on the wire.
+        //
+        // WHAT MAKES THE POOL REPRODUCE IT. Fifteen recipes, five to a slot —
+        // enough for seven days under `MAX_RECIPE_USES_PER_WEEK`, with room over
+        // `MIN_ELIGIBLE_RECIPES_PER_SLOT` — every one OFF the target's own macro
+        // ratio, and the whole pool PROTEIN-SCARCE at roughly 0.065 g per kcal
+        // where the 30/30/40 split wants 0.075. That is the real corpus's own
+        // shape, and it leaves the feasible region thin: a day reaches its
+        // protein band only through the few combinations that lean hardest on
+        // the high-protein dishes, which are the last ones the calorie-guidance
+        // order tries. A wide pool would close on its first candidate and prove
+        // nothing. They still all shop for the one shared food, keeping this
+        // file's grocery invariant.
+        //
+        // Verified against the pre-fix module on these exact figures: 2,200,
+        // 2,300 and 2,400 each refused with `422 no_matching_meals` after
+        // spending the whole per-day evaluation allowance, while 2,000 and 2,100
+        // published — the non-monotonic band, exactly as reported.
+        interface VariedRecipeSpec {
+            readonly slug: string;
+            readonly slot: string;
+            readonly perServing: { calories: number; protein: number; carbs: number; fat: number };
+        }
+
+        const VARIED_POOL: readonly VariedRecipeSpec[] = [
+            { slug: 'oats-berries', slot: 'breakfast', perServing: { calories: 420, protein: 12.6, carbs: 68, fat: 10 } },
+            { slug: 'eggs-toast', slot: 'breakfast', perServing: { calories: 450, protein: 25.2, carbs: 32, fat: 22 } },
+            { slug: 'yogurt-bowl', slot: 'breakfast', perServing: { calories: 380, protein: 28.8, carbs: 40, fat: 8 } },
+            { slug: 'protein-smoothie', slot: 'breakfast', perServing: { calories: 400, protein: 31.5, carbs: 45, fat: 6 } },
+            { slug: 'sausage-muffins', slot: 'breakfast', perServing: { calories: 480, protein: 27, carbs: 12, fat: 34 } },
+            { slug: 'chicken-rice-bowl', slot: 'lunch', perServing: { calories: 620, protein: 43.2, carbs: 68, fat: 16 } },
+            { slug: 'tuna-bean-salad', slot: 'lunch', perServing: { calories: 540, protein: 37.8, carbs: 45, fat: 18 } },
+            { slug: 'lentil-soup', slot: 'lunch', perServing: { calories: 480, protein: 21.6, carbs: 66, fat: 12 } },
+            { slug: 'turkey-wrap', slot: 'lunch', perServing: { calories: 560, protein: 34.2, carbs: 52, fat: 20 } },
+            { slug: 'salmon-quinoa', slot: 'lunch', perServing: { calories: 650, protein: 39.6, carbs: 50, fat: 28 } },
+            { slug: 'beef-rice', slot: 'dinner', perServing: { calories: 700, protein: 45, carbs: 72, fat: 22 } },
+            { slug: 'roast-chicken-veg', slot: 'dinner', perServing: { calories: 620, protein: 46.8, carbs: 40, fat: 24 } },
+            { slug: 'shrimp-rice-bowl', slot: 'dinner', perServing: { calories: 580, protein: 36, carbs: 62, fat: 16 } },
+            { slug: 'tofu-stirfry', slot: 'dinner', perServing: { calories: 520, protein: 27, carbs: 58, fat: 18 } },
+            { slug: 'turkey-meatballs', slot: 'dinner', perServing: { calories: 640, protein: 41.4, carbs: 48, fat: 26 } },
+        ];
+
+        /** Pinned, like every other sequence in this file, so a rebuilt world is identical. */
+        const VARIED_FOOD_SEQUENCE = 500;
+        const VARIED_RECIPE_SEQUENCE_BASE = 510;
+
+        /** §0.7.3's 30/30/40 split, which is what the targets screen confirms. */
+        const targetsFor = (calories: number) => ({
+            calories,
+            protein: Math.round((0.3 * calories) / 4),
+            carbs: Math.round((0.4 * calories) / 4),
+            fat: Math.round((0.3 * calories) / 9),
+        });
+
+        /**
+         * §0.7.3's day bands, as LITERALS rather than as the policy module's own
+         * constants.
+         *
+         * Reading the tolerance from the code under test would let this case
+         * judge a published week by whatever the generator currently believes,
+         * and the finding was precisely a disagreement between what the
+         * generator would accept and what it would look for. Stating the numbers
+         * here means a published day is checked against the AAP.
+         */
+        const dayIsAcceptable = (
+            day: MealPlanDayResponse,
+            targets: { calories: number; protein: number; carbs: number; fat: number },
+        ): boolean => {
+            const macroBand = (target: number) => Math.max(15, 0.15 * target);
+            const totals = day.plannedTotals;
+
+            return (
+                Math.abs(totals.calories - targets.calories) <= 0.1 * targets.calories &&
+                totals.protein >= targets.protein - 15 &&
+                totals.protein <= targets.protein + 25 &&
+                Math.abs(totals.carbs - targets.carbs) <= macroBand(targets.carbs) &&
+                Math.abs(totals.fat - targets.fat) <= macroBand(targets.fat)
+            );
+        };
+
+        const seedVariedWorld = async (
+            targets: { calories: number; protein: number; carbs: number; fat: number },
+        ): Promise<void> => {
+            await makeUser({
+                id: USER_ID,
+                target_calories: targets.calories,
+                target_protein_g: targets.protein,
+                target_carbs_g: targets.carbs,
+                target_fat_g: targets.fat,
+            });
+            // `confirmed_targets` has to match the four `users` columns field for
+            // field, or the targets resolve `legacy` and the week is refused with
+            // `targets_unconfirmed` before the search ever runs (§0.5.2).
+            await makePreferences(USER_ID, {
+                time_zone: PLAN_TIME_ZONE,
+                confirmed_targets: targets,
+            });
+
+            const food = await seedSharedFood(VARIED_FOOD_SEQUENCE);
+
+            for (const [index, spec] of VARIED_POOL.entries()) {
+                await makeRecipeVersion({
+                    sequence: VARIED_RECIPE_SEQUENCE_BASE + index,
+                    slug: `plans-suite-varied-${spec.slug}`,
+                    catalogFoodId: food.id,
+                    meal_slots: [spec.slot],
+                    perServing: spec.perServing,
+                });
+            }
+        };
+
+        // 2,000 and 2,100 published before the fix and must still — a change that
+        // traded the band for the targets beneath it would fail here rather than
+        // look like progress. 2,200 upwards are the maintain and gain sized ones
+        // the route refused.
+        it.each([2000, 2100, 2200, 2300, 2400])(
+            'publishes a seven-day week at %d kcal a day',
+            async (calories) => {
+                const targets = targetsFor(calories);
+                await seedVariedWorld(targets);
+
+                const response = await postPlan(generateBody()).expect(201);
+                const plan = response.body as MealPlanResponse;
+
+                expect(plan.days).toHaveLength(PLAN_DAY_COUNT);
+                expect(plan.summary.plannedMeals).toBe(PLAN_DAY_COUNT * MEALS_PER_DAY);
+                expect(plan.targets).toEqual(targets);
+
+                for (const day of plan.days) {
+                    expect(day.meals).toHaveLength(MEALS_PER_DAY);
+                    // The week is not merely published: every day of it is
+                    // acceptable by the policy the refusal claimed it violated.
+                    expect(dayIsAcceptable(day, targets)).toBe(true);
+                }
+
+                // And it is a real row, not just a response body.
+                expect(await storedPlans()).toHaveLength(1);
+            },
+        );
+
+        it('gives every published day three different recipes', async () => {
+            // JRNY1-same-day-repeat, end to end: the rule permits one dish at two
+            // slots of a day, and two thirds of the corpus's planned weeks used to
+            // take it. A pool this wide never needs to, and the search now prefers
+            // the distinct assignment — see `solveDay`'s two passes.
+            const targets = targetsFor(2400);
+            await seedVariedWorld(targets);
+
+            const response = await postPlan(generateBody()).expect(201);
+            const plan = response.body as MealPlanResponse;
+
+            for (const day of plan.days) {
+                const versionIds = day.meals.map((meal) => meal.recipe.versionId);
+
+                expect(new Set(versionIds).size).toBe(versionIds.length);
+            }
+        });
+
+        it('still refuses a target the catalog genuinely cannot reach', async () => {
+            // The other half of the finding: the route must not have become
+            // agreeable. Fifteen recipes at their largest offered portion cannot
+            // approach 6,000 kcal, and that week is still refused — as an
+            // infeasible week, with the allergies promise intact.
+            const targets = targetsFor(6000);
+            await seedVariedWorld(targets);
+
+            const response = await postPlan(generateBody()).expect(422);
+            const body = asErrorBody(response.body);
+
+            expect(body.error).toBe('no_matching_meals');
+            expect(body.allergiesKept).toBe(true);
+            expect(await storedPlans()).toHaveLength(0);
         });
     });
 
@@ -2332,6 +2536,204 @@ describe('GET /api/meal-planning/plans/current', () => {
             // Identity comes only from the verified token the harness stands in
             // for; without it the request never reaches a handler (Rule §4).
             await request.get(`${PLANS_PATH}/current`).expect(401);
+        });
+    });
+
+    /* -----------------------------------------------------------------------
+     * What this collection resolves ONCE for the whole response
+     *
+     * The cases above assert the contract. These assert the read's COST, which
+     * no assertion about the body can reach: the collection hydrates up to TWO
+     * plans inside one `RepeatableRead` snapshot, and the canonical targets read
+     * — `targets.service.ts::getTargets`, a single
+     * `users ⋈ meal_plan_preferences` join keyed by USER and by nothing else —
+     * is the only input both hydrations share. Taken per plan it ran TWICE in
+     * one snapshot, where the second execution was guaranteed to return the
+     * first one's answer; statement count is what multiplies once PostgreSQL is
+     * not co-located, so the duplicate is a whole round trip for a value already
+     * in hand.
+     *
+     * A unit test cannot see this and neither can the body — the response is
+     * identical either way, which is exactly why the duplicate survived — so the
+     * only way to pin it is to count the calls a real request makes.
+     *
+     * THE EMPTY STATE IS PINNED AS FIRMLY AS THE TWO-PLAN ONE, and deliberately:
+     * a user with no plan hydrates nothing, so the hoisted read must not run at
+     * all. Hoisting it above the members would have ADDED a statement to the one
+     * request that needs none, and only a case that counts ZERO can fail on
+     * that.
+     * --------------------------------------------------------------------- */
+
+    describe('the canonical targets read it resolves once per request', () => {
+        /**
+         * A snapshot for the upcoming week that differs from `FIXTURE_TARGETS`
+         * in every member, so the two members' `targetsStale` verdicts cannot
+         * agree by accident.
+         */
+        const SUCCESSOR_SNAPSHOT_TARGETS = { calories: 2400, protein: 170, carbs: 240, fat: 80 };
+
+        /** `meal_plans.targets_snapshot` as the column takes it, beside `asJsonFlags`. */
+        const asJsonMacros = (macros: typeof SUCCESSOR_SNAPSHOT_TARGETS): Prisma.InputJsonValue =>
+            macros as unknown as Prisma.InputJsonValue;
+
+        /**
+         * A COUNTING SPY, NOT A STUB: no `mockImplementation`, so the real
+         * `users ⋈ meal_plan_preferences` join still runs and the request each
+         * case drives is the same request every other case in this file drives.
+         * The same arrangement `api/swaps.test.ts` uses to count what a commit
+         * resolves under its lock.
+         */
+        const countTargetReads = () => jest.spyOn(targetsService, 'getTargets');
+
+        /**
+         * The recorded callers projected to their user ids.
+         *
+         * Each recorded call also carries the transaction client, and a failure
+         * that tried to print it would serialise the whole Prisma client instead
+         * of showing a readable diff.
+         */
+        const readers = (spy: jest.SpyInstance): unknown[] => spy.mock.calls.map(([userId]) => userId);
+
+        it('reads the user’s targets exactly once while hydrating both members', async () => {
+            const { plan, recipe } = await seedPlannedWeek(USER_ID);
+            const successorStart = addDaysToDayKey(plan.end_date.toISOString().slice(0, 10), 1);
+            const successor = await makePlan(USER_ID, {
+                sequence: 493,
+                recipeVersionId: recipe.id,
+                startDate: successorStart,
+                // The upcoming week was built against DIFFERENT numbers, which
+                // is what makes this case prove the split rather than merely the
+                // count: one hoisted per-USER read feeds both members, while
+                // `targets_snapshot` stays a per-PLAN fact and the two members
+                // therefore report different `targetsStale`.
+                targets_snapshot: asJsonMacros(SUCCESSOR_SNAPSHOT_TARGETS),
+            });
+
+            const targetReads = countTargetReads();
+
+            try {
+                const current = asCurrent((await getCurrent().expect(200)).body);
+
+                // ONE read for the request. Two would mean the value was
+                // resolved again for the second member, inside a snapshot that
+                // already guarantees the first answer.
+                expect(readers(targetReads)).toEqual([USER_ID]);
+
+                expect(current.current?.id).toBe(plan.id);
+                expect(current.upcoming?.id).toBe(successor.id);
+
+                // Both members carry the user's CURRENT confirmed targets
+                // (§0.5.2), stated as literals rather than re-derived from the
+                // response: these are the values the route answered before the
+                // read was hoisted.
+                expect(current.current?.targets).toEqual(FIXTURE_TARGETS);
+                expect(current.upcoming?.targets).toEqual(FIXTURE_TARGETS);
+
+                // And each reports its own snapshot and its own staleness.
+                expect(current.current?.generationTargets).toEqual(FIXTURE_TARGETS);
+                expect(current.current?.targetsStale).toBe(false);
+                expect(current.upcoming?.generationTargets).toEqual(SUCCESSOR_SNAPSHOT_TARGETS);
+                expect(current.upcoming?.targetsStale).toBe(true);
+            } finally {
+                // Restored in a `finally` for the reason the flag spies are
+                // restored in the case that installs them: this suite runs in
+                // band beside files that call the real implementation.
+                targetReads.mockRestore();
+            }
+        });
+
+        it('reads them once more after they move, and reports the moved values on both members', async () => {
+            const { plan, recipe } = await seedPlannedWeek(USER_ID);
+            const successorStart = addDaysToDayKey(plan.end_date.toISOString().slice(0, 10), 1);
+            const successor = await makePlan(USER_ID, {
+                sequence: 494,
+                recipeVersionId: recipe.id,
+                startDate: successorStart,
+            });
+
+            // Moved through the canonical writer, so the join the single read
+            // makes is answering about a state a user can actually reach.
+            await putTargets({ source: 'manual', ...RECONFIRMED_TARGETS, expectedTargetsRevision: 1 }).expect(200);
+
+            const targetReads = countTargetReads();
+
+            try {
+                const current = asCurrent((await getCurrent().expect(200)).body);
+
+                expect(readers(targetReads)).toEqual([USER_ID]);
+
+                // One read, two members, and the moved values on both — the
+                // equivalence that matters: a hoisted value must reach the
+                // second member as completely as the first. Both weeks were
+                // built against `FIXTURE_TARGETS`, so both are now stale.
+                expect(current.current?.id).toBe(plan.id);
+                expect(current.upcoming?.id).toBe(successor.id);
+                expect(current.current?.targets).toEqual(RECONFIRMED_TARGETS);
+                expect(current.upcoming?.targets).toEqual(RECONFIRMED_TARGETS);
+                expect(current.current?.generationTargets).toEqual(FIXTURE_TARGETS);
+                expect(current.upcoming?.generationTargets).toEqual(FIXTURE_TARGETS);
+                expect(current.current?.targetsStale).toBe(true);
+                expect(current.upcoming?.targetsStale).toBe(true);
+            } finally {
+                targetReads.mockRestore();
+            }
+        });
+
+        it('reads them not at all for a user with no plan to describe', async () => {
+            await makeUser({ id: USER_ID, ...FIXTURE_USER_TARGET_COLUMNS });
+            await makePreferences(USER_ID, { time_zone: PLAN_TIME_ZONE });
+
+            const targetReads = countTargetReads();
+
+            try {
+                const response = await getCurrent().expect(200);
+
+                // ZERO, not one. The empty state describes no week, so it has
+                // nothing to report targets for, and the read it does not need
+                // must not be issued on its behalf — the statement the hoist
+                // would otherwise have added to precisely the cheapest request
+                // this route serves.
+                expect(readers(targetReads)).toEqual([]);
+                expect(response.body).toEqual({ current: null, upcoming: null });
+            } finally {
+                targetReads.mockRestore();
+            }
+        });
+
+        it('reads them once when only the current member exists', async () => {
+            const { plan } = await seedPlannedWeek(USER_ID);
+            const targetReads = countTargetReads();
+
+            try {
+                const body = asCurrent((await getCurrent().expect(200)).body);
+
+                expect(body.current?.id).toBe(plan.id);
+                expect(body.upcoming).toBeNull();
+                expect(body.current?.targets).toEqual(FIXTURE_TARGETS);
+                expect(readers(targetReads)).toEqual([USER_ID]);
+            } finally {
+                targetReads.mockRestore();
+            }
+        });
+
+        it('reads them once when only the upcoming member exists', async () => {
+            // The other side of the branch: the hoisted read is guarded by "is
+            // there anything to hydrate", not by "is there a current week", so
+            // an upcoming-only user must still get its targets read — once.
+            const upcomingStart = addDaysToDayKey(utcTodayDayKey(), 3);
+            const { plan } = await seedPlannedWeek(USER_ID, { startDate: upcomingStart, sequence: 495 });
+            const targetReads = countTargetReads();
+
+            try {
+                const body = asCurrent((await getCurrent().expect(200)).body);
+
+                expect(body.current).toBeNull();
+                expect(body.upcoming?.id).toBe(plan.id);
+                expect(body.upcoming?.targets).toEqual(FIXTURE_TARGETS);
+                expect(readers(targetReads)).toEqual([USER_ID]);
+            } finally {
+                targetReads.mockRestore();
+            }
         });
     });
 });

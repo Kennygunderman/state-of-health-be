@@ -1,0 +1,106 @@
+{
+  "slug": "ground-beef-black-bean-bowl",
+  "name": "Ground beef and black bean bowl",
+  "description": "Lean ground beef browned with chili powder and red bell pepper, simmered with black beans and salsa over white rice.",
+  "iconKey": "bowl",
+  "instructions": [
+    "Chop the bell pepper and toss the ground beef with the chili powder and the salt.",
+    "Warm the olive oil in a skillet over medium-high heat and brown the beef for 6 minutes, breaking it up as it cooks.",
+    "Add the bell pepper and cook 3 minutes more, until it softens.",
+    "Stir in the drained black beans and the salsa and simmer for 4 minutes.",
+    "Spoon the warm white rice into two bowls and top it with the beef and beans."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 bowl",
+  "prepMinutes": 10,
+  "cookMinutes": 15,
+  "mealSlots": [
+    "lunch",
+    "dinner"
+  ],
+  "dietTags": [
+    "gluten_free"
+  ],
+  "allergenTags": [],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "dairy_free"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:173110",
+      "quantity": 10,
+      "unit": "oz",
+      "gramWeight": 282.5,
+      "displayText": "10 oz",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:175238",
+      "quantity": 1.25,
+      "unit": "cup",
+      "gramWeight": 300.0,
+      "displayText": "1¼ cups",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169757",
+      "quantity": 1,
+      "unit": "cup",
+      "gramWeight": 158.0,
+      "displayText": "1 cup",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:174524",
+      "quantity": 4,
+      "unit": "tbsp",
+      "gramWeight": 72.0,
+      "displayText": "4 tbsp",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170108",
+      "quantity": 0.5,
+      "unit": "cup",
+      "gramWeight": 74.5,
+      "displayText": "½ cup",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 0.5,
+      "unit": "tbsp",
+      "gramWeight": 6.75,
+      "displayText": "½ tbsp",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171319",
+      "quantity": 1,
+      "unit": "tsp",
+      "gramWeight": 2.7,
+      "displayText": "1 tsp",
+      "sortOrder": 6,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 3.0,
+      "displayText": "½ tsp",
+      "sortOrder": 7,
+      "isOptional": false
+    }
+  ]
+}

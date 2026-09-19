@@ -30,6 +30,10 @@
  *   4. THE SCHEMA REDIRECT — `?schema=`, `?options=-c search_path=…` — which
  *      leaves the host and the database name matching every rule and moves the
  *      tables an unqualified statement reaches.
+ *   5. THE ONE EXEMPTION from the module-load assertion — a help invocation,
+ *      decided from argv alone — and, just as importantly, its EDGES: the
+ *      spellings the scripts read as help and therefore skip the assertion,
+ *      against the spellings they do not and which must still be refused.
  *
  * WHAT IT DELIBERATELY DOES NOT SETTLE. The other URL-shape refusals
  * (`missing_database_url`, `unparsable_database_url`, and the encoded-name and
@@ -38,6 +42,11 @@
  * here: the first two belong to the classification rules exercised by
  * `catalog-load.test.ts`, and the out-of-process proof that a guard aborts a run
  * before Prisma loads is `src/__tests__/setup/testDb.test.ts`'s spawned child.
+ * Seam 5 above is asserted here as the PREDICATE the module-load block reads,
+ * because a module this file has already imported cannot be re-imported under a
+ * different argv; that the block really is wired to it — usage under a refused
+ * database, and a refusal without a help flag — is proven out of process, per
+ * entry point, by `catalogScriptFlags.test.ts`.
  *
  * HOW IT DRIVES THE GUARD. Through `assertScriptDatabase({script, argv, env})`
  * with both sources INJECTED. `process.argv` and `process.env` are never
@@ -55,7 +64,9 @@ import {
     entryScriptName,
     evaluateScriptDatabase,
     evaluateShadowDatabase,
+    HELP_FLAGS,
     isDevelopmentDatabaseName,
+    isHelpInvocation,
     SCRIPT_DATABASE_POLICIES,
 } from '../../../scripts/lib/dbGuard';
 import type { DatabaseOrigin, ScriptDatabasePolicy } from '../../../scripts/lib/dbGuard';
@@ -885,5 +896,118 @@ describe('the module-load enforcement', () => {
         // pipeline script, importing this module would end the run instead of
         // failing a test.
         expect(entryScriptName(process.argv)).toBeNull();
+        // And it is that path — argv[1] being the Jest binary — that silences
+        // the block here, NOT the help exemption below: this worker's command
+        // line carries no help flag, so the two reasons the block can do
+        // nothing stay distinguishable, and the no-op path keeps its own
+        // coverage whatever the exemption later does.
+        expect(isHelpInvocation(process.argv)).toBe(false);
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * The help exemption, and the line it draws
+ * ------------------------------------------------------------------------- */
+
+// WHY THIS EXEMPTION EXISTS. The block above ran before any entry script's own
+// `parseArgs`, so `npm run catalog:load -- --help` (and the same for the other
+// eight) printed the refusal and exited 1 instead of printing the usage block —
+// unreachable for exactly the operator who needs it, the one who has not
+// pointed DATABASE_URL at anything the policies accept yet.
+//
+// WHY IT IS SAFE, AND WHERE THAT SAFETY LIVES. Not in this predicate's
+// leniency but in its EXACTNESS. Every script answers these two tokens in the
+// first statement of its `parseArgs` — before a value is consumed, before its
+// prerequisite checks, and before the lazy `import('../src/prisma/client')`
+// each stage defers its client behind — so a token this predicate calls help is
+// a usage block and an exit 0, never work against an unguarded database. The
+// risk is therefore entirely in DISAGREEMENT with the scripts, in either
+// direction: a token exempted here that a script parses as an ordinary flag
+// would reach that script's stage with no assertion behind it, and a token the
+// scripts answer as help but this predicate does not brings the original
+// finding back for that spelling. Both directions are cases below.
+describe('isHelpInvocation', () => {
+    /** argv as the runtime hands it over: the node binary, the script, the tail. */
+    const argvFor = (...tail: readonly string[]): readonly string[] => [
+        '/usr/bin/node',
+        '/repo/backend/scripts/catalog-load.ts',
+        ...tail,
+    ];
+
+    it('is exactly the two tokens every entry script declares', () => {
+        // The scripts spell this list nine times over; the guard spells it once
+        // more. Pinning the value here is what makes the per-script agreement
+        // cases in `catalogScriptFlags.test.ts` a comparison rather than a
+        // restatement.
+        expect([...HELP_FLAGS]).toEqual(['--help', '-h']);
+    });
+
+    it.each([
+        ['--help alone', ['--help']],
+        ['-h alone', ['-h']],
+        ['--help after a flag that takes a value', ['--release', 'v1', '--help']],
+        ['-h after a flag that takes a value', ['--release', 'v1', '-h']],
+        ['--help last of several', ['--release', 'v1', '--dry-run', '--help']],
+        // The case the operator writing a real load actually types, and the one
+        // worth stating: `--confirm-target` is the guard's own flag, and the
+        // scripts still answer help ahead of reading its value, so the guard
+        // must too. `--confirm-target -h` names no database (parseConfirmTarget
+        // reads a `-`-prefixed token as no value at all) and is a usage block.
+        ['-h where --confirm-target would take its value', ['--confirm-target', '-h']],
+        ['-h after a complete --confirm-target', ['--confirm-target', 'soh_test', '-h']],
+        ['--help beside the inline spelling of the flag', ['--confirm-target=soh_test', '--help']],
+    ])('exempts %s', (_label, tail) => {
+        expect(isHelpInvocation(argvFor(...tail))).toBe(true);
+    });
+
+    it.each([
+        // The direction that would be a hole rather than an inconvenience: no
+        // script reads `--help=x` as help — each reports it as a flag it does
+        // not accept and exits 1 — so exempting it would skip the assertion for
+        // a command line that is not a usage request.
+        ['--help=x, which no script reads as help', ['--help=x']],
+        ['--help=true, for the same reason', ['--help=true']],
+        ['--help= with nothing after it', ['--help=']],
+        ['-h=1, the inline spelling of the short form', ['-h=1']],
+        ['--helper, a longer token that merely starts the same way', ['--helper']],
+        ['-help, a single-dash spelling of the long flag', ['-help']],
+        ['--h, a double-dash spelling of the short flag', ['--h']],
+        ['--HELP, which no parser case-folds', ['--HELP']],
+        ['-H, the capital of the short form', ['-H']],
+        ['help as a bare word', ['help']],
+        ['" --help" carrying a leading space', [' --help']],
+        ['a --confirm-target VALUE that merely reads like help', ['--confirm-target', '--help=x']],
+        ['no arguments at all', []],
+    ])('does not exempt %s', (_label, tail) => {
+        expect(isHelpInvocation(argvFor(...tail))).toBe(false);
+    });
+
+    it('reads the argument tail only, never the interpreter or the script path', () => {
+        // `process.argv.slice(2)` is what every script parses, so a help token
+        // in either of the first two positions is not an argument: a checkout
+        // under a directory named `--help` must not exempt every run in it, and
+        // a node flag is not the script's command line.
+        expect(isHelpInvocation(['/usr/bin/node', '/repo/-h/scripts/seed-dev.ts'])).toBe(false);
+        expect(isHelpInvocation(['/usr/bin/node', '--help'])).toBe(false);
+        expect(isHelpInvocation(['--help', '/repo/backend/scripts/seed-dev.ts'])).toBe(false);
+    });
+
+    it('is total for an argv that is absent or too short to hold arguments', () => {
+        // The block calls this at module load on a path that may be about to
+        // refuse, so a throw here would replace an actionable refusal with a
+        // stack trace. Both of `entryScriptName`'s own tolerances are matched.
+        expect(isHelpInvocation(undefined)).toBe(false);
+        expect(isHelpInvocation([])).toBe(false);
+        expect(isHelpInvocation(['/usr/bin/node'])).toBe(false);
+    });
+
+    it('leaves every refusal the exempted command line would otherwise have taken exactly where it was', () => {
+        // The exemption skips the ASSERTION, and changes nothing about what the
+        // assertion decides. Same script, same argv, same URL: the verdict a
+        // non-help invocation gets is still the refusal it always was.
+        for (const argv of [['--help'], ['-h'], ['--confirm-target', '-h']]) {
+            expect(refusalOf('catalog-load', REMOTE_DEPLOYMENT_URL, argv).code).toBe('unrecognised_origin');
+            expect(refusalOf('seed-dev', LOOPBACK_DEPLOYMENT_URL, argv).code).toBe('development_only');
+        }
     });
 });

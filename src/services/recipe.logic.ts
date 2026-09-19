@@ -87,7 +87,7 @@ import {
     RecipeNutritionProvenance,
     RecipePerServingNutrition,
 } from '../types/recipe';
-import { formatQuarters, millilitersToGrams, unitFamily } from '../utils/units';
+import { authoredAmountQualifier, formatIngredientAmount, millilitersToGrams } from '../utils/units';
 
 /* ---------------------------------------------------------------------------
  * Errors — the narrow case where a verdict cannot express the problem
@@ -1152,31 +1152,22 @@ export interface ScaledRecipeIngredient {
     isOptional: boolean;
 }
 
-const MASS_DISPLAY_DECIMALS = 1;
-const TENTHS_PER_UNIT = 10;
-
 /**
- * Count units that name nothing — the design shows "¼" for a quarter of an
- * avocado, not "¼ each".
- */
-const GENERIC_COUNT_UNIT_KEYS: ReadonlySet<string> = new Set(
-    ['each', 'whole', 'piece', 'pieces', 'count'].map(tagKey),
-);
-
-/**
- * An ingredient quantity as frame 12 renders it: fraction glyphs for volumes
- * and counts ("¾ cup", "¼"), a tenth of a unit for masses ("2.5 oz").
+ * An ingredient quantity as frame 12 renders it: fraction glyphs for the
+ * measures a cook works in ("¾ cup", "1¼ cups", "¼"), whole numbers for grams
+ * and millilitres ("188 g"), a tenth for a weight read off a scale ("6.2 oz").
  *
- * The ingredient's OWN unit is kept. `utils/units.ts`'s `formatMass` and
- * `formatVolume` promote to the largest unit that stays ≥ 1, which is right for
- * a shopping list and wrong here: a recipe that says 5 oz of chicken must not
- * start saying 0.3 lb, and a "was/now" comparison in a recipe has no meaning to
- * keep a family stable for.
+ * The whole convention — the fraction ladder, the per-unit precision, the
+ * dropped count placeholder, the pluralised unit word — lives in
+ * `utils/units.ts::formatIngredientAmount`, because the app renders these rows
+ * itself and the two implementations have to be the same rule rather than two
+ * readings of it. This function is that rule plus the recipe domain's own
+ * loudness about input it could not legitimately have been given.
  *
- * The unit is also rendered exactly as the recipe authored it, with no
- * pluralisation. Pluralising an authored word is how "2 cups" becomes
- * "2 cupses"; `pluralizeCount` exists for the grocery list, whose count rows
- * are generated from a portion description rather than authored.
+ * The ingredient's OWN unit is kept. `formatMass` and `formatVolume` promote to
+ * the largest unit that stays ≥ 1, which is right for a shopping list and wrong
+ * here: a recipe that says 5 oz of chicken must not start saying 0.3 lb, and a
+ * "was/now" comparison in a recipe has no meaning to keep a family stable for.
  */
 export const formatIngredientQuantity = (quantity: number, unit: string): string => {
     if (!Number.isFinite(quantity)) {
@@ -1186,29 +1177,7 @@ export const formatIngredientQuantity = (quantity: number, unit: string): string
         );
     }
 
-    const label = unit.trim();
-    const family = unitFamily(label);
-
-    if (family === 'mass') {
-        const rounded = Math.round(quantity * TENTHS_PER_UNIT) / TENTHS_PER_UNIT;
-        const text = Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(MASS_DISPLAY_DECIMALS);
-        return label.length === 0 ? text : `${text} ${label}`;
-    }
-
-    // Volumes, counts and unrecognised units all take the quarter glyphs: the
-    // design's recipe quantities are fractions, and a unit this repository does
-    // not know is safer rendered as an exact-looking fraction than as a decimal
-    // that implies a precision the recipe never stated.
-    const text = formatQuarters(quantity);
-
-    if (label.length === 0) {
-        return text;
-    }
-    if (family === 'count' && GENERIC_COUNT_UNIT_KEYS.has(tagKey(label))) {
-        return text;
-    }
-
-    return `${text} ${label}`;
+    return formatIngredientAmount(quantity, unit);
 };
 
 /**
@@ -1227,9 +1196,12 @@ export const formatIngredientQuantity = (quantity: number, unit: string): string
  *    serving and `m = yield_servings` is the whole recipe again.
  *
  * At a factor of exactly 1 the AUTHORED `display_text` is returned unchanged:
- * at that scale it is correct by construction and it carries phrasing a
- * recomputation would lose. Every other factor is rendered by
- * {@link formatIngredientQuantity}.
+ * at that scale it is correct by construction, and it is the answer even where
+ * it disagrees with a recomputation — a seed row spelled "3½ oz" or
+ * "2 cups, drained" is what its author meant the cook to read. Every other
+ * factor is rendered by {@link formatIngredientQuantity} and then given back
+ * the authored phrasing that the amount alone cannot carry, so a portion of
+ * "¾ cup, chopped" reads "⅓ cup, chopped" rather than "⅓ cup".
  */
 export const scaleIngredients = (
     ingredients: readonly RecipeIngredientSnapshot[],
@@ -1260,7 +1232,11 @@ export const scaleIngredients = (
             quantity,
             unit: ingredient.unit,
             gramWeight: requireGramWeight(ingredient) * factor,
-            displayText: factor === 1 ? ingredient.display_text : formatIngredientQuantity(quantity, ingredient.unit),
+            displayText:
+                factor === 1
+                    ? ingredient.display_text
+                    : formatIngredientQuantity(quantity, ingredient.unit) +
+                      authoredAmountQualifier(ingredient.display_text, ingredient.quantity, ingredient.unit),
             sortOrder: ingredient.sort_order,
             isOptional: ingredient.is_optional,
         };

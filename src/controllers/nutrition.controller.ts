@@ -24,6 +24,7 @@ import {
     FeatureDisabledError,
 } from '../services/entitlement.service';
 import { CatalogFoodNotFoundError } from '../services/mealPlanning.errors';
+import { UserNotProvisionedError } from '../services/user.service';
 import { getUserId, getUserEmail } from '../utils/getUserId';
 import { describeErrorSafely, logSafeEvent } from '../utils/safeLogger';
 
@@ -79,6 +80,46 @@ const logRouteFailure = (action: string, status: number, error: unknown): void =
     });
 };
 
+/**
+ * Records one REFUSAL on a diary route — a request the server answered with a
+ * 4xx it chose, not a fault it suffered.
+ *
+ * Separate from {@link logRouteFailure} and at `warn`, following the event
+ * partition `mealPlanning.controller.ts` established and
+ * `api/controllerBoundary.test.ts` pins ("a rejection is not also a failure"):
+ * a `request_failed` at `error` says the server broke, and emitting one for a
+ * 404 the code deliberately returns would make an interrupted sign-up read like
+ * a server fault in every alert that watches that event.
+ *
+ * The one refusal that earns a line is the unprovisioned principal below: it is
+ * invisible in the response (a 404 is indistinguishable from an absent row, by
+ * design) and it is an operator's only signal that a sign-up completed its
+ * Firebase half and not its `users` half. The route's other 404s — "Meal not
+ * found", "Entry not found" — are ordinary and stay unlogged.
+ */
+const logRouteRejection = (action: string, status: number, code: string, error: unknown): void => {
+    logSafeEvent('warn', 'request_rejected', {
+        action,
+        status,
+        code,
+        ...describeErrorSafely(error),
+    });
+};
+
+/**
+ * The body every legacy diary and food route answers an unprovisioned caller
+ * with, and the machine code its rejection is logged under.
+ *
+ * Byte-identical to `updateTargetsController`'s existing 404 below, because
+ * this is the legacy human-message family: `PUT /api/user/targets` has answered
+ * exactly this for exactly this caller since before meal planning existed, and
+ * a second spelling of "your account row is missing" would leave shipped
+ * clients matching on two strings. The meal-planning routes answer the same
+ * condition with their own machine-code envelope; these routes do not borrow it.
+ */
+const USER_NOT_PROVISIONED_BODY = { error: 'User not found' } as const;
+const USER_NOT_PROVISIONED_CODE = 'user_not_provisioned';
+
 export const getDailyMacrosController = async (req: Request, res: Response) => {
     try {
         const userId = getUserId(req);
@@ -89,24 +130,58 @@ export const getDailyMacrosController = async (req: Request, res: Response) => {
         const day = await getDailyMacros(userId, date);
         return res.json(day);
     } catch (error) {
+        // The day read materializes the four meal buckets, so it is a WRITE for
+        // a caller seeing a date for the first time, and `getDailyMacros`
+        // refuses that write when no `users` row owns it. A permanent condition
+        // the caller cannot retry away answers 404 rather than the 500 an
+        // unmapped Prisma P2003 produced.
+        if (error instanceof UserNotProvisionedError) {
+            logRouteRejection(ACTIONS.dailyMacros, 404, USER_NOT_PROVISIONED_CODE, error);
+            return res.status(404).json(USER_NOT_PROVISIONED_BODY);
+        }
         logRouteFailure(ACTIONS.dailyMacros, 500, error);
         res.status(500).json({ error: 'Failed to get daily macros' });
     }
 };
 
-// The three 400 bodies these endpoints answer with, chosen from the parser's
-// verdict rather than from the request, which the parser has already read. Only
-// the legacy guard's verdict gets a message and no code: that string is what
-// every client sending a malformed legacy body has always been shown. A catalog
-// body, a shapeless body and a malformed path id get the machine code and the
-// per-field details instead, so the caller learns which field to fix.
-// Exhaustive by construction — a fourth verdict code makes this function fall
-// off its end and fail the build, rather than silently inheriting the legacy
+/**
+ * The machine code §0.3.1 gives a body no shape could be chosen for. Spelled
+ * here because for the `unrecognized_payload` verdict it is the value of `code`
+ * and NOT of `error` — the verdict name itself is internal and never reaches the
+ * wire.
+ */
+const UNRECOGNIZED_PAYLOAD_WIRE_CODE = 'invalid_payload';
+
+// The 400 bodies these endpoints answer with, chosen from the parser's verdict
+// rather than from the request, which the parser has already read.
+//
+// Three renderings, because three different things are being preserved:
+//
+//   * `legacy_fields_required` — message only. That string is what every client
+//     sending a malformed legacy body has always been shown, and it carries no
+//     code because the shipped response has none.
+//   * `unrecognized_payload` — the same frozen string as `error`, PLUS the
+//     machine code and the per-field details. A body naming no shape earned
+//     that sentence long before the catalog shape existed and is the one
+//     refusal here a shipped client can still reach, so replacing `error` with
+//     the code would change a live response (§0.5.2) and would render the
+//     literal word `invalid_payload` to a user; carrying both satisfies §0.3.1
+//     at the same time.
+//   * `invalid_request` / `invalid_payload` — the machine code as `error` with
+//     the per-field details, so the caller learns which field to fix. Both
+//     describe requests only a catalog-aware client can send (a catalog body's
+//     own fields, a body naming two foods, a path id the database cannot parse),
+//     none of which has a historical body to preserve.
+//
+// Exhaustive by construction — a new verdict code makes this function fall off
+// its end and fail the build, rather than silently inheriting another case's
 // body.
 const logEntryErrorBody = (verdict: LogEntryErrorVerdict): Record<string, unknown> => {
     switch (verdict.code) {
         case 'legacy_fields_required':
             return { error: verdict.message };
+        case 'unrecognized_payload':
+            return { error: verdict.message, code: UNRECOGNIZED_PAYLOAD_WIRE_CODE, details: verdict.details };
         case 'invalid_request':
         case 'invalid_payload':
             return { error: verdict.code, details: verdict.details };

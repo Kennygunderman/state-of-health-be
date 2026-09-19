@@ -29,13 +29,16 @@ import {
     deriveDislikedFoodGroups,
     evaluateMealAgainstPreferences,
     feetAndInchesToCentimeters,
+    FOOD_GROUP_VALUES,
     INCHES_TO_CENTIMETERS,
     isBodyAnswerComplete,
     isCalendarDayKey,
     isClockTime,
+    isKnownFoodGroup,
     isNoAllergenSelection,
     isPayloadBearingSetupStep,
     MAX_DISLIKED_FOOD_IDS,
+    MAX_FOOD_GROUP_LENGTH,
     MAX_REVISION,
     mealsPerDayForSchedule,
     NAMED_ALLERGENS,
@@ -60,6 +63,7 @@ import {
     poundsToKilograms,
     reconcileSetupStateForRoute,
     requiredSetupSteps,
+    resolveFoodGroup,
     resolveTargetRouteForBodyStep,
     resolveTargetRouteForUpdate,
     routeStepOrder,
@@ -1513,6 +1517,82 @@ describe('deriveDislikedFoodGroups', () => {
 });
 
 /* ---------------------------------------------------------------------------
+ * The food-group vocabulary
+ * ------------------------------------------------------------------------- */
+
+describe('FOOD_GROUP_VALUES', () => {
+    /**
+     * THE PIN. `FOOD_GROUP_VALUES` is a copy, in `src/`, of a vocabulary
+     * authored in `data/`, because no runtime module may read `data/`
+     * (`rootDir: "./src"`, and the image excludes it). A copy that drifts is
+     * worse than no copy: the catalog would load foods carrying a group this
+     * endpoint refuses, so a user could not exclude the very group their
+     * suggestions offered them. This test is what makes extending the taxonomy
+     * a reviewed change to BOTH files.
+     *
+     * Order is asserted as well as membership, so the two lists stay readable
+     * side by side and a reviewer diffing them sees one block move rather than
+     * 123 scattered lines.
+     */
+    it('is the shipped coverage plan, exactly — same terms, same order, same count', () => {
+        expect(FOOD_GROUP_VALUES).toEqual(SHIPPED_GROUP_NAMES);
+        expect(FOOD_GROUP_VALUES).toHaveLength(coveragePlan.foodGroupCount);
+        expect(new Set(FOOD_GROUP_VALUES).size).toBe(coveragePlan.foodGroupCount);
+    });
+
+    it('holds no term longer than the per-entry bound, so the bound cannot refuse a real group', () => {
+        // The two constants are independent, and the bound is the useless kind
+        // of strict if it refuses something the catalog legitimately carries.
+        const longest = [...FOOD_GROUP_VALUES].sort((left, right) => right.length - left.length)[0];
+
+        expect(longest.length).toBeLessThanOrEqual(MAX_FOOD_GROUP_LENGTH);
+    });
+});
+
+describe('isKnownFoodGroup', () => {
+    it.each(['mushroom', 'olive', 'blue_cheese', 'nutritional_supplement'])(
+        'accepts the shipped term %p',
+        (group) => {
+            expect(SHIPPED_GROUP_NAMES).toContain(group);
+            expect(isKnownFoodGroup(group)).toBe(true);
+            expect(resolveFoodGroup(group)).toBe(group);
+        },
+    );
+
+    it.each([
+        ['Blue cheese', 'blue_cheese'],
+        ['blue-cheese', 'blue_cheese'],
+        ['  Mushroom  ', 'mushroom'],
+    ])('reads %p as the catalog term %p, so a display label round-trips', (sent, canonical) => {
+        expect(resolveFoodGroup(sent)).toBe(canonical);
+        expect(isKnownFoodGroup(sent)).toBe(true);
+    });
+
+    it.each([
+        'bogus_group_not_in_taxonomy',
+        'sea_vegetable',
+        'herb',
+        '<script>alert(1)</script>',
+        "' OR 1=1 --",
+        '',
+        '   ',
+    ])('refuses %p', (group) => {
+        expect(isKnownFoodGroup(group)).toBe(false);
+        expect(resolveFoodGroup(group)).toBeNull();
+    });
+
+    it.each(['mush', 'mushroom_soup', 'olives_and_more', 'pre_olive'])(
+        'matches whole terms only, refusing %p',
+        (group) => {
+            // A prefix or substring match here would let one request exclude a
+            // group the user never chose — or, read the other way, let 'mush'
+            // silently exclude every mushroom.
+            expect(isKnownFoodGroup(group)).toBe(false);
+        },
+    );
+});
+
+/* ---------------------------------------------------------------------------
  * The step parsers
  * ------------------------------------------------------------------------- */
 
@@ -2457,6 +2537,23 @@ describe('parseSetupStep', () => {
 
             expect(codesFor(verdict, 'startDate')).toEqual([code]);
         });
+
+        it.each([
+            ['a day long past', '2020-01-01'],
+            ['a day years ahead', '2099-12-31'],
+        ])('accepts %p, because the WINDOW is not this layer\u2019s question', (_label, startDate) => {
+            // The layer boundary, asserted rather than assumed. Whether a real
+            // calendar day falls inside `[today, max(today + 30, plan end + 1)]`
+            // needs today's date in the user's stored zone AND the user's active
+            // plans — a clock reading and a database read, neither of which a
+            // pure parser may make. `preferences.service.ts::resolveReviewStartDate`
+            // is where those refusals (`below_minimum` / `above_maximum`) come
+            // from, and `api/preferences.test.ts` exercises the window end to
+            // end. A parser that started guessing at it would be judging against
+            // the server's own clock and zone, which is exactly the bug the
+            // service is arranged to avoid.
+            expect(saveStep('review', { timeZone: ZONE, startDate }).kind).toBe('ok');
+        });
     });
 
     it('labels each accepted payload with its own step', () => {
@@ -3363,6 +3460,92 @@ describe('parsePreferencesUpdate', () => {
             );
 
             expect(detailsOf(verdict)[0].code).toBe(code);
+        });
+
+        describe('the per-entry length bound on food groups', () => {
+            /**
+             * Unbounded entries are the harm: a hundred of them at the
+             * `express.json()` limit stores ~100 KB of text in one array column,
+             * and every one of those characters is normalised by the spelling
+             * rule before it can even be judged. The bound is therefore checked
+             * BEFORE normalisation, and asserted at its literal edge in both
+             * directions so neither an off-by-one nor a silently widened
+             * constant survives.
+             */
+            const entry = (length: number): string => 'x'.repeat(length);
+
+            it('accepts an entry at the bound, refusing one character more', () => {
+                // At the bound it clears the LENGTH gate; it is still not a term
+                // of the vocabulary, which is the service's refusal and not this
+                // parser's — so the shape verdict here is 'ok'.
+                expect(
+                    parseUpdate(
+                        { dislikedFoodGroups: [entry(MAX_FOOD_GROUP_LENGTH)], expectedRevision: 4 },
+                        updateContext(),
+                    ).kind,
+                ).toBe('ok');
+
+                expect(
+                    codesFor(
+                        parseUpdate(
+                            {
+                                dislikedFoodGroups: [entry(MAX_FOOD_GROUP_LENGTH + 1)],
+                                expectedRevision: 4,
+                            },
+                            updateContext(),
+                        ),
+                        'dislikedFoodGroups[0]',
+                    ),
+                ).toEqual([PREFERENCE_FIELD_CODES.ABOVE_MAXIMUM]);
+            });
+
+            it('refuses the 90,000-character entry the audit submitted, naming its index', () => {
+                expect(
+                    codesFor(
+                        parseUpdate(
+                            { dislikedFoodGroups: ['olive', entry(90_000)], expectedRevision: 4 },
+                            updateContext(),
+                        ),
+                        'dislikedFoodGroups[1]',
+                    ),
+                ).toEqual([PREFERENCE_FIELD_CODES.ABOVE_MAXIMUM]);
+            });
+
+            it('refuses every offending entry at once, so one save reports the whole list', () => {
+                const verdict = parseUpdate(
+                    {
+                        dislikedFoodGroups: [entry(200), 'olive', 7, entry(70)],
+                        expectedRevision: 4,
+                    },
+                    updateContext(),
+                );
+
+                expect(detailsOf(verdict)).toEqual([
+                    { field: 'dislikedFoodGroups[0]', code: PREFERENCE_FIELD_CODES.ABOVE_MAXIMUM },
+                    { field: 'dislikedFoodGroups[2]', code: PREFERENCE_FIELD_CODES.INVALID_TYPE },
+                    { field: 'dislikedFoodGroups[3]', code: PREFERENCE_FIELD_CODES.ABOVE_MAXIMUM },
+                ]);
+            });
+        });
+
+        it('returns the food-group survivors in the order they were sent', () => {
+            // Load-bearing, not cosmetic: `resolveDislikeWrites` refuses an
+            // unselectable group by its index in THIS list, so a reordering here
+            // would name the wrong element of the client's array. Storage order
+            // is the service's own sort and is unaffected.
+            const verdict = parseUpdate(
+                {
+                    dislikedFoodGroups: ['olive', 'Mushroom', 'mushroom', 'avocado'],
+                    expectedRevision: 4,
+                },
+                updateContext(),
+            );
+
+            expect(payloadOf(verdict, ZONE).dislikedFoodGroups).toEqual([
+                'olive',
+                'Mushroom',
+                'avocado',
+            ]);
         });
 
         it('bounds the food-group list', () => {

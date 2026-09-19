@@ -1,0 +1,130 @@
+{
+  "slug": "black-bean-tofu-burrito-bowl",
+  "name": "Black bean and tofu burrito bowl",
+  "description": "Spiced tofu and mushrooms with black beans, a modest scoop of brown rice, peppers, salsa and lime — everything a burrito holds, in a bowl that still hits its protein.",
+  "iconKey": "bowl",
+  "instructions": [
+    "Crumble the tofu into the olive oil in a wide pan over medium-high heat and cook for 5 minutes without stirring, so it browns.",
+    "Add the mushrooms and bell pepper and cook for 4 minutes, until the mushrooms are dry and the pepper has softened.",
+    "Stir in the black beans and heat through for 2 minutes, then fold in the spinach until it wilts.",
+    "Warm the brown rice and divide it between two bowls.",
+    "Spoon the tofu mixture over the rice, top with the salsa and the cilantro, and squeeze the lime over."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 bowl",
+  "prepMinutes": 10,
+  "cookMinutes": 14,
+  "mealSlots": [
+    "lunch",
+    "dinner"
+  ],
+  "dietTags": [
+    "gluten_free",
+    "pescatarian",
+    "vegan",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "soy"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 2,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "dairy_free",
+    "vegan"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:172448",
+      "quantity": 400,
+      "unit": "g",
+      "gramWeight": 400,
+      "displayText": "400 g",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:175238",
+      "quantity": 0.75,
+      "unit": "cup",
+      "gramWeight": 180,
+      "displayText": "¾ cup, drained",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169704",
+      "quantity": 0.5,
+      "unit": "cup",
+      "gramWeight": 101,
+      "displayText": "½ cup",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169251",
+      "quantity": 2,
+      "unit": "cup",
+      "gramWeight": 140,
+      "displayText": "2 cups, sliced",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168462",
+      "quantity": 3,
+      "unit": "cup",
+      "gramWeight": 90,
+      "displayText": "3 cups",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170108",
+      "quantity": 0.75,
+      "unit": "cup",
+      "gramWeight": 112,
+      "displayText": "¾ cup, chopped",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:174524",
+      "quantity": 4,
+      "unit": "tbsp",
+      "gramWeight": 72,
+      "displayText": "4 tbsp",
+      "sortOrder": 6,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 0.5,
+      "unit": "tbsp",
+      "gramWeight": 6.75,
+      "displayText": "½ tbsp",
+      "sortOrder": 7,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168155",
+      "quantity": 0.5,
+      "unit": "each",
+      "gramWeight": 33,
+      "displayText": "½ lime",
+      "sortOrder": 8,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169997",
+      "quantity": 0.5,
+      "unit": "cup",
+      "gramWeight": 8,
+      "displayText": "½ cup, chopped",
+      "sortOrder": 9,
+      "isOptional": false
+    }
+  ]
+}

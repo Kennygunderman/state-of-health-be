@@ -1,0 +1,74 @@
+{
+  "slug": "soy-milk-berry-protein-shake",
+  "name": "Soy milk and berry protein shake",
+  "description": "Firm tofu blended with unsweetened soy milk, strawberries and banana — a two-minute shake whose protein comes from food rather than a powder.",
+  "iconKey": "bowl_dash",
+  "instructions": [
+    "Blend the tofu with the soy milk until completely smooth.",
+    "Add the strawberries and the banana and blend again until thick.",
+    "Pour into a tall glass and drink straight away."
+  ],
+  "yieldServings": 1,
+  "servingDescription": "1 glass",
+  "prepMinutes": 5,
+  "cookMinutes": 0,
+  "mealSlots": [
+    "snack"
+  ],
+  "dietTags": [
+    "gluten_free",
+    "pescatarian",
+    "vegan",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "soy"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 2,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "dairy_free",
+    "vegan",
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:172448",
+      "quantity": 150,
+      "unit": "g",
+      "gramWeight": 150,
+      "displayText": "150 g",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:175215",
+      "quantity": 0.67,
+      "unit": "cup",
+      "gramWeight": 162,
+      "displayText": "⅔ cup",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:167762",
+      "quantity": 1,
+      "unit": "cup",
+      "gramWeight": 152,
+      "displayText": "1 cup, halves",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173944",
+      "quantity": 0.33,
+      "unit": "each",
+      "gramWeight": 40,
+      "displayText": "⅓ banana",
+      "sortOrder": 3,
+      "isOptional": false
+    }
+  ]
+}

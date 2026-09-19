@@ -24,6 +24,7 @@ import {
     resolveLegacyInputMethod,
     toNutritionProvenance,
 } from './nutrition.logic';
+import { assertUserProvisioned } from './user.service';
 
 const DEFAULT_MEALS = ['Breakfast', 'Lunch', 'Dinner', 'Snack'];
 
@@ -145,6 +146,18 @@ export const getDailyMacros = async (userId: string, dateKey: string): Promise<D
     // was added self-heal. sort_order comes from DEFAULT_MEALS position.
     const missing = DEFAULT_MEALS.filter((name) => !meals.some((meal) => meal.name === name));
     if (missing.length > 0) {
+        // The owner-existence question is asked HERE and not at the top of the
+        // function, because this branch is the only one that writes. A day whose
+        // four buckets already exist is the read every diary screen makes, and it
+        // must not gain a query for a condition it cannot hit. An authenticated
+        // identity with no `users` row reaches `meals.user_id`'s foreign key
+        // instead, which raises Prisma P2003 and answers this route's 500 —
+        // where the shipped `PUT /api/user/targets` has always answered
+        // `404 "User not found"` for the same caller. The guard is an explicit
+        // typed check rather than a branch on the vendor's error code
+        // (`backend-architecture` §9), and it runs before the insert, so an
+        // unprovisioned caller leaves no partial row behind.
+        await assertUserProvisioned(userId);
         await prisma.meals.createMany({
             data: missing.map((name) => ({
                 user_id: userId,
@@ -450,6 +463,41 @@ interface DaySummaryMealRow {
     fat: number | null;
 }
 
+/* ---------------------------------------------------------------------------
+ * Rounding parity between the day read and the history reads
+ *
+ * §0.7.3 gives the diary ONE rounding contract: a consumed total is
+ * `Math.round(storedSnapshot × servings)` per value, so that the client's "This
+ * adds" card and the server's totals agree to the integer. `asEaten` above is
+ * that rule in JavaScript; the three aggregate queries below have to compute the
+ * same number in SQL, and PostgreSQL offers two roundings that are NOT it:
+ *
+ *   * `round(double precision)` — half-to-EVEN. This is what these queries used
+ *     to call, because `calories × servings` is `int × double`. A day holding one
+ *     entry at `servings = 0.5` with snapshots 145/145/153/57 therefore read
+ *     73/73/77/29 from `GET /macros/:date` and 72/72/76/28 from
+ *     `GET /macros/history` and the meal breakdown — the same day, four fields
+ *     apart, printed verbatim by `DayBreakdownCard`.
+ *   * `round(numeric)` — half-AWAY-FROM-ZERO. It matches `Math.round` on
+ *     positives and diverges on every negative half-value: measured on this
+ *     server, `round(-0.5::numeric)` is -1, -1.5 is -2 and -2.5 is -3, where
+ *     `Math.round` gives 0, -1 and -2. Negative macros are storable — the legacy
+ *     guard only asks `Number.isFinite(Number(field))` — so casting to numeric
+ *     would swap a visible divergence for a rarer one.
+ *
+ * `FLOOR(x::numeric + 0.5)` IS `Math.round`: the definition, not an
+ * approximation of it. Measured against `Math.round` over the half-values and
+ * near-half values in both signs, it agreed on every one. The `::numeric` cast
+ * is still needed — `floor(double + 0.5)` would reintroduce binary
+ * representation error on the addition — and it is exact here because PostgreSQL
+ * converts `double precision` to `numeric` through the shortest decimal that
+ * round-trips, so a product that is exactly x.5 in IEEE-754 becomes exactly x.5.
+ *
+ * All ten call sites use the same expression, including the two `HAVING`
+ * clauses: a day is skipped when its calories total is not positive, and that
+ * total has to be the one the page reports.
+ * ------------------------------------------------------------------------- */
+
 // Per-meal totals for a set of days, keyed by day. Feeds the history screen's
 // line-by-line breakdown; only meals with logged entries appear.
 const getMealBreakdowns = async (
@@ -463,10 +511,10 @@ const getMealBreakdowns = async (
             e.meal_id,
             m.name,
             m.sort_order,
-            SUM(ROUND(e.calories * e.servings))::int AS calories,
-            SUM(ROUND(e.protein_g * e.servings))::int AS protein,
-            SUM(ROUND(e.carbs_g * e.servings))::int AS carbs,
-            SUM(ROUND(e.fat_g * e.servings))::int AS fat
+            SUM(FLOOR((e.calories * e.servings)::numeric + 0.5))::int AS calories,
+            SUM(FLOOR((e.protein_g * e.servings)::numeric + 0.5))::int AS protein,
+            SUM(FLOOR((e.carbs_g * e.servings)::numeric + 0.5))::int AS carbs,
+            SUM(FLOOR((e.fat_g * e.servings)::numeric + 0.5))::int AS fat
         FROM meal_entries e
         JOIN meals m ON m.id = e.meal_id
         WHERE e.user_id = ${userId}
@@ -499,20 +547,21 @@ export const getHistory = async (
     limit: number,
 ): Promise<{ days: DailySummaryResponse[]; total: number }> => {
     // Totals multiply per-serving snapshots by servings at read time, same math
-    // as the old reselect selectors. Zero-calorie days are skipped (old
-    // PreviousDailyMealEntriesScreen behavior).
+    // as the old reselect selectors, and round exactly as `asEaten` does — see
+    // the rounding-parity note above `getMealBreakdowns`. Zero-calorie days are
+    // skipped (old PreviousDailyMealEntriesScreen behavior).
     const rows = await prisma.$queryRaw<DailySummaryRow[]>`
         SELECT
             date,
             COUNT(DISTINCT meal_id) AS meal_count,
-            SUM(ROUND(calories * servings))::int AS calories,
-            SUM(ROUND(protein_g * servings))::int AS protein,
-            SUM(ROUND(carbs_g * servings))::int AS carbs,
-            SUM(ROUND(fat_g * servings))::int AS fat
+            SUM(FLOOR((calories * servings)::numeric + 0.5))::int AS calories,
+            SUM(FLOOR((protein_g * servings)::numeric + 0.5))::int AS protein,
+            SUM(FLOOR((carbs_g * servings)::numeric + 0.5))::int AS carbs,
+            SUM(FLOOR((fat_g * servings)::numeric + 0.5))::int AS fat
         FROM meal_entries
         WHERE user_id = ${userId} AND deleted_at IS NULL
         GROUP BY date
-        HAVING SUM(ROUND(calories * servings)) > 0
+        HAVING SUM(FLOOR((calories * servings)::numeric + 0.5)) > 0
         ORDER BY date DESC
         LIMIT ${limit} OFFSET ${(page - 1) * limit}
     `;
@@ -521,7 +570,7 @@ export const getHistory = async (
             SELECT date FROM meal_entries
             WHERE user_id = ${userId} AND deleted_at IS NULL
             GROUP BY date
-            HAVING SUM(ROUND(calories * servings)) > 0
+            HAVING SUM(FLOOR((calories * servings)::numeric + 0.5)) > 0
         ) days
     `;
     const mealsByDay = await getMealBreakdowns(userId, rows.map((row) => row.date));

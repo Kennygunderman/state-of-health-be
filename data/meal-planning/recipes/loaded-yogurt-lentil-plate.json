@@ -1,0 +1,100 @@
+{
+  "slug": "loaded-yogurt-lentil-plate",
+  "name": "Loaded yogurt and lentil plate",
+  "description": "Cooked lentils warmed with toasted cumin and tomato and piled over a thick bed of seasoned plain greek yogurt, with spinach wilted through and olive oil poured over at the table.",
+  "iconKey": "fork_knife",
+  "instructions": [
+    "Warm half the olive oil in a skillet over medium heat, stir in the ground cumin and cook for 30 seconds, until it smells toasted.",
+    "Add the diced tomato and the cooked lentils, heat them through for 3 minutes, then fold in the spinach until it wilts.",
+    "Season the greek yogurt with the salt and spread it across two plates.",
+    "Spoon the warm lentils over the yogurt and pour the remaining olive oil over each plate."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 plate",
+  "prepMinutes": 8,
+  "cookMinutes": 4,
+  "mealSlots": [
+    "lunch",
+    "dinner"
+  ],
+  "dietTags": [
+    "gluten_free",
+    "pescatarian",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "milk"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:172421",
+      "quantity": 3.5,
+      "unit": "cup",
+      "gramWeight": 693,
+      "displayText": "3½ cups",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:2705424",
+      "quantity": 2.5,
+      "unit": "cup",
+      "gramWeight": 612.5,
+      "displayText": "2½ cups",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170457",
+      "quantity": 2,
+      "unit": "each",
+      "gramWeight": 246,
+      "displayText": "2 medium, diced",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168462",
+      "quantity": 4,
+      "unit": "cup",
+      "gramWeight": 120,
+      "displayText": "4 cups",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 3.5,
+      "unit": "tbsp",
+      "gramWeight": 47.25,
+      "displayText": "3½ tbsp",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170923",
+      "quantity": 2,
+      "unit": "tsp",
+      "gramWeight": 4.2,
+      "displayText": "2 tsp",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 1,
+      "unit": "tsp",
+      "gramWeight": 6,
+      "displayText": "1 tsp",
+      "sortOrder": 6,
+      "isOptional": false
+    }
+  ]
+}

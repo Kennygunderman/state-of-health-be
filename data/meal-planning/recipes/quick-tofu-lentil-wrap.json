@@ -1,0 +1,104 @@
+{
+  "slug": "quick-tofu-lentil-wrap",
+  "name": "Tofu and lentil cabbage wrap",
+  "description": "Seared firm tofu and cooked lentils with sriracha, rolled into crisp cabbage leaves in fifteen minutes.",
+  "iconKey": "wrap",
+  "instructions": [
+    "Press the tofu dry and cut it into small cubes.",
+    "Warm the olive oil in a skillet over medium-high heat and sear the tofu for 5 minutes, turning once, until the edges are firm.",
+    "Stir in the cooked lentils, the sriracha hot sauce, the salt and the black pepper and heat through for 2 minutes.",
+    "Separate the cabbage into large leaves and lay them out in overlapping pairs.",
+    "Spoon the tofu and lentils down the middle of each pair and roll them up tightly from one long edge."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 wrap",
+  "prepMinutes": 8,
+  "cookMinutes": 7,
+  "mealSlots": [
+    "lunch",
+    "dinner"
+  ],
+  "dietTags": [
+    "gluten_free",
+    "pescatarian",
+    "vegan",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "soy"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "dairy_free",
+    "vegan",
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:172448",
+      "quantity": 1.75,
+      "unit": "cup",
+      "gramWeight": 441.0,
+      "displayText": "1¾ cups",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:172421",
+      "quantity": 1.75,
+      "unit": "cup",
+      "gramWeight": 346.5,
+      "displayText": "1¾ cups",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169975",
+      "quantity": 120,
+      "unit": "g",
+      "gramWeight": 120,
+      "displayText": "120 g",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171186",
+      "quantity": 2,
+      "unit": "tsp",
+      "gramWeight": 13.0,
+      "displayText": "2 tsp",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 0.5,
+      "unit": "tbsp",
+      "gramWeight": 6.75,
+      "displayText": "½ tbsp",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 3.0,
+      "displayText": "½ tsp",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170931",
+      "quantity": 0.25,
+      "unit": "tsp",
+      "gramWeight": 0.575,
+      "displayText": "¼ tsp",
+      "sortOrder": 6,
+      "isOptional": false
+    }
+  ]
+}

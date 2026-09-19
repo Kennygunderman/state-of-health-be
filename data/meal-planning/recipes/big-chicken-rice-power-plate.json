@@ -1,0 +1,107 @@
+{
+  "slug": "big-chicken-rice-power-plate",
+  "name": "Big chicken and rice power plate",
+  "description": "A large plate of garlicky seared chicken breast with broccoli and red bell pepper over warm white rice, on the table in fifteen minutes.",
+  "iconKey": "fork_knife",
+  "instructions": [
+    "Cut the chicken breast into thin strips and chop the broccoli and the bell pepper.",
+    "Warm the olive oil in a large skillet over medium-high heat, add the garlic and cook it for 30 seconds, until fragrant.",
+    "Add the chicken breast in a single layer and cook for 5 minutes, turning once, until it is cooked through.",
+    "Add the broccoli and the bell pepper with the salt and the black pepper and cook for 4 minutes, until the broccoli is bright and just tender.",
+    "Spread the warm white rice over one large plate and spoon the chicken and vegetables on top."
+  ],
+  "yieldServings": 1,
+  "servingDescription": "1 large plate",
+  "prepMinutes": 5,
+  "cookMinutes": 10,
+  "mealSlots": [
+    "lunch",
+    "dinner"
+  ],
+  "dietTags": [
+    "gluten_free"
+  ],
+  "allergenTags": [],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "dairy_free",
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:171077",
+      "quantity": 9,
+      "unit": "oz",
+      "gramWeight": 254.25,
+      "displayText": "9 oz",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169757",
+      "quantity": 1.5,
+      "unit": "cup",
+      "gramWeight": 237.0,
+      "displayText": "1½ cups",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170379",
+      "quantity": 1.5,
+      "unit": "cup",
+      "gramWeight": 132.0,
+      "displayText": "1½ cups, chopped",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170108",
+      "quantity": 0.5,
+      "unit": "cup",
+      "gramWeight": 74.5,
+      "displayText": "½ cup, chopped",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169230",
+      "quantity": 2,
+      "unit": "clove",
+      "gramWeight": 6.0,
+      "displayText": "2 cloves",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 1.25,
+      "unit": "tbsp",
+      "gramWeight": 16.875,
+      "displayText": "1¼ tbsp",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170931",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 1.15,
+      "displayText": "½ tsp",
+      "sortOrder": 6,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 3.0,
+      "displayText": "½ tsp",
+      "sortOrder": 7,
+      "isOptional": false
+    }
+  ]
+}

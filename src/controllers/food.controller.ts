@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import { createFood, deleteFood, getFoodsForUser, updateFood } from '../services/food.service';
 import { getBrandedFood, searchBrandedFoods, UsdaError } from '../services/usda.service';
+import { UserNotProvisionedError } from '../services/user.service';
 import { getUserId } from '../utils/getUserId';
 
 const isValidFoodPayload = (body: any): boolean =>
@@ -25,6 +26,15 @@ export const getFoods = async (req: Request, res: Response) => {
             },
         });
     } catch (error) {
+        // The first fetch seeds the four starter foods, so this read is a WRITE
+        // for a library that has never held a row, and `getFoodsForUser` refuses
+        // that write when no `users` row owns it. The body is the one
+        // `PUT /api/user/targets` has always answered for the same caller, so a
+        // missing account row reads identically wherever a legacy route meets
+        // it — instead of the 500 an unmapped Prisma P2003 produced here.
+        if (error instanceof UserNotProvisionedError) {
+            return res.status(404).json({ error: 'User not found' });
+        }
         console.error('Error getting foods:', error);
         res.status(500).json({ error: 'Failed to get foods' });
     }

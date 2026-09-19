@@ -86,6 +86,7 @@ import {
     InvalidRequestDetail,
     MealPlanDayEnvelopeResponse,
     MealPlanMealResponse,
+    PreferencesSaveResponse,
     SwapAlternativesResponse,
     SwapMealResponse,
     SwapPreviewResponse,
@@ -1576,6 +1577,212 @@ describe('POST one committed swap', () => {
         expect(await storedEntries()).toEqual(entriesBefore);
         expect(entriesBefore[0].meal_plan_meal_id).toBe(fixture.lunchMealId);
         expect(entriesBefore[0].recipe_version_id).toBe(fixture.lunchRecipe.id);
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * POST …/meals/:mealId/swap — the plan-level flag aggregate it refreshes
+ *
+ * `meal_plan_meals.flags` is the source of truth and the swap has always
+ * cleared it (the case above). `meal_plans.incompatibility_flags` is the
+ * plan-level AUDIT RECORD §0.5.1 and §0.5.2 name alongside it, and the failure
+ * these cases exist to catch is the two disagreeing: a swap that clears the
+ * meal's flag while leaving the aggregate naming that same meal, which is
+ * exactly what the aggregate read back as before this suite grew this section.
+ * Nothing user-visible reads the column today — `hasIncompatibilities` and
+ * `/affected-meals` both derive from the meals — so the assertions below are
+ * against STORAGE, which is the only place the divergence is observable.
+ * ------------------------------------------------------------------------- */
+
+/** The zone `makePreferences` stores, restated on each save so it cannot move. */
+const FIXTURE_TIME_ZONE = 'America/New_York';
+
+/**
+ * The column as stored, read as `unknown`.
+ *
+ * `unknown` rather than a decoded type because one of the values this column
+ * legitimately holds is the bare `[]` a plan is PUBLISHED with — the "never
+ * recomputed" value, which is neither the record's shape nor a claim about
+ * flags. Asserting through a type would presume a shape the storage does not
+ * guarantee, and the transition off that value is one of the cases below.
+ */
+const storedIncompatibilityFlags = async (planId?: string): Promise<unknown> =>
+    (await storedPlan(planId)).incompatibility_flags;
+
+/** The instant an audit record states it was derived at, as a `Date` to bracket. */
+const recomputedAtOf = (aggregate: unknown): Date =>
+    new Date((aggregate as { recomputedAt: string }).recomputedAt);
+
+/**
+ * Declares `milk` on one recipe version — on `allergen_tags`, which is what
+ * eligibility reads, AND on the ingredient snapshot that union is derived from,
+ * so the fixture states one thing twice rather than contradicting itself.
+ *
+ * AN ALLERGEN RATHER THAN A DISLIKE, and not a stylistic choice: every fixture
+ * food shares the `fixture_food` food group, and §0.7.3 has a dislike exclude
+ * the whole group a disliked food belongs to. Disliking one food would
+ * therefore make every candidate ineligible as well, leaving no swap to
+ * observe. An allergen is carried per recipe, so this flags exactly the meals
+ * planning this recipe and leaves the candidates — whose `allergen_tags` are
+ * empty — on offer.
+ */
+const declareMilkOn = async (version: FixtureRecipeVersion): Promise<void> => {
+    await prisma.recipe_versions.update({
+        where: { id: version.id },
+        data: { allergen_tags: ['milk'] },
+    });
+    await prisma.recipe_ingredients.updateMany({
+        where: { recipe_version_id: version.id, sort_order: 0 },
+        data: { snapshot_allergen_tags: ['milk'] },
+    });
+};
+
+/**
+ * Saves a milk allergy through the route a plan-settings edit takes, and
+ * returns how many meals it flagged.
+ *
+ * THE REAL PREFERENCE-SAVE PATH, never a hand-written column. That path is the
+ * other writer of this aggregate, so the record a swap has to refresh must be
+ * the one it actually produces — a fixture that wrote the column itself could
+ * agree with the swap's writer while both disagreed with the save's.
+ */
+const declareMilkAllergy = async (): Promise<number> => {
+    const response = await asUser(request.put('/api/meal-planning/preferences'), { uid: USER_ID }).send({
+        allergens: ['milk'],
+        timeZone: FIXTURE_TIME_ZONE,
+        expectedRevision: 1,
+    });
+
+    if (response.status !== 200) {
+        throw new Error(
+            `declaring the allergy was refused with ${String(response.status)}: ` +
+                JSON.stringify(response.body),
+        );
+    }
+
+    return (response.body as PreferencesSaveResponse).affectedMealCount;
+};
+
+describe('the plan-level flag aggregate a swap refreshes', () => {
+    /** Where a preference save that moved flags leaves the plan's revision. */
+    const PLAN_REVISION_AFTER_FLAGGING = PLAN_REVISION_BEFORE + 1;
+    /** And where the swap of a flagged meal leaves it: one bump, not two. */
+    const PLAN_REVISION_AFTER_FLAGGED_SWAP = PLAN_REVISION_AFTER_FLAGGING + 1;
+
+    /** The one flag a milk allergy puts on a meal planning a milk-bearing recipe. */
+    const MILK_FLAG = [{ code: 'allergen', detail: ['milk'] }];
+
+    /** The swap of the flagged lunch, against the revision the save left behind. */
+    const swapTheFlaggedLunch = () =>
+        commitSwapOrThrow(
+            swapBody(fixture.equalPortionCandidate.id, 1, {
+                expectedPlanRevision: PLAN_REVISION_AFTER_FLAGGING,
+            }),
+        );
+
+    it('clears the aggregate when the swap clears the last flagged meal', async () => {
+        await declareMilkOn(fixture.lunchRecipe);
+
+        expect(await declareMilkAllergy()).toBe(1);
+
+        // The starting point: the SAVE's own record, naming the one meal it
+        // flagged. Asserted rather than assumed, because every claim below is
+        // about what the swap does to this exact value.
+        expect(await storedIncompatibilityFlags()).toEqual({
+            flaggedMealIds: [fixture.lunchMealId],
+            codes: ['allergen'],
+            recomputedAt: expect.any(String),
+        });
+        expect((await storedLunch()).flags).toEqual(MILK_FLAG);
+        expect((await storedPlan()).revision).toBe(PLAN_REVISION_AFTER_FLAGGING);
+
+        const before = new Date();
+        const body = await swapTheFlaggedLunch();
+        const after = new Date();
+
+        // The meal row is the source of truth, and it now carries no flag...
+        expect(body.meal.flags).toEqual([]);
+        expect((await storedLunch()).flags).toEqual([]);
+
+        // ...and the aggregate now says the same thing, instead of going on
+        // naming the meal this commit has just made compatible.
+        const aggregate = await storedIncompatibilityFlags();
+
+        expect(aggregate).toEqual({
+            flaggedMealIds: [],
+            codes: [],
+            recomputedAt: expect.any(String),
+        });
+
+        // RE-DERIVED BY THIS COMMIT rather than left at the save's instant. A
+        // record that kept the older timestamp would be the same defect with an
+        // empty payload rather than a full one — the column would be claiming a
+        // currency it does not have — so the instant is bracketed to the request
+        // and not merely asserted to be a string.
+        bracketed(recomputedAtOf(aggregate), before, after);
+
+        // ONE revision bump for the swap, on top of the save's. The aggregate
+        // rides the statement that increments it rather than adding a second
+        // write, so a swap still costs a client exactly one stale-plan boundary.
+        expect((await storedPlan()).revision).toBe(PLAN_REVISION_AFTER_FLAGGED_SWAP);
+    });
+
+    it('keeps naming the flagged meals the swap did not touch', async () => {
+        await declareMilkOn(fixture.lunchRecipe);
+        await declareMilkOn(fixture.dinnerRecipe);
+
+        expect(await declareMilkAllergy()).toBe(2);
+
+        await swapTheFlaggedLunch();
+
+        // RECOMPUTED FROM THE ROWS, never blanked: the dinner is still flagged,
+        // so the aggregate still names it and still carries its code. This is
+        // the case that separates a real recomputation from a swap that simply
+        // empties the column whenever it writes.
+        expect(await storedIncompatibilityFlags()).toEqual({
+            flaggedMealIds: [fixture.dinnerMealId],
+            codes: ['allergen'],
+            recomputedAt: expect.any(String),
+        });
+        expect((await storedMeal(fixture.dinnerMealId)).flags).toEqual(MILK_FLAG);
+        expect((await storedLunch()).flags).toEqual([]);
+    });
+
+    it('records the aggregate even on a plan nothing ever flagged', async () => {
+        // A plan is published with the bare `[]` this column defaults to. The
+        // commit writes the record unconditionally, so there is no "nothing
+        // changed" branch in which the aggregate could be left behind — and the
+        // record it leaves is the honest one for a plan with no flagged meal.
+        expect(await storedIncompatibilityFlags()).toEqual([]);
+
+        await commitSwapOrThrow(swapBody(fixture.equalPortionCandidate.id, 1));
+
+        expect(await storedIncompatibilityFlags()).toEqual({
+            flaggedMealIds: [],
+            codes: [],
+            recomputedAt: expect.any(String),
+        });
+    });
+
+    it('leaves the aggregate exactly as it stood when the commit is refused', async () => {
+        await declareMilkOn(fixture.lunchRecipe);
+        await declareMilkAllergy();
+
+        const recordBefore = await storedIncompatibilityFlags();
+
+        // A stale revision, which the gates refuse before anything is written.
+        // The aggregate must still describe the flag that is still standing: a
+        // refusal that cleared it would be the mirror image of the defect.
+        const response = await postSwap(
+            swapBody(fixture.equalPortionCandidate.id, 1, {
+                expectedPlanRevision: PLAN_REVISION_BEFORE,
+            }),
+        );
+
+        expect(response.status).toBe(409);
+        expect(await storedIncompatibilityFlags()).toEqual(recordBefore);
+        expect((await storedLunch()).flags).toEqual(MILK_FLAG);
+        expect((await storedPlan()).revision).toBe(PLAN_REVISION_AFTER_FLAGGING);
     });
 });
 

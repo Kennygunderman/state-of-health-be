@@ -60,7 +60,13 @@ import { randomUUID } from 'node:crypto';
 
 import { Prisma, catalog_foods } from '../../generated/prisma';
 import { prisma } from '../../prisma/client';
-import { loadPlannedMealsForGroceries, rebuildPlanGroceries } from '../../services/grocery.service';
+import {
+    buildPlanGroceryDrafts,
+    loadPlannedMealsForGroceries,
+    loadStoredGroceryRows,
+    rebuildPlanGroceries,
+    writePlanGroceryRows,
+} from '../../services/grocery.service';
 import {
     GroceryItem,
     GroceryListResponse,
@@ -1083,6 +1089,57 @@ describe('PUT one check mark', () => {
             expect((await storedRow('Spinach')).is_checked).toBe(false);
         });
 
+        /**
+         * §0.5.1 gives this route no idempotency key and no expected revision,
+         * which is a statement about what it REQUIRES. A client that sends
+         * `expectedPlanRevision` believes it asked for an optimistic-concurrency
+         * guard, and a 200 would tell it the guard was applied — so the request
+         * is refused by name, like the four keyed writes refuse theirs, and the
+         * row is left exactly as it was.
+         */
+        it('refuses an expectedPlanRevision it does not implement, and toggles nothing', async () => {
+            const before = await storedRow('Spinach');
+
+            const response = await putItem(fixture.planId, itemId('Spinach'), {
+                isChecked: true,
+                expectedPlanRevision: 999,
+            }).expect(400);
+            const after = await storedRow('Spinach');
+
+            expect(response.body).toEqual({
+                error: 'invalid_request',
+                details: [{ field: 'expectedPlanRevision', code: 'unknown_field' }],
+            });
+            // A refusal that toggled anyway would be the worse defect.
+            expect(after.is_checked).toBe(before.is_checked);
+            expect(after.flagged_at).toEqual(before.flagged_at);
+            expect(after.checked_at).toEqual(before.checked_at);
+            expect(grams(after.previous_quantity_grams)).toBe(grams(before.previous_quantity_grams));
+            expect(await planRevision()).toBe(PLAN_REVISION);
+        });
+
+        it('names every unknown key and the bad isChecked in one refusal', async () => {
+            const response = await putItem(fixture.planId, itemId('Beans'), {
+                isChecked: 'yes',
+                idempotencyKey: randomUUID(),
+                quantityGrams: 4000,
+            }).expect(400);
+            const flagged = await storedRow('Beans');
+
+            expect(response.body).toEqual({
+                error: 'invalid_request',
+                details: [
+                    { field: 'isChecked', code: 'invalid_type' },
+                    { field: 'idempotencyKey', code: 'unknown_field' },
+                    { field: 'quantityGrams', code: 'unknown_field' },
+                ],
+            });
+            // The flagged row keeps its check, its flag and its baseline.
+            expect(flagged.is_checked).toBe(true);
+            expect(flagged.flagged_at).toEqual(FLAGGED_AT);
+            expect(grams(flagged.previous_quantity_grams)).toBe(100);
+        });
+
         it('answers an item of another plan and an item that does not exist identically, and writes nothing', async () => {
             const before = await storedRows();
             const secondPlanBefore = await storedRows(fixture.secondPlanId);
@@ -1473,6 +1530,26 @@ describe('POST uncheck-all', () => {
 
         expect(repeated.body).toEqual({ checkedCount: 0 });
         expect(await storedRows()).toEqual(afterFirst);
+    });
+
+    /**
+     * The unknown-field refusal the single-item toggle applies is scoped to
+     * that route's BODY, and this one has none: "Uncheck all" is a whole-plan
+     * command whose entire request is its path, so it accepts no body, judges
+     * none, and is unaffected by what a client happens to send. Asserted rather
+     * than assumed, because tightening the toggle's parser is exactly the
+     * change that could have leaked into here and started refusing a request
+     * clients already send with an empty JSON object.
+     */
+    it('takes no body, so nothing in one can refuse it', async () => {
+        const withJunk = await asUser(
+            request.post(uncheckAllPath(fixture.planId)).send({ isChecked: false, expectedPlanRevision: 999 }),
+            { uid: USER_ID },
+        ).expect(200);
+
+        expect(withJunk.body).toEqual({ checkedCount: 0 });
+        expect((await storedRows()).filter((row) => row.is_checked)).toHaveLength(0);
+        expect((await storedRows()).filter((row) => row.flagged_at !== null)).toHaveLength(0);
     });
 
     it('touches only the plan it was asked about', async () => {
@@ -1978,6 +2055,513 @@ describe('the two foods the catalog portions by the container', () => {
 });
 
 /* ---------------------------------------------------------------------------
+ * The names a shopper actually reads
+ *
+ * `food_state` is an internal code, and the shopping name is composed on the
+ * SERVER — the client renders `name` verbatim — so what a shopper reads is
+ * decided here and provable only here. A week is published with one food in
+ * each of the five states plus a base name carried in two of them at once, and
+ * the served names are read back off the wire.
+ * ------------------------------------------------------------------------- */
+
+describe('the names a shopper reads on the served list', () => {
+    /**
+     * One food of the week: the catalog's own `display_name` and `food_state`,
+     * and the name the list must serve for it.
+     */
+    const NAMED_FOODS = [
+        // The three states that describe how the CATALOG measured the food say
+        // nothing on a shopping line.
+        { displayName: 'Olive oil', foodState: 'as_purchased', category: 'fat_oil', served: 'Olive oil' },
+        { displayName: 'Peanut butter', foodState: 'prepared', category: 'condiment_sauce', served: 'Peanut butter' },
+        { displayName: 'Spinach', foodState: 'raw', category: 'produce_vegetable', served: 'Spinach' },
+        // The two that are real shopping distinctions keep their words.
+        { displayName: 'Salt', foodState: 'dry', category: 'spice_herb', served: 'Salt, dry' },
+        { displayName: 'Lentils', foodState: 'cooked', category: 'legume', served: 'Lentils, cooked' },
+    ] as const;
+
+    /**
+     * One base name on the list in two states at once, which is the only reason
+     * a silent state is ever said — and it is said in shopper words ("as
+     * sold"), never as the stored code.
+     */
+    const COEXISTING = [
+        { displayName: 'Chickpeas', foodState: 'as_purchased', category: 'legume', served: 'Chickpeas, as sold' },
+        { displayName: 'Chickpeas', foodState: 'cooked', category: 'legume', served: 'Chickpeas, cooked' },
+    ] as const;
+
+    let namedPlanId: string;
+
+    beforeEach(async () => {
+        const ingredients: { catalogFoodId: string; gram_weight: number; quantity: number; unit: string; display_text: string }[] =
+            [];
+
+        for (const named of [...NAMED_FOODS, ...COEXISTING]) {
+            const food = await makeCatalogFood({
+                display_name: named.displayName,
+                category: named.category,
+                food_state: named.foodState,
+                defaultPortion: gramPortion,
+            });
+
+            ingredients.push({
+                catalogFoodId: food.id,
+                gram_weight: 100,
+                quantity: 100,
+                unit: 'g',
+                display_text: '100 g',
+            });
+        }
+
+        const version = await makeRecipeVersion({
+            slug: 'grocery-suite-shopper-names',
+            name: 'Everything Bowl',
+            catalogFoodId: ingredients[0].catalogFoodId,
+            yield_servings: 1,
+            ingredients,
+        });
+        const plan = await makePlan(USER_ID, {
+            startDate: weekOffsetDayKey(70),
+            dayCount: 1,
+            slots: [{ slot: 'lunch', slot_time: '12:30', recipeVersionId: version.id }],
+        });
+
+        namedPlanId = plan.id;
+        await prisma.$transaction(async (tx) => {
+            await rebuildPlanGroceries(tx, {
+                userId: USER_ID,
+                planId: namedPlanId,
+                meals: await loadPlannedMealsForGroceries(tx, USER_ID, namedPlanId),
+                now: new Date(),
+            });
+        });
+    });
+
+    it('serves every name the way a shopper would read it', async () => {
+        const served = everyItem(await readList(namedPlanId))
+            .map((item) => item.name)
+            .sort();
+
+        expect(served).toEqual(
+            [...NAMED_FOODS, ...COEXISTING].map((named) => named.served).sort(),
+        );
+    });
+
+    it('prints no internal food_state token anywhere on the list', async () => {
+        const served = everyItem(await readList(namedPlanId)).map((item) => item.name);
+
+        for (const name of served) {
+            expect(name).not.toContain('_');
+            expect(name).not.toContain('as purchased');
+            expect(name).not.toMatch(/,\s*prepared\b/);
+        }
+    });
+
+    it('still renders two states of one base name as two distinct lines', async () => {
+        const chickpeas = everyItem(await readList(namedPlanId)).filter((item) => item.name.startsWith('Chickpeas'));
+
+        expect(chickpeas.map((item) => `${item.name} (${item.foodState})`).sort()).toEqual([
+            'Chickpeas, as sold (as_purchased)',
+            'Chickpeas, cooked (cooked)',
+        ]);
+        expect(chickpeas[0].name).not.toBe(chickpeas[1].name);
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * A later change that LOWERS an amount still above the acknowledged one
+ *
+ * The flag is a standing statement about what the shopper acknowledged, so the
+ * question a second swap asks is not "which way did the amount move?" but "does
+ * the row still ask them for more than they bought?". This describe drives the
+ * whole sequence through the real writes — the toggle over HTTP, then the
+ * production rebuild a swap commits, then a regeneration's carry-over — because
+ * the failure it pins was invisible in the response of any single step: each
+ * write looked right and the flag disappeared between two of them.
+ * ------------------------------------------------------------------------- */
+
+describe('a later change that lowers an amount still above the acknowledged one', () => {
+    /** 100 g per recipe at a yield of one, so the multiplier IS the gram total. */
+    const GRAMS_PER_PORTION = 100;
+
+    /** The three amounts of the sequence, and the text each renders as. */
+    const ACKNOWLEDGED = { multiplier: 1, grams: 100, text: '3.5 oz' };
+    const RAISED = { multiplier: 3, grams: 300, text: '10.6 oz' };
+    const LOWERED_BUT_ABOVE = { multiplier: 2, grams: 200, text: '7.1 oz' };
+
+    let sequencePlanId: string;
+    let sequenceItemId: string;
+    let sequenceFoodId: string;
+    let sequenceRecipeVersionId: string;
+
+    const rebuild = async (planId: string): Promise<void> => {
+        await prisma.$transaction(async (tx) => {
+            await rebuildPlanGroceries(tx, {
+                userId: USER_ID,
+                planId,
+                meals: await loadPlannedMealsForGroceries(tx, USER_ID, planId),
+                now: new Date(),
+            });
+        });
+    };
+
+    const planAt = async (multiplier: number): Promise<void> => {
+        await prisma.meal_plan_meals.updateMany({
+            where: { meal_plan_id: sequencePlanId },
+            data: { portion_multiplier: multiplier },
+        });
+        await rebuild(sequencePlanId);
+    };
+
+    const sequenceRow = (): Promise<StoredGroceryRow> =>
+        prisma.grocery_items.findUniqueOrThrow({ where: { id: sequenceItemId } });
+
+    beforeEach(async () => {
+        const food = await makeCatalogFood({
+            display_name: 'Olive oil',
+            category: 'fat_oil',
+            food_state: 'raw',
+            defaultPortion: gramPortion,
+        });
+        const version = await makeRecipeVersion({
+            slug: 'grocery-suite-standing-flag',
+            name: 'Oil Dressed Salad',
+            catalogFoodId: food.id,
+            yield_servings: 1,
+            ingredients: [
+                {
+                    catalogFoodId: food.id,
+                    gram_weight: GRAMS_PER_PORTION,
+                    quantity: GRAMS_PER_PORTION,
+                    unit: 'g',
+                    display_text: `${GRAMS_PER_PORTION} g`,
+                },
+            ],
+        });
+        const plan = await makePlan(USER_ID, {
+            startDate: weekOffsetDayKey(56),
+            dayCount: 1,
+            slots: [{ slot: 'lunch', slot_time: '12:30', recipeVersionId: version.id }],
+        });
+
+        sequencePlanId = plan.id;
+        sequenceFoodId = food.id;
+        sequenceRecipeVersionId = version.id;
+        await rebuild(sequencePlanId);
+        sequenceItemId = (await readList(sequencePlanId)).sections[0].items[0].id;
+
+        // The shopper buys 100 g and ticks the row off: 100 g is the
+        // acknowledged amount from here on.
+        await putItem(sequencePlanId, sequenceItemId, { isChecked: true }).expect(200);
+        await planAt(RAISED.multiplier);
+    });
+
+    it('flags the first increase against what was acknowledged', async () => {
+        const flagged = (await readList(sequencePlanId)).checkedItems[0];
+
+        expect(flagged.quantityGrams).toBe(RAISED.grams);
+        expect(flagged.displayText).toBe(RAISED.text);
+        expect(flagged.flag).toMatchObject({
+            previousDisplayText: ACKNOWLEDGED.text,
+            newDisplayText: RAISED.text,
+            deltaDisplayText: '+7.1 oz',
+        });
+    });
+
+    it('keeps the flag, the sub-line and the banner when a later change lowers it to 200 g', async () => {
+        const raisedAt = (await sequenceRow()).flagged_at;
+
+        await planAt(LOWERED_BUT_ABOVE.multiplier);
+
+        const list = await readList(sequencePlanId);
+        const stillFlagged = list.checkedItems[0];
+        const stored = await sequenceRow();
+
+        expect(stillFlagged.quantityGrams).toBe(LOWERED_BUT_ABOVE.grams);
+        expect(stillFlagged.displayText).toBe(LOWERED_BUT_ABOVE.text);
+        // Still checked, and still flagged: the shopper bought 100 g, the week
+        // now needs 200 g, and they have acknowledged nothing in between.
+        expect(stillFlagged.isChecked).toBe(true);
+        expect(stillFlagged.flag).toMatchObject({
+            previousDisplayText: ACKNOWLEDGED.text,
+            newDisplayText: LOWERED_BUT_ABOVE.text,
+            deltaDisplayText: '+3.6 oz',
+        });
+        // The instant is the one the flag was raised at, not the one that
+        // lowered the amount.
+        expect(stillFlagged.flag?.flaggedAt).toBe(raisedAt?.toISOString());
+        expect(stored.flagged_at).toEqual(raisedAt);
+        expect(grams(stored.previous_quantity_grams)).toBe(ACKNOWLEDGED.grams);
+        expect(list.banner).toMatchObject({ code: 'amount_increased', itemNames: ['Olive oil'] });
+    });
+
+    it('clears the flag once the amount comes back to what was acknowledged', async () => {
+        await planAt(LOWERED_BUT_ABOVE.multiplier);
+        await planAt(ACKNOWLEDGED.multiplier);
+
+        const list = await readList(sequencePlanId);
+        const cleared = list.checkedItems[0];
+        const stored = await sequenceRow();
+
+        expect(cleared.quantityGrams).toBe(ACKNOWLEDGED.grams);
+        expect(cleared.displayText).toBe(ACKNOWLEDGED.text);
+        expect(cleared.isChecked).toBe(true);
+        expect(cleared.flag).toBeNull();
+        expect(stored.flagged_at).toBeNull();
+        // The baseline is kept, so a later increase is still measured from the
+        // amount the shopper actually saw.
+        expect(grams(stored.previous_quantity_grams)).toBe(ACKNOWLEDGED.grams);
+        expect(list.banner).toBeNull();
+    });
+
+    it('stops flagging the row once the shopper re-acknowledges it', async () => {
+        // Toggling is the shopper's own acknowledgement: it clears the flag and
+        // records 300 g as the new yardstick, so the fall to 200 g that follows
+        // has nothing left to warn about.
+        await putItem(sequencePlanId, sequenceItemId, { isChecked: false }).expect(200);
+        await putItem(sequencePlanId, sequenceItemId, { isChecked: true }).expect(200);
+        expect(grams((await sequenceRow()).previous_quantity_grams)).toBe(RAISED.grams);
+
+        await planAt(LOWERED_BUT_ABOVE.multiplier);
+
+        const list = await readList(sequencePlanId);
+
+        expect(list.checkedItems[0].flag).toBeNull();
+        expect((await sequenceRow()).flagged_at).toBeNull();
+        expect(list.banner).toBeNull();
+    });
+
+    /**
+     * The same decision reached through the OTHER caller of the diff. A
+     * regeneration publishes a new plan's rows and carries the old plan's check
+     * state across `resolveCarriedCheckState`, which asks `diffGroceryList` the
+     * question and copies its verdicts — so a flag that stands through a swap
+     * has to survive a regeneration that lowers the amount the same way, or the
+     * two paths would disagree about the same week.
+     */
+    it('carries the standing flag onto a regenerated plan', async () => {
+        const regenerated = await makePlan(USER_ID, {
+            startDate: weekOffsetDayKey(63),
+            dayCount: 1,
+            slots: [
+                {
+                    slot: 'lunch',
+                    slot_time: '12:30',
+                    recipeVersionId: sequenceRecipeVersionId,
+                    portion_multiplier: LOWERED_BUT_ABOVE.multiplier,
+                },
+            ],
+        });
+
+        await prisma.$transaction(async (tx) => {
+            await writePlanGroceryRows(tx, {
+                userId: USER_ID,
+                planId: regenerated.id,
+                drafts: await buildPlanGroceryDrafts(tx, await loadPlannedMealsForGroceries(tx, USER_ID, regenerated.id)),
+                carryOverFrom: await loadStoredGroceryRows(tx, USER_ID, sequencePlanId),
+                now: new Date(),
+            });
+        });
+
+        const carried = (await readList(regenerated.id)).checkedItems[0];
+        const stored = await prisma.grocery_items.findFirstOrThrow({
+            where: { meal_plan_id: regenerated.id, catalog_food_id: sequenceFoodId },
+        });
+
+        expect(carried.quantityGrams).toBe(LOWERED_BUT_ABOVE.grams);
+        expect(carried.isChecked).toBe(true);
+        expect(carried.flag).toMatchObject({
+            previousDisplayText: ACKNOWLEDGED.text,
+            newDisplayText: LOWERED_BUT_ABOVE.text,
+            deltaDisplayText: '+3.6 oz',
+        });
+        expect(grams(stored.previous_quantity_grams)).toBe(ACKNOWLEDGED.grams);
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * A week whose total lands on a display-rounding midpoint
+ *
+ * `quantity_grams` is `NUMERIC(10,2)` and the aggregate keeps every decimal, so
+ * a week's true total can sit on the far side of a rounding step from the number
+ * the column holds. This is the shipped data's own case: 416.25 g of a
+ * two-serving recipe is 208.125 g, which renders "1 cup", while the stored
+ * 208.13 g renders "1¼ cups".
+ *
+ * WHY IT IS AN HTTP CASE AND NOT ONLY A PURE ONE. The row is written by the
+ * production builder and read back through `grocery.mapper.ts`, which serves
+ * `displayText` from the stored column and builds the flag by RE-RENDERING the
+ * acknowledged baseline's grams. A row whose text disagreed with its own grams
+ * therefore reached the client as a sub-line quoting an amount the row had never
+ * shown, or — the consequential half — as no flag at all on a visible increase.
+ * Both are properties of the served payload, so they are asserted on it.
+ * ------------------------------------------------------------------------- */
+
+describe('a week whose total lands on a display-rounding midpoint', () => {
+    /** The density that puts this food's real total on a ¼-cup step. */
+    const DENSITY_G_PER_ML = 0.78195;
+
+    /** A cup portion, so the row is a volume row and the step is a quarter cup. */
+    const CUP_PORTION = { description: '1 cup', amount: 1, unit: 'cup', gram_weight: 185 };
+
+    const YIELD_SERVINGS = 2;
+
+    /** Grams of the food in the whole recipe; the yield halves it to 208.125 g. */
+    const GRAMS_PER_RECIPE = 416.25;
+
+    /** What the column holds, and what the row must therefore read as. */
+    const STORED_GRAMS = 208.13;
+    const STORED_TEXT = '1¼ cups';
+
+    /** What the untruncated aggregate rendered as before this was fixed. */
+    const UNTRUNCATED_TEXT = '1 cup';
+
+    /** A later week at 1.25 portions: 260.16 g, a quarter cup more on the row. */
+    const INCREASED_MULTIPLIER = 1.25;
+    const INCREASED_GRAMS = 260.16;
+    const INCREASED_TEXT = '1½ cups';
+    const DELTA_TEXT = '+¼ cup';
+
+    /** 1.1 portions: 20 g more, which is inside the row's own quarter cup. */
+    const INVISIBLE_INCREASE_MULTIPLIER = 1.1;
+    const INVISIBLE_INCREASE_GRAMS = 228.94;
+
+    let midpointPlanId: string;
+    let midpointItemId: string;
+
+    const rebuildMidpointPlan = async (): Promise<void> => {
+        await prisma.$transaction(async (tx) => {
+            await rebuildPlanGroceries(tx, {
+                userId: USER_ID,
+                planId: midpointPlanId,
+                meals: await loadPlannedMealsForGroceries(tx, USER_ID, midpointPlanId),
+                now: new Date(),
+            });
+        });
+    };
+
+    beforeEach(async () => {
+        const food = await makeCatalogFood({
+            display_name: 'Quinoa',
+            category: 'grain',
+            food_state: 'cooked',
+            density_g_per_ml: DENSITY_G_PER_ML,
+            defaultPortion: CUP_PORTION,
+        });
+        const version = await makeRecipeVersion({
+            slug: 'grocery-suite-midpoint',
+            name: 'Quinoa Bowl',
+            catalogFoodId: food.id,
+            yield_servings: YIELD_SERVINGS,
+            ingredients: [
+                {
+                    catalogFoodId: food.id,
+                    gram_weight: GRAMS_PER_RECIPE,
+                    quantity: GRAMS_PER_RECIPE,
+                    unit: 'g',
+                    display_text: `${GRAMS_PER_RECIPE} g`,
+                },
+            ],
+        });
+        // Its own week: the shared fixture holds the current one and the
+        // describes above take the rest, and the partial unique index refuses a
+        // second active plan on one start date. The week is still unended, so
+        // the toggle below is accepted.
+        const plan = await makePlan(USER_ID, {
+            startDate: weekOffsetDayKey(49),
+            dayCount: 1,
+            slots: [{ slot: 'lunch', slot_time: '12:30', recipeVersionId: version.id }],
+        });
+
+        midpointPlanId = plan.id;
+        await rebuildMidpointPlan();
+        midpointItemId = (await readList(midpointPlanId)).sections[0].items[0].id;
+    });
+
+    it('serves a displayText that describes the quantityGrams beside it', async () => {
+        const item = everyItem(await readList(midpointPlanId))[0];
+
+        expect(item.quantityGrams).toBe(STORED_GRAMS);
+        expect(item.displayText).toBe(STORED_TEXT);
+        // The rendering of the untruncated aggregate, which the row must NOT
+        // carry: it would describe a different amount from the grams served
+        // beside it, and every "was Y" the flag builds re-renders those grams.
+        expect(item.displayText).not.toBe(UNTRUNCATED_TEXT);
+        expect((await prisma.grocery_items.findUniqueOrThrow({ where: { id: midpointItemId } })).display_text).toBe(
+            STORED_TEXT,
+        );
+    });
+
+    it('flags a visible increase on the checked row, with a pill that reconciles with it', async () => {
+        const acknowledgedText = everyItem(await readList(midpointPlanId))[0].displayText;
+
+        await putItem(midpointPlanId, midpointItemId, { isChecked: true }).expect(200);
+
+        // The acknowledged baseline is recorded as GRAMS, so it is the stored
+        // number — and the text the shopper saw is the rendering of exactly
+        // that number.
+        expect(
+            grams((await prisma.grocery_items.findUniqueOrThrow({ where: { id: midpointItemId } })).previous_quantity_grams),
+        ).toBe(STORED_GRAMS);
+
+        await prisma.meal_plan_meals.updateMany({
+            where: { meal_plan_id: midpointPlanId },
+            data: { portion_multiplier: INCREASED_MULTIPLIER },
+        });
+        await rebuildMidpointPlan();
+
+        const list = await readList(midpointPlanId);
+        const flagged = list.checkedItems[0];
+
+        expect(flagged.quantityGrams).toBe(INCREASED_GRAMS);
+        expect(flagged.displayText).toBe(INCREASED_TEXT);
+        expect(flagged.isChecked).toBe(true);
+        // The flag exists at all — the half of this defect that left a checked
+        // row growing a quarter cup with no sub-line and no banner — and its
+        // "was" is the text the row itself was showing.
+        expect(flagged.flag).toMatchObject({
+            previousDisplayText: STORED_TEXT,
+            newDisplayText: INCREASED_TEXT,
+            deltaDisplayText: DELTA_TEXT,
+        });
+        // Stated against the text the row was ACTUALLY SERVING when the shopper
+        // checked it, not only against the constant: the sub-line has to quote
+        // the amount they saw, and a row whose text disagreed with its own
+        // grams is exactly how "was" came to name an amount it had never shown.
+        expect(flagged.flag?.previousDisplayText).toBe(acknowledgedText);
+        expect(list.banner).toMatchObject({ code: 'amount_increased', itemNames: ['Quinoa, cooked'] });
+    });
+
+    /**
+     * The same-display exception on the drifting row, which is where the
+     * suppression used to hide: an increase the row's own text does not show
+     * raises no flag — and the row's text really does not move, so the shopper
+     * is not looking at a larger amount with nothing to tell them about it.
+     * Before the fix this row read "1 cup" while its grams said "1¼ cups", so
+     * this very increase moved the served text a quarter cup AND raised no
+     * flag.
+     */
+    it('raises no flag for an increase the row\u2019s own text does not show', async () => {
+        const acknowledgedText = everyItem(await readList(midpointPlanId))[0].displayText;
+
+        await putItem(midpointPlanId, midpointItemId, { isChecked: true }).expect(200);
+        await prisma.meal_plan_meals.updateMany({
+            where: { meal_plan_id: midpointPlanId },
+            data: { portion_multiplier: INVISIBLE_INCREASE_MULTIPLIER },
+        });
+        await rebuildMidpointPlan();
+
+        const list = await readList(midpointPlanId);
+        const unflagged = list.checkedItems[0];
+
+        expect(unflagged.quantityGrams).toBe(INVISIBLE_INCREASE_GRAMS);
+        expect(unflagged.displayText).toBe(acknowledgedText);
+        expect(unflagged.flag).toBeNull();
+        expect(list.banner).toBeNull();
+    });
+});
+
+/* ---------------------------------------------------------------------------
  * Ownership, the capability gate, and what a refusal may say
  * ------------------------------------------------------------------------- */
 
@@ -2065,20 +2649,25 @@ describe('ownership and the capability gate', () => {
         expect((await prisma.grocery_items.findUniqueOrThrow({ where: { id: otherRow.id } })).is_checked).toBe(false);
     });
 
-    it('ignores a userId in the body', async () => {
+    it('refuses a userId in the body, and reaches no user through it', async () => {
         await makeUser({ id: OTHER_USER_ID });
         await makePreferences(OTHER_USER_ID);
 
         // `getUserId(req)` reads the verified token claims and nothing else
-        // (Rule §4), so a body field naming another user is inert rather than
-        // an escalation.
+        // (Rule §4), so a body field naming another user could never be an
+        // escalation — but it is refused rather than ignored, because a request
+        // the server accepts is a request the client believes was honoured.
         const response = await putItem(fixture.planId, itemId('Spinach'), {
             isChecked: true,
             userId: OTHER_USER_ID,
-        }).expect(200);
+        }).expect(400);
 
-        expect((response.body as ToggleGroceryItemResponse).item.isChecked).toBe(true);
+        expect(response.body).toEqual({
+            error: 'invalid_request',
+            details: [{ field: 'userId', code: 'unknown_field' }],
+        });
         expect((await storedRow('Spinach')).user_id).toBe(USER_ID);
+        expect((await storedRow('Spinach')).is_checked).toBe(false);
         expect(await prisma.grocery_items.count({ where: { user_id: OTHER_USER_ID } })).toBe(0);
     });
 

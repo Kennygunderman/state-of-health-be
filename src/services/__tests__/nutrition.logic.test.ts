@@ -55,12 +55,18 @@
  * here for the same reason — written beside a Prisma call they needed a database
  * and a seeded catalog to exercise, so their branches went untested:
  *
- *  - **`parseMealEntryPath` / `parseEntryPath`.** Both routes address a row by a
- *    `@db.Uuid` key, so an unparsable id is a PostgreSQL syntax error, and
- *    handing one to the writer answers a fixable request with a 500. The
- *    verdicts pin `400 invalid_request` with `invalid_id` on the field the
- *    caller must fix, and that a well-formed id is still left to the 404 that
- *    keeps "missing" and "not yours" indistinguishable.
+ *  - **`isDatabaseParsableUuid` / `parseMealEntryPath` / `parseEntryPath`.** Both
+ *    routes address a row by a `@db.Uuid` key, so an unparsable id is a
+ *    PostgreSQL syntax error, and handing one to the writer answers a fixable
+ *    request with a 500. The verdicts pin `400 invalid_request` with
+ *    `invalid_id` on the field the caller must fix, and that a well-formed id is
+ *    still left to the 404 that keeps "missing" and "not yours"
+ *    indistinguishable. Where that line falls is the compatibility decision, so
+ *    the grammar is pinned form by form rather than described: every id the data
+ *    layer can parse — including a v1 id, an unhyphenated id, a braced id and a
+ *    `urn:uuid:` id, all of which answered 404 before this release — must still
+ *    reach the query, and only the forms that used to answer 500 may earn the
+ *    400 (§0.5.2, existing contracts change additively only).
  *  - **The stored-provenance vocabulary.** `toNutritionProvenance` reads an
  *    unrestricted TEXT column, and what it does with a value it does not know —
  *    report `null`, the unlabelled class — is safe for HISTORY and destructive
@@ -109,6 +115,7 @@ import {
     ParsedMealEntryPath,
     StoredMealEntrySnapshot,
     containsNulCharacter,
+    isDatabaseParsableUuid,
     isEntryNutritionProvenance,
     parseEntryPath,
     parseLogEntryBody,
@@ -126,7 +133,6 @@ const CATALOG_FOOD_ID = '3f2504e0-4f89-41d3-9a0c-0305e82c3301';
 /** The shipped 400 texts. Asserted literally — they are part of the wire contract. */
 const LEGACY_REQUIRED_MESSAGE = 'name, calories, protein, carbs, and fat are required';
 const CONFLICTING_REFERENCE_MESSAGE = 'foodId and catalogFoodId cannot both be provided';
-const UNRECOGNIZED_MESSAGE = 'either catalogFoodId or name, calories, protein, carbs, and fat are required';
 const SERVINGS_MESSAGE = 'servings must be a number between 0.25 and 10 with at most 2 decimal places';
 
 /**
@@ -208,8 +214,8 @@ describe('parseLogEntryBody', () => {
             const verdict = parseLogEntryBody(body);
 
             expect(verdict.kind).toBe('error');
-            expect(asError(verdict).code).toBe('invalid_payload');
-            expect(asError(verdict).message).toBe(UNRECOGNIZED_MESSAGE);
+            expect(asError(verdict).code).toBe('unrecognized_payload');
+            expect(asError(verdict).message).toBe(LEGACY_REQUIRED_MESSAGE);
             expect(asError(verdict).details).toStrictEqual([{ field: 'body', code: 'unrecognized_payload' }]);
         });
 
@@ -224,7 +230,7 @@ describe('parseLogEntryBody', () => {
         it('refuses an empty object', () => {
             const verdict = parseLogEntryBody({});
 
-            expect(asError(verdict).code).toBe('invalid_payload');
+            expect(asError(verdict).code).toBe('unrecognized_payload');
             expect(fieldCodes(verdict)).toStrictEqual(['body:unrecognized_payload']);
         });
 
@@ -233,7 +239,7 @@ describe('parseLogEntryBody', () => {
             // a shape signal — a body carrying only them selects nothing.
             const verdict = parseLogEntryBody({ servings: 2, servingText: '1 cup' });
 
-            expect(asError(verdict).code).toBe('invalid_payload');
+            expect(asError(verdict).code).toBe('unrecognized_payload');
             expect(fieldCodes(verdict)).toStrictEqual(['body:unrecognized_payload']);
         });
 
@@ -734,13 +740,14 @@ describe('parseLogEntryBody', () => {
         });
     });
 
-    describe('which of the three 400 verdicts a failure earns', () => {
+    describe('which 400 verdict a failure earns', () => {
         // Each verdict is rendered differently: legacy_fields_required keeps the
-        // frozen message-only body shipped clients read, while the other two
-        // carry the machine code and the per-field details. One code shared
-        // across two routes is what let a catalog failure be answered with the
-        // legacy message and lose both, so the partition is asserted here rather
-        // than inferred from the controller.
+        // frozen message-only body shipped clients read, unrecognized_payload
+        // keeps that same sentence as `error` and adds the machine code and
+        // details beside it, and the other two carry the machine code as `error`.
+        // One code shared across two routes is what let a catalog failure be
+        // answered with the legacy message and lose both, so the partition is
+        // asserted here rather than inferred from the controller.
         it.each([
             ['a legacy body with holes', 'legacy_fields_required', { name: 'eggs' }],
             ['a legacy body with an unusable name', 'legacy_fields_required', { ...validLegacyBody(), name: '  ' }],
@@ -761,8 +768,8 @@ describe('parseLogEntryBody', () => {
                 'invalid_payload',
                 { ...validLegacyBody(), foodId: 'personal-food-1', catalogFoodId: CATALOG_FOOD_ID },
             ],
-            ['a body naming neither shape', 'invalid_payload', { servings: 2 }],
-            ['a body that is not an object at all', 'invalid_payload', null],
+            ['a body naming neither shape', 'unrecognized_payload', { servings: 2 }],
+            ['a body that is not an object at all', 'unrecognized_payload', null],
         ])('answers %s with the %s verdict', (_case, expectedCode, body) => {
             expect(asError(parseLogEntryBody(body)).code).toBe(expectedCode);
         });
@@ -772,6 +779,46 @@ describe('parseLogEntryBody', () => {
 
             expect(verdict.code).toBe('legacy_fields_required');
             expect(verdict.message).toBe(LEGACY_REQUIRED_MESSAGE);
+        });
+
+        it.each([
+            ['an empty object', {}],
+            ['an array', [1, 2, 3]],
+            ['a body whose only key is unknown', { somethingElse: 1 }],
+            ['a body carrying only the shared fields', { servings: 2 }],
+            ['a non-object body', null],
+        ])('keeps the frozen sentence for %s, which names no shape at all', (_case, body) => {
+            // The compatibility half of §0.3.1's `invalid_payload`. This refusal
+            // predates the catalog shape — the shipped `isValidMacroPayload`
+            // guard answered exactly this sentence for every body that was not a
+            // legacy one — and it is the only refusal here a client that has
+            // never heard of `catalogFoodId` can still reach. Replacing the
+            // sentence with the machine code would change that live response
+            // (§0.5.2) and would render the literal word `invalid_payload` to a
+            // user of a client that prints `error`; the code travels in `code`
+            // instead, which the controller's renderer pins.
+            const verdict = asError(parseLogEntryBody(body));
+
+            expect(verdict.code).toBe('unrecognized_payload');
+            expect(verdict.message).toBe(LEGACY_REQUIRED_MESSAGE);
+            expect(verdict.details).toStrictEqual([{ field: 'body', code: 'unrecognized_payload' }]);
+        });
+
+        it('does not give the two-food conflict the frozen sentence', () => {
+            // The boundary of the rule above, and the reason the two verdicts
+            // are separate. A body naming both foods routinely carries all five
+            // legacy fields — this one does — so "name, calories, protein,
+            // carbs, and fat are required" would be factually false. It is also
+            // a body no shipped client can send, since `catalogFoodId` is new in
+            // this release, so there is no historical response to preserve:
+            // §0.3.1's machine code is the whole contract for it.
+            const verdict = asError(
+                parseLogEntryBody({ ...validLegacyBody(), foodId: 'personal-food-1', catalogFoodId: CATALOG_FOOD_ID }),
+            );
+
+            expect(verdict.code).toBe('invalid_payload');
+            expect(verdict.message).toBe(CONFLICTING_REFERENCE_MESSAGE);
+            expect(verdict.message).not.toBe(LEGACY_REQUIRED_MESSAGE);
         });
 
         it('never answers a catalog field failure with the legacy verdict or its message', () => {
@@ -1152,6 +1199,57 @@ describe('resolveLegacyInputMethod', () => {
 const MEAL_ID = '9b2fbd4c-7c21-4a17-8b36-1d5a2d4f9c10';
 const ENTRY_ID = 'c0a80121-7ac0-4f2e-b1f7-3f8c1d9a4e62';
 
+/** The same 128 bits as {@link MEAL_ID}, written without separators. */
+const MEAL_ID_SIMPLE = '9b2fbd4c7c214a178b361d5a2d4f9c10';
+
+/**
+ * The four textual forms the data layer's UUID parser accepts, each of which
+ * therefore reaches the query and earns the 404 the legacy routes have always
+ * answered. Named once and reused by the predicate's own suite and by both path
+ * parsers, so the three cannot pin different grammars.
+ *
+ * Verified against the live parser rather than inferred: driving
+ * `prisma.meals.findFirst` with all 24 forms below (8 accepted, 16 refused)
+ * produced exactly this partition, with zero disagreements against
+ * `isDatabaseParsableUuid`.
+ */
+const PARSABLE_ID_FORMS: readonly [string, string][] = [
+    ['a hyphenated v4 UUID', MEAL_ID],
+    ['an upper-case hyphenated UUID', MEAL_ID.toUpperCase()],
+    ['a v1 UUID, which gen_random_uuid never produces but the parser reads', '9b2fbd4c-7c21-1a17-8b36-1d5a2d4f9c10'],
+    ['a UUID with an out-of-range variant nibble', '9b2fbd4c-7c21-4a17-1b36-1d5a2d4f9c10'],
+    ['a UUID missing its hyphens', MEAL_ID_SIMPLE],
+    ['an upper-case UUID missing its hyphens', MEAL_ID_SIMPLE.toUpperCase()],
+    ['a brace-wrapped UUID', `{${MEAL_ID}}`],
+    ['a urn:uuid:-prefixed UUID', `urn:uuid:${MEAL_ID}`],
+];
+
+/**
+ * Every form the parser refuses, which is exactly the class the routes used to
+ * answer 500 for — including the three near-misses its length-dispatched
+ * grammar rejects (braces or a URN prefix around the unhyphenated form, and an
+ * upper-case URN prefix), and the hyphens-after-every-four-digits spelling
+ * PostgreSQL's own `uuid_in` would take but the data layer never sees.
+ */
+const UNPARSABLE_ID_FORMS: readonly [string, string][] = [
+    ['a string that is not a UUID at all', 'not-a-uuid'],
+    ['a SQL fragment', "' OR 1=1--"],
+    ['an empty segment', ''],
+    ['31 hex digits', MEAL_ID_SIMPLE.slice(0, 31)],
+    ['33 hex digits', `${MEAL_ID_SIMPLE}0`],
+    ['hyphens after every group of four digits', '9b2fbd4c-7c214a17-8b361d5a-2d4f9c10'],
+    ['a truncated UUID', '9b2fbd4c-7c21-4a17-8b36'],
+    ['a trailing hyphen', `${MEAL_ID}-`],
+    ['a padded UUID', ` ${MEAL_ID} `],
+    ['a trailing newline', `${MEAL_ID}\n`],
+    ['a NUL character inside the id', `${MEAL_ID.slice(0, 35)}${NUL}`],
+    ['a full-width digit lookalike', `${MEAL_ID.slice(0, 35)}\uff10`],
+    ['braces around the unhyphenated form', `{${MEAL_ID_SIMPLE}}`],
+    ['a URN prefix on the unhyphenated form', `urn:uuid:${MEAL_ID_SIMPLE}`],
+    ['a URN prefix on the braced form', `urn:uuid:{${MEAL_ID}}`],
+    ['an upper-case URN prefix', `URN:UUID:${MEAL_ID}`],
+];
+
 const asPathError = (verdict: ParsedMealEntryPath | ParsedEntryPath): ErrorVerdict => {
     if (verdict.kind !== 'error') {
         throw new Error(`expected an error verdict, received "${verdict.kind}"`);
@@ -1160,33 +1258,58 @@ const asPathError = (verdict: ParsedMealEntryPath | ParsedEntryPath): ErrorVerdi
     return verdict;
 };
 
-describe('parseMealEntryPath', () => {
-    it('accepts a v4 UUID and hands back the id the writers address the meal by', () => {
-        expect(parseMealEntryPath({ mealId: MEAL_ID })).toStrictEqual({ kind: 'ok', mealId: MEAL_ID });
+describe('isDatabaseParsableUuid', () => {
+    // The grammar this predicate encodes IS the legacy routes' compatibility
+    // rule, so it is pinned form by form. An id the data layer can parse reaches
+    // the query, finds no row and answers the 404 shipped clients act on ("the
+    // entry is gone, drop it from the cache"); an id it cannot parse is the
+    // syntax error that used to surface as a 500. Narrowing this predicate to v4
+    // moved four well-formed forms from 404 to 400, which §0.5.2 forbids on an
+    // existing contract — widening it past the parser would move unparsable ids
+    // from 400 back to 500. Both mistakes are one regex edit away, which is why
+    // every form is here rather than summarized.
+    it.each(PARSABLE_ID_FORMS)('accepts %s', (_case, value) => {
+        expect(isDatabaseParsableUuid(value)).toBe(true);
     });
 
-    it('accepts an upper-case UUID, which PostgreSQL parses identically', () => {
-        const upper = MEAL_ID.toUpperCase();
-
-        expect(parseMealEntryPath({ mealId: upper })).toStrictEqual({ kind: 'ok', mealId: upper });
+    it.each(UNPARSABLE_ID_FORMS)('refuses %s', (_case, value) => {
+        expect(isDatabaseParsableUuid(value)).toBe(false);
     });
 
     it.each([
-        ['a string that is not a UUID at all', 'not-a-uuid'],
-        ['a SQL fragment', "' OR 1=1--"],
-        ['an empty segment', ''],
-        ['a UUID missing its hyphens', '9b2fbd4c7c214a178b361d5a2d4f9c10'],
-        ['a brace-wrapped UUID PostgreSQL would accept but no row can hold', `{${MEAL_ID}}`],
-        ['a padded UUID', ` ${MEAL_ID} `],
-        ['a v1 UUID, which gen_random_uuid never produces', '9b2fbd4c-7c21-1a17-8b36-1d5a2d4f9c10'],
-        ['a UUID with an out-of-range variant nibble', '9b2fbd4c-7c21-4a17-1b36-1d5a2d4f9c10'],
-        ['a truncated UUID', '9b2fbd4c-7c21-4a17-8b36'],
-        ['an absent parameter', undefined],
+        ['an absent value', undefined],
         ['null', null],
         ['a number', 7],
         ['an array of ids', [MEAL_ID]],
         ['an object', { mealId: MEAL_ID }],
-    ])('refuses %s with invalid_id on mealId', (_case, mealId) => {
+        ['a boolean', true],
+    ])('refuses %s, which is not a string at all', (_case, value) => {
+        expect(isDatabaseParsableUuid(value)).toBe(false);
+    });
+
+    it('is deliberately wider than the v4 rule the new routes apply', () => {
+        // The one boundary worth stating twice: this release's OWN path ids are
+        // held to v4 (§0.5.2 `invalid_id`), and `catalogFoodId` on this very
+        // endpoint still is. Only the two legacy diary path ids use the wider
+        // grammar, because only they had a 404 to preserve.
+        const v1 = '9b2fbd4c-7c21-1a17-8b36-1d5a2d4f9c10';
+
+        expect(isDatabaseParsableUuid(v1)).toBe(true);
+        expect(fieldCodes(parseLogEntryBody({ catalogFoodId: v1, servings: 1 }))).toStrictEqual([
+            'catalogFoodId:invalid_id',
+        ]);
+    });
+});
+
+describe('parseMealEntryPath', () => {
+    it.each(PARSABLE_ID_FORMS)('accepts %s and hands back the id the writers address the meal by', (_case, mealId) => {
+        // Handed back verbatim, not normalized: the value the caller sent is the
+        // value the writer's predicate must use, and the parser's job is to
+        // decide whether the query may run, not to rewrite the request.
+        expect(parseMealEntryPath({ mealId })).toStrictEqual({ kind: 'ok', mealId });
+    });
+
+    it.each(UNPARSABLE_ID_FORMS)('refuses %s with invalid_id on mealId', (_case, mealId) => {
         // The whole point of the verdict: every one of these would otherwise
         // reach `meals.id`, a @db.Uuid column, and come back as a 500 for a
         // request the caller could have fixed.
@@ -1194,7 +1317,19 @@ describe('parseMealEntryPath', () => {
 
         expect(asPathError(verdict).code).toBe('invalid_request');
         expect(asPathError(verdict).details).toStrictEqual([{ field: 'mealId', code: 'invalid_id' }]);
-        expect(asPathError(verdict).message).toBe('mealId must be a v4 UUID');
+        expect(asPathError(verdict).message).toBe('mealId must be a UUID');
+    });
+
+    it.each([
+        ['an absent parameter', undefined],
+        ['null', null],
+        ['a number', 7],
+        ['an array of ids', [MEAL_ID]],
+        ['an object', { mealId: MEAL_ID }],
+    ])('refuses %s with invalid_id on mealId', (_case, mealId) => {
+        expect(asPathError(parseMealEntryPath({ mealId })).details).toStrictEqual([
+            { field: 'mealId', code: 'invalid_id' },
+        ]);
     });
 
     it('leaves a well-formed id that names nothing to the 404', () => {
@@ -1206,13 +1341,20 @@ describe('parseMealEntryPath', () => {
 });
 
 describe('parseEntryPath', () => {
-    it('accepts a v4 UUID and hands back the entry id', () => {
-        expect(parseEntryPath({ id: ENTRY_ID })).toStrictEqual({ kind: 'ok', entryId: ENTRY_ID });
+    it.each(PARSABLE_ID_FORMS)('accepts %s and hands back the entry id', (_case, id) => {
+        expect(parseEntryPath({ id })).toStrictEqual({ kind: 'ok', entryId: id });
+    });
+
+    it.each(UNPARSABLE_ID_FORMS)('refuses %s with invalid_id on id', (_case, id) => {
+        const verdict = parseEntryPath({ id });
+
+        expect(asPathError(verdict).code).toBe('invalid_request');
+        expect(asPathError(verdict).details).toStrictEqual([{ field: 'id', code: 'invalid_id' }]);
+        expect(asPathError(verdict).message).toBe('id must be a UUID');
     });
 
     it.each([
         ['a string that is not a UUID', 'entry-1'],
-        ['an empty segment', ''],
         ['an absent parameter', undefined],
         ['null', null],
         ['a number', 12],
@@ -1222,6 +1364,17 @@ describe('parseEntryPath', () => {
 
         expect(asPathError(verdict).code).toBe('invalid_request');
         expect(asPathError(verdict).details).toStrictEqual([{ field: 'id', code: 'invalid_id' }]);
+    });
+
+    it('accepts the same four forms the meal path does, so one route cannot drift from the other', () => {
+        // Both routes address a `@db.Uuid` primary key through the same parser,
+        // and a client holding an id in one spelling uses it on all three
+        // routes. A grammar that differed per route would refuse an id the
+        // sibling route accepted.
+        PARSABLE_ID_FORMS.forEach(([, value]) => {
+            expect(parseEntryPath({ id: value }).kind).toBe('ok');
+            expect(parseMealEntryPath({ mealId: value }).kind).toBe('ok');
+        });
     });
 
     it('names the route parameter the caller sees rather than an internal name', () => {

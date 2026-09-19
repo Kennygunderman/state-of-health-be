@@ -1,8 +1,20 @@
 import type { NextFunction, Request, Response } from 'express';
 
-import { assertSchemaFreshnessOnce, assertTestDatabase } from './testDb';
+import { assertSchemaFreshnessOnce, assertTestDatabase, pinConnectionLimit } from './testDb';
 
 assertTestDatabase();
+
+// After the guard, never before it, and it decides nothing the guard is owed:
+// WHICH database the suite runs against still arrives from outside and is
+// approved above, and this only appends `connection_limit` to the URL that was
+// approved. It is the one place that bounds EVERY Prisma client in this
+// process — the `prisma/client.ts` singleton and the extra clients a few
+// suites build with `new PrismaClient()` and no options all read this single
+// variable. See `pinConnectionLimit` for the size and why it is that size.
+const boundedDatabaseUrl = pinConnectionLimit(process.env.DATABASE_URL);
+if (boundedDatabaseUrl !== undefined) {
+    process.env.DATABASE_URL = boundedDatabaseUrl;
+}
 
 // Deleted rather than blanked: `usda.service.ts` and `openrouter.service.ts`
 // read their key once behind an accessor that throws a typed "not configured"

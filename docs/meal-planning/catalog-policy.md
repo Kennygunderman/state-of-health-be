@@ -764,6 +764,25 @@ value presented with the same confidence as a sourced one. The manifest states
 the same rule from the import side — a portion selector that resolves to nothing
 is quarantined rather than published, for the same reason.
 
+**Which writer can produce such a row is worth stating plainly, because neither
+build stage can.** `catalog:import` reads USDA's per-100 g `foodNutrients` array
+and `catalog:generate` asks the model for per-100 g values, so both write
+`per_100g` into `nutrition_basis` and nothing else; the excluded basis reaches
+the catalog only through `catalog:load`, which takes each row's basis from the
+release JSONL as the release recorded it, or through a row inserted into the
+table by hand. The check therefore guards **what a release load brings in and
+what `catalog:validate` re-judges afterwards**, not importer or generator output
+whose basis is fixed at the source. Validation is what makes that guard bite: it
+reads every `candidate` and `published` row (and `quarantined` rows as well
+under `--revalidate-quarantined`, or when the run already owes them a review),
+so a loaded row whose serving carries no gram weight is judged on the next pass
+and taken back out of the published set even though the release line asserted
+`published` — `catalog:load` restores each line's stored status rather than
+re-deciding it, and this stage decides it afterwards. None of that relaxes the
+rule: `validateCatalogCandidate` applies the same judgement to every row it
+reads, whatever wrote it, and a release produced by an older or a foreign
+pipeline is the realistic way this tier fires in practice.
+
 This is also why the report lists **quarantined counts per category** beside the
 published counts: a category can miss its target because the records were not
 found or because they were found and quarantined, and those call for different

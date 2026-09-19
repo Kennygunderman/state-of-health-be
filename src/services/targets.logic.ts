@@ -313,27 +313,39 @@ export interface TargetsUserRow {
 }
 
 /**
- * The `meal_plan_preferences` columns that describe the targets record.
+ * The `meal_plan_preferences` columns that describe the targets record, TOGETHER
+ * WITH the answers the estimate is computed from.
  *
  * `confirmed_targets` is `unknown` because the column is `Json?`: it is data
  * this module must inspect defensively, never a shape it may assume.
+ *
+ * WHY THE ESTIMATE INPUTS ARE PART OF THIS SHAPE. Staleness is a claim about a
+ * confirmed ESTIMATE — "recalculating would give you a different figure" — and
+ * that question cannot be answered from the two revisions alone, because the
+ * revisions say only THAT something was saved, never WHAT. Answering it means
+ * recomputing the equation from the answers currently on file and comparing,
+ * which needs the seven measurements and the route: hence the extension of
+ * {@link EstimateAvailabilityRow} rather than a second parameter. The read that
+ * builds this row projects those columns in the same statement as the rest
+ * (`targets.service.ts::readStoredTargets`), so the recomputation is judged
+ * against one consistent snapshot of the row.
  *
  * TWO REVISIONS ARE HERE AND THEY ARE NOT INTERCHANGEABLE. `targets_revision`
  * is the optimistic-concurrency token for the targets RECORD — what a client
  * pins on `PUT /meal-planning/targets` and what `TargetsResponse.revision`
  * reports. `revision` is the PREFERENCES counter, which advances on every
- * preference save, and it is the one staleness is judged against: AAP §0.5.2
- * defines `stale` as `targets_input_revision ≠ preferences.revision`, and
- * §0.5.1 defines `targets_input_revision` as "the `revision` whose
- * goal/body/activity/pace produced the confirmed estimate". So the pair is a
- * single ancestry check — the preferences revision the confirmed figure was
- * computed at, against the preferences revision the row is at now — and both
- * halves must read the same counter or a confirmed estimate can claim an
- * ancestry it does not have. `estimateRevision` on the save envelope pins the
- * same `revision`, which is why the number recorded here and the number the
- * wire check compares are one and the same.
+ * preference save; §0.5.1 defines `targets_input_revision` as "the `revision`
+ * whose goal/body/activity/pace produced the confirmed estimate", so the pair
+ * is the ANCESTRY check AAP §0.5.2 states — the preferences revision the
+ * confirmed figure was computed at, against the revision the row is at now —
+ * and both halves must read the same counter or a confirmed estimate can claim
+ * an ancestry it does not have. `estimateRevision` on the save envelope pins
+ * the same `revision`, which is why the number recorded here and the number the
+ * wire check compares are one and the same. That ancestry is NECESSARY for
+ * staleness and not sufficient: what makes it sufficient is the recomputation
+ * above (see {@link deriveTargetsResponse}).
  */
-export interface TargetsPreferencesRow {
+export interface TargetsPreferencesRow extends EstimateAvailabilityRow {
     target_source: string | null;
     targets_revision: number;
     confirmed_targets: unknown;
@@ -1255,6 +1267,56 @@ const confirmedSnapshotMatches = (confirmedTargets: unknown, values: NutritionTa
 };
 
 /**
+ * Whether recalculating from the answers currently on file would reproduce the
+ * confirmed figure — i.e. whether the recalculation the review screen offers
+ * would be a no-op.
+ *
+ * WHY THIS RECOMPUTES RATHER THAN DIFFING THE INPUT COLUMNS. The user-facing
+ * question is "are my targets out of date?", and the only faithful answer is the
+ * one the equation gives, because the equation is not injective: the bounds in
+ * `applyTargetBounds` collapse a whole range of adjusted figures onto the same
+ * number. A row losing 1 lb a week and the same row losing 1.5 lb a week can
+ * both land on the BMR bound and present the IDENTICAL target, and a column
+ * diff would then report a change the user could never see. Recomputing answers
+ * the question that is actually asked, and it costs one pure arithmetic pass
+ * over seven numbers.
+ *
+ * NOT `ready` IS ANSWERED `false`, deliberately. Inputs that are absent,
+ * outside the supported envelope, `prefer_not_to_say` or on a persisted
+ * `manual` route yield no estimate at all (see {@link resolveEstimateInputs}),
+ * so nothing can be SHOWN to still match and the honest answer to "does this
+ * still describe your details?" stays "ask again". The caller therefore reports
+ * such a row as stale, which is also what it reported before this conjunct
+ * existed.
+ *
+ * `estimateRevision` moves no term of the equation — it is echoed on the
+ * estimate DTO for the save envelope to pin — so the row's own `revision` is
+ * passed rather than inventing a number, and only the four figures are compared.
+ * All four are compared, not the calories alone: the macros are derived from the
+ * calories at fixed ratios, so a change can move one gram figure while leaving
+ * the kcal untouched, and a partial comparison would miss it.
+ */
+const confirmedEstimateStillCurrent = (
+    row: TargetsPreferencesRow,
+    values: NutritionTargetValues,
+): boolean => {
+    const resolved = resolveEstimateInputs(row);
+
+    if (resolved.kind !== 'ready') {
+        return false;
+    }
+
+    const fresh = computeTargetEstimate(resolved.inputs, row.revision);
+
+    return (
+        fresh.calories === values.calories &&
+        fresh.protein === values.protein &&
+        fresh.carbs === values.carbs &&
+        fresh.fat === values.fat
+    );
+};
+
+/**
  * Which route the stored targets can be attributed to.
  *
  * Anything that cannot be attributed is `legacy`: no preferences row, a route
@@ -1304,21 +1366,49 @@ const resolveTargetSource = (
  *    says nothing about them — and `legacy` needs no staleness because those
  *    surfaces already treat it as "review your targets".
  *
- *    THE COMPARISON IS AN ANCESTRY CHECK ON THE PREFERENCES REVISION, exactly
- *    as AAP §0.5.2 defines it: `targets_input_revision ≠ preferences.revision`.
+ *    TWO CONDITIONS, AND BOTH ARE REQUIRED. The first is the ancestry check
+ *    AAP §0.5.2 states: `targets_input_revision ≠ preferences.revision`.
  *    `targets_input_revision` is the preferences `revision` the confirmed
  *    figure was computed at (§0.5.1), and `revision` is where the row stands
- *    now, so the flag answers "was this figure derived from the answers this
- *    user currently has on file?" — one counter, recorded by the canonical
- *    writer and advanced by every preference save. It is deliberately the SAME
- *    number `estimateRevision` pins on the save envelope, so the revision a
- *    client confirmed against is the revision stored as the ancestry.
+ *    now — one counter, recorded by the canonical writer and advanced by every
+ *    preference save, and deliberately the SAME number `estimateRevision` pins
+ *    on the save envelope, so the revision a client confirmed against is the
+ *    revision stored as the ancestry. The second is that RECALCULATING FROM THE
+ *    ANSWERS CURRENTLY ON FILE WOULD PRODUCE A DIFFERENT FIGURE
+ *    ({@link confirmedEstimateStillCurrent}), which is §0.5.2's own
+ *    parenthetical — "goal/body/activity/pace changed since the estimate was
+ *    confirmed" — evaluated against the equation instead of inferred from a
+ *    counter.
  *
- *    A narrower counter that moved only when a term of the equation changed
- *    would answer a different and more flattering question, and it is not the
- *    contract: two surfaces read this flag as "review your targets", and the
- *    §0.5.2 rule is what they were specified against. Nothing recalculates
- *    either way — `stale` offers a recalculation, it never performs one.
+ *    THE ANCESTRY ALONE OVER-TRIGGERS, which is why the second condition is
+ *    here. `revision` is the all-purpose preferences counter: a diet, dislikes,
+ *    schedule, budget or unit-preference save advances it, and so does the
+ *    `review {startDate}` save the generate sequence itself performs
+ *    immediately after confirming the targets (§0.7.4). Keyed on the counter
+ *    alone, essentially every user who generates a plan would be told on the
+ *    very next screen that their targets are out of date, and offered a
+ *    "recalculation" that returns the number they are already looking at. So a
+ *    save that moved nothing the equation reads leaves a confirmed estimate
+ *    FRESH.
+ *
+ *    THE ANCESTRY IS STILL KEPT AS THE NECESSARY HALF, which makes this a
+ *    strict narrowing of the §0.5.2 formula rather than a replacement of it: a
+ *    confirmation clears the flag by construction (it records the current
+ *    revision), a row whose two revisions agree can never read stale whatever
+ *    the equation says, and a later change to product policy — new activity
+ *    factors, a different bound — cannot mass-flip every confirmed user to
+ *    stale, because a figure nobody has saved against since remains its own
+ *    ancestor. The recomputation is the SUFFICIENT half: "would recalculating
+ *    actually change the figure?".
+ *
+ *    The comparison uses `values` rather than the snapshot because at this
+ *    point `source === 'estimated'` already implies `confirmedSnapshotMatches`
+ *    returned true, so all four are finite numbers equal to
+ *    `confirmed_targets` — the two comparisons are the same comparison, and
+ *    `values` is the one already in hand.
+ *
+ *    Nothing recalculates either way — `stale` offers a recalculation, it never
+ *    performs one.
  *  - `revision` is the targets counter, and 0 when there is no preferences row.
  */
 export const deriveTargetsResponse = (
@@ -1347,14 +1437,17 @@ export const deriveTargetsResponse = (
     // either named route requires one; the explicit check is what lets the
     // compiler see it.
     //
-    // A null `targets_input_revision` is stale by this comparison, and rightly
-    // so: an estimate confirmed without recording the inputs it came from
-    // cannot be shown to still match them, and the honest answer to "does this
-    // still describe your details?" is then "ask again".
+    // A null `targets_input_revision` satisfies the ancestry half — an estimate
+    // confirmed without recording the inputs it came from has no ancestry to
+    // claim — and the recomputation then decides, exactly as it does for a row
+    // whose two counters merely differ. Such a row is reported stale unless its
+    // answers still produce the confirmed figure, in which case there is again
+    // nothing for a recalculation to change.
     const stale =
         source === 'estimated' &&
         preferencesRow !== null &&
-        preferencesRow.targets_input_revision !== preferencesRow.revision;
+        preferencesRow.targets_input_revision !== preferencesRow.revision &&
+        !confirmedEstimateStillCurrent(preferencesRow, values);
 
     return {
         targets: values,

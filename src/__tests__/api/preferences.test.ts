@@ -1548,6 +1548,421 @@ describe('PUT /api/meal-planning/preferences', () => {
         });
     });
 
+    describe('the review step\u2019s start-date window', () => {
+        /* -------------------------------------------------------------------
+         * The window is `[today, max(today + 30, latest active plan's end + 1)]`
+         * and `today` is the day key in the user's STORED zone (§0.5.2). Three
+         * separate pieces of wiring produce that, and NO test at any level
+         * exercised them together: `startDateWindow` is unit-tested in
+         * `mealPlan.logic.test.ts`, but through the GENERATE path, which refuses
+         * `out_of_range` — this step refuses `below_minimum` / `above_maximum`,
+         * so those unit tests cannot detect a regression here. What was
+         * unprotected was the wiring: which zone `today` is read in, whether the
+         * plan-extended upper bound is consulted at all, and which codes come
+         * back.
+         *
+         * Asserted at both edges, in both directions, so neither an off-by-one
+         * nor a silently widened bound survives.
+         * ----------------------------------------------------------------- */
+
+        /** The window's width below the upper bound, per §0.5.2. */
+        const MAX_START_OFFSET_DAYS = 30;
+
+        const saveReview = async (startDate: string, expectedRevision = 1) =>
+            saveStep('review', withZone({ startDate, expectedRevision }));
+
+        const preparedRow = () =>
+            makePreferences(USER_ID, {
+                time_zone: TIME_ZONE,
+                revision: 1,
+                setup_status: 'ready_for_review',
+                setup_step: 'review',
+            });
+
+        it('accepts today itself, the lower bound', async () => {
+            await preparedRow();
+
+            const response = await saveReview(utcTodayDayKey());
+
+            expect(response.status).toBe(200);
+            expect((await storedRowOrThrow()).review_start_date).not.toBeNull();
+        });
+
+        it('refuses yesterday with below_minimum, storing nothing', async () => {
+            // A plan may not start in the past: the day is already partly spent,
+            // and the diary for it may already hold entries.
+            await preparedRow();
+
+            const response = await saveReview(addDaysToDayKey(utcTodayDayKey(), -1));
+
+            expect(response.status).toBe(400);
+            expect(detailsOf(response)).toEqual([
+                { field: 'startDate', code: PREFERENCE_FIELD_CODES.BELOW_MINIMUM },
+            ]);
+
+            const row = await storedRowOrThrow();
+            expect(row.review_start_date).toBeNull();
+            expect(row.revision).toBe(1);
+        });
+
+        it('accepts the 30th day ahead, the upper bound with no plan', async () => {
+            await preparedRow();
+
+            const response = await saveReview(
+                addDaysToDayKey(utcTodayDayKey(), MAX_START_OFFSET_DAYS),
+            );
+
+            expect(response.status).toBe(200);
+        });
+
+        it('refuses the 31st day ahead with above_maximum, storing nothing', async () => {
+            await preparedRow();
+
+            const response = await saveReview(
+                addDaysToDayKey(utcTodayDayKey(), MAX_START_OFFSET_DAYS + 1),
+            );
+
+            expect(response.status).toBe(400);
+            expect(detailsOf(response)).toEqual([
+                { field: 'startDate', code: PREFERENCE_FIELD_CODES.ABOVE_MAXIMUM },
+            ]);
+
+            const row = await storedRowOrThrow();
+            expect(row.review_start_date).toBeNull();
+            expect(row.revision).toBe(1);
+        });
+
+        it('refuses a non-calendar day before it ever reaches the window', async () => {
+            await preparedRow();
+
+            expect(detailsOf(await saveReview('2026-02-30'))).toEqual([
+                { field: 'startDate', code: PREFERENCE_FIELD_CODES.INVALID_DATE },
+            ]);
+        });
+
+        describe('when an active plan reaches beyond the 30-day bound', () => {
+            /* ---------------------------------------------------------------
+             * The upper bound must always admit the successor week of the plan
+             * the user holds, or "Plan another week" could offer a start date
+             * the server then refuses (§0.5.2). A plan ending 40 days out makes
+             * `end + 1` the binding bound rather than `today + 30`.
+             * ------------------------------------------------------------- */
+            const PLAN_ENDS_DAYS_AHEAD = 40;
+
+            /** A plan whose seven days end well past `today + 30`. */
+            const farFuturePlan = async () => {
+                // Seven days ending exactly PLAN_ENDS_DAYS_AHEAD from today, so
+                // the bound this asserts is the plan's own end and not a week
+                // boundary that happens to fall nearby.
+                await makePlan(USER_ID, {
+                    startDate: addDaysToDayKey(utcTodayDayKey(), PLAN_ENDS_DAYS_AHEAD - 6),
+                });
+
+                return addDaysToDayKey(utcTodayDayKey(), PLAN_ENDS_DAYS_AHEAD);
+            };
+
+            it('extends the bound to the day after the plan ends', async () => {
+                await preparedRow();
+                const endDate = await farFuturePlan();
+
+                // Beyond today + 30, and accepted BECAUSE the plan reaches there.
+                const response = await saveReview(addDaysToDayKey(endDate, 1));
+
+                expect(response.status).toBe(200);
+            });
+
+            it('refuses the day after that, so the extension is exact', async () => {
+                await preparedRow();
+                const endDate = await farFuturePlan();
+
+                const response = await saveReview(addDaysToDayKey(endDate, 2));
+
+                expect(response.status).toBe(400);
+                expect(detailsOf(response)).toEqual([
+                    { field: 'startDate', code: PREFERENCE_FIELD_CODES.ABOVE_MAXIMUM },
+                ]);
+            });
+        });
+
+        describe('the zone today is read in', () => {
+            /* ---------------------------------------------------------------
+             * `today` is the day key in the user's STORED zone, never the
+             * server's. A bare date plus a Firebase identity cannot otherwise
+             * establish the user's calendar day (§0.5.2), and reading UTC
+             * instead would refuse a user in Auckland the whole of their own
+             * current day for the ~12 hours the two zones disagree.
+             *
+             * DRIVEN THROUGH THE SERVICE with a pinned `now` rather than the
+             * wall clock: `saveSetupStep`'s fourth parameter exists for exactly
+             * this, and the instant below is chosen so the two zones REALLY
+             * differ. A wall-clock test would pass for reasons unrelated to the
+             * zone whenever the two happen to agree — which they do for most of
+             * the day, so such a test would be no protection at all.
+             * ------------------------------------------------------------- */
+
+            /** 20:00 UTC: already the 20th in Auckland, still the 19th in UTC. */
+            const PINNED_NOW = new Date('2026-09-19T20:00:00.000Z');
+            const AHEAD_ZONE = 'Pacific/Auckland';
+            const AHEAD_ZONE_TODAY = '2026-09-20';
+            const UTC_TODAY = '2026-09-19';
+
+            const readyInZone = (timeZone: string) =>
+                makePreferences(USER_ID, {
+                    time_zone: timeZone,
+                    revision: 1,
+                    setup_status: 'ready_for_review',
+                    setup_step: 'review',
+                });
+
+            it('accepts the stored zone\u2019s own today, which UTC has not reached', async () => {
+                await readyInZone(AHEAD_ZONE);
+
+                const result = await saveSetupStep(
+                    USER_ID,
+                    'review',
+                    { startDate: AHEAD_ZONE_TODAY, timeZone: AHEAD_ZONE, expectedRevision: 1 },
+                    PINNED_NOW,
+                );
+
+                expect(result.kind).toBe('ok');
+                expect((await storedRowOrThrow()).review_start_date).toEqual(
+                    new Date(`${AHEAD_ZONE_TODAY}T00:00:00.000Z`),
+                );
+            });
+
+            it('refuses the UTC day, which is already yesterday in the stored zone', async () => {
+                // The assertion that fails if `today` is ever read in server
+                // time: under UTC this date IS today and would be accepted.
+                await readyInZone(AHEAD_ZONE);
+
+                const result = await saveSetupStep(
+                    USER_ID,
+                    'review',
+                    { startDate: UTC_TODAY, timeZone: AHEAD_ZONE, expectedRevision: 1 },
+                    PINNED_NOW,
+                );
+
+                expect(result).toMatchObject({
+                    kind: 'error',
+                    details: [
+                        { field: 'startDate', code: PREFERENCE_FIELD_CODES.BELOW_MINIMUM },
+                    ],
+                });
+                expect((await storedRowOrThrow()).review_start_date).toBeNull();
+            });
+
+            it('accepts that same UTC day for a user whose stored zone is UTC', async () => {
+                // The control: one instant, one date, two stored zones, two
+                // verdicts — so the refusal above is the ZONE's doing and not
+                // the date's.
+                await readyInZone('UTC');
+
+                const result = await saveSetupStep(
+                    USER_ID,
+                    'review',
+                    { startDate: UTC_TODAY, timeZone: 'UTC', expectedRevision: 1 },
+                    PINNED_NOW,
+                );
+
+                expect(result.kind).toBe('ok');
+            });
+        });
+    });
+
+    describe('the food-group half of a dislike, which must name a real group', () => {
+        /* -------------------------------------------------------------------
+         * `dislikedFoodGroups` used to accept and STORE any string: no check
+         * that the value is a term of the controlled taxonomy, and no bound on
+         * how long one entry may be. Both halves matter, and differently.
+         *
+         * A value outside the taxonomy is an exclusion that excludes NOTHING —
+         * no catalog food carries it, so the user declines a kind of food and
+         * keeps being served it, which is the same harm the ids half already
+         * refuses `unknown_value` for. An unbounded value is a storage and work
+         * amplifier: the global 100 KB body limit is the only thing that capped
+         * it, so one row could hold ~100 KB of text across the hundred entries
+         * the count bound permits, every character of it normalised by the
+         * spelling rule before it could be judged.
+         *
+         * ASSERTED IN BOTH DIRECTIONS, and the refusals are asserted to persist
+         * NOTHING: the row and its revision must be byte-identical afterwards,
+         * because a refusal that still bumped the revision would invalidate the
+         * client's pinned revision and make the next legitimate save fail.
+         * ----------------------------------------------------------------- */
+
+        /** A term the shipped coverage plan really declares. */
+        const REAL_GROUP = 'olive';
+        /** Shaped like a term, declared by nothing. */
+        const UNREAL_GROUP = 'bogus_group_not_in_taxonomy';
+
+        const groupsPayload = (
+            dislikedFoodGroups: unknown,
+            expectedRevision = 1,
+        ): Record<string, unknown> => withZone({ dislikedFoodGroups, expectedRevision });
+
+        it('accepts a term the coverage plan declares', async () => {
+            await makePreferences(USER_ID, { time_zone: TIME_ZONE, revision: 1 });
+
+            const saved = await saveAllOk(groupsPayload([REAL_GROUP]));
+
+            expect(saved.preferences.dislikedFoodGroups).toEqual([REAL_GROUP]);
+            expect((await storedRowOrThrow()).disliked_food_groups).toEqual([REAL_GROUP]);
+        });
+
+        it('reads a display label as its catalog term, so the chip the user sees round-trips', async () => {
+            await makePreferences(USER_ID, { time_zone: TIME_ZONE, revision: 1 });
+
+            const saved = await saveAllOk(groupsPayload(['Blue cheese']));
+
+            // Stored in the spelling it arrived in — the eligibility rule folds
+            // both sides before comparing, so the exclusion works either way —
+            // and accepted, which is the part that used to be impossible to
+            // distinguish from accepting junk.
+            expect(saved.preferences.dislikedFoodGroups).toEqual(['Blue cheese']);
+        });
+
+        it.each([
+            ['a value outside the taxonomy', UNREAL_GROUP],
+            ['a markup payload', '<script>alert(1)</script>'],
+            ['a SQL payload', "' OR 1=1 --"],
+            ['a near-miss of a real term', 'olives'],
+        ])('refuses %s with unknown_value and stores nothing', async (_label, group) => {
+            await makePreferences(USER_ID, { time_zone: TIME_ZONE, revision: 1 });
+
+            const response = await saveAll(groupsPayload([group]));
+
+            expect(response.status).toBe(400);
+            expect(detailsOf(response)).toEqual([
+                { field: 'dislikedFoodGroups[0]', code: PREFERENCE_FIELD_CODES.UNKNOWN_VALUE },
+            ]);
+
+            const row = await storedRowOrThrow();
+            expect(row.disliked_food_groups).toEqual([]);
+            expect(row.revision).toBe(1);
+        });
+
+        it('refuses the 90,000-character entry with above_maximum and stores nothing', async () => {
+            // The audit's own reproduction. It reached the column intact before,
+            // which is how one row came to hold ~90 KB of text.
+            await makePreferences(USER_ID, { time_zone: TIME_ZONE, revision: 1 });
+
+            const response = await saveAll(groupsPayload(['x'.repeat(90_000)]));
+
+            expect(response.status).toBe(400);
+            expect(detailsOf(response)).toEqual([
+                { field: 'dislikedFoodGroups[0]', code: PREFERENCE_FIELD_CODES.ABOVE_MAXIMUM },
+            ]);
+
+            const row = await storedRowOrThrow();
+            expect(row.disliked_food_groups).toEqual([]);
+            expect(row.revision).toBe(1);
+        });
+
+        it('names the offending entry by ITS index, not the first', async () => {
+            // The index is the client's own array position, which is what lets a
+            // client highlight the chip the user must fix.
+            await makePreferences(USER_ID, { time_zone: TIME_ZONE, revision: 1 });
+
+            const response = await saveAll(groupsPayload([REAL_GROUP, 'mushroom', UNREAL_GROUP]));
+
+            expect(response.status).toBe(400);
+            expect(detailsOf(response)).toEqual([
+                { field: 'dislikedFoodGroups[2]', code: PREFERENCE_FIELD_CODES.UNKNOWN_VALUE },
+            ]);
+        });
+
+        it('sorts what it stores however the client ordered it', async () => {
+            await makePreferences(USER_ID, { time_zone: TIME_ZONE, revision: 1 });
+
+            const saved = await saveAllOk(groupsPayload([REAL_GROUP, 'avocado', 'cheese']));
+
+            expect(saved.preferences.dislikedFoodGroups).toEqual(['avocado', 'cheese', REAL_GROUP]);
+        });
+
+        it('accepts a stored group the taxonomy no longer declares, so drift cannot brick the screen', async () => {
+            // The same asymmetry the ids half documents, and it is not
+            // hypothetical: a group enters storage by DERIVATION from a catalog
+            // row, so a plan that renames a group leaves users holding the old
+            // term. The read hands it back, the client re-sends it with every
+            // save of the step, and judging it as a new selection would leave
+            // removing that chip as the only accepted edit on the whole screen.
+            await makePreferences(USER_ID, {
+                time_zone: TIME_ZONE,
+                revision: 1,
+                disliked_food_groups: ['legacy_retired_group', REAL_GROUP],
+            });
+
+            const read = await readPreferencesOk();
+            expect(read.dislikedFoodGroups).toEqual(['legacy_retired_group', REAL_GROUP]);
+
+            const saved = await saveAllOk(groupsPayload(read.dislikedFoodGroups));
+
+            expect(saved.preferences.dislikedFoodGroups).toEqual([
+                'legacy_retired_group',
+                REAL_GROUP,
+            ]);
+        });
+
+        it('lets an unrelated answer be edited while a drifted group is re-sent', async () => {
+            await makePreferences(USER_ID, {
+                time_zone: TIME_ZONE,
+                revision: 1,
+                disliked_food_groups: ['legacy_retired_group'],
+            });
+
+            const saved = await saveAllOk(
+                withZone({
+                    dislikedFoodGroups: ['legacy_retired_group'],
+                    cookingTimeLimitMin: 45,
+                    expectedRevision: 1,
+                }),
+            );
+
+            expect(saved.preferences.cookingTimeLimitMin).toBe(45);
+            expect(saved.preferences.dislikedFoodGroups).toEqual(['legacy_retired_group']);
+        });
+
+        it('still refuses a NEW unreal group sent alongside a stored drifted one', async () => {
+            // The escape is for the list the user already has, never a licence
+            // to add more: otherwise one drifted group would reopen the field.
+            await makePreferences(USER_ID, {
+                time_zone: TIME_ZONE,
+                revision: 1,
+                disliked_food_groups: ['legacy_retired_group'],
+            });
+
+            const response = await saveAll(
+                groupsPayload(['legacy_retired_group', UNREAL_GROUP]),
+            );
+
+            expect(response.status).toBe(400);
+            expect(detailsOf(response)).toEqual([
+                { field: 'dislikedFoodGroups[1]', code: PREFERENCE_FIELD_CODES.UNKNOWN_VALUE },
+            ]);
+            expect((await storedRowOrThrow()).disliked_food_groups).toEqual([
+                'legacy_retired_group',
+            ]);
+        });
+
+        it('keeps deriving a group from a catalog row the plan never declared', async () => {
+            // Derivation is NOT judged against the vocabulary: the catalog is
+            // the authority on what a food's group is, and refusing the save
+            // would under-exclude the dislike the user actually asked for.
+            const drifted = await makeCatalogFood({
+                display_name: 'Kombu',
+                food_group: 'sea_vegetable',
+            });
+
+            await makePreferences(USER_ID, { time_zone: TIME_ZONE, revision: 1 });
+
+            const saved = await saveAllOk(
+                withZone({ dislikedFoodIds: [drifted.id], expectedRevision: 1 }),
+            );
+
+            expect(saved.preferences.dislikedFoodGroups).toEqual(['sea_vegetable']);
+        });
+    });
+
     describe('the zone-only save that reconciles a moved device', () => {
         /* -------------------------------------------------------------------
          * `timeZone` is an ENVELOPE key and also a stored column, and this is

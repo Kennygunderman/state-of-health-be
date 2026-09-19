@@ -216,6 +216,59 @@ const toPlanDayKey = (date: Date, column: string, planId: string): string => {
  * ------------------------------------------------------------------------- */
 
 /**
+ * How many `catalog_foods` ids one hydration statement may carry.
+ *
+ * A CONSTANT AT MODULE SCOPE (Rule backend-architecture §5) because it is
+ * configuration of the read rather than a rule about groceries: it decides how
+ * an id list is cut into statements and nothing about what a shopping line
+ * says, which is why it is not in `grocery.logic.ts` and why §7.1's
+ * anti-ceremony clause keeps the chunking itself in this service.
+ *
+ * WHY 300, FROM `EXPLAIN (ANALYZE, BUFFERS)` ON THIS EXACT PROJECTION against
+ * the loaded v1 release (`catalog_foods`: 10,928 rows, relpages 1,206; primary
+ * key 61 pages), random ids, after `ANALYZE`:
+ *
+ *   | ids | plan node              | execution   |
+ *   |-----|------------------------|-------------|
+ *   | 40  | Bitmap Heap Scan (pk)  | 0.50-0.56ms |
+ *   | 200 | Bitmap Heap Scan (pk)  | 1.25-1.35ms |
+ *   | 300 | Bitmap Heap Scan (pk)  | 1.67-1.75ms |
+ *   | 500 | Bitmap Heap Scan (pk)  | 2.27-2.37ms |  last good
+ *   | 600 | Seq Scan               | 5.02-5.41ms |  flip
+ *   | 800 | Seq Scan               | 3.86-4.32ms |
+ *
+ * The flip sits between 4.58 % and 5.49 % selectivity — the planner's ~5 %
+ * threshold — and past it the statement reports `Buffers: shared hit=1206`,
+ * the table's ENTIRE relpages, no matter how few ids were asked for. So the
+ * unbounded list did not merely get slower: it stopped being proportional to
+ * the plan and became a whole-table read.
+ *
+ * 300 is 2.7 % of the current catalog: a 1.67× margin below the measured
+ * last-good 500 and 2× below the first-bad 600. THE MARGIN IMPROVES AS THE
+ * CATALOG GROWS, because 5 % of a larger table is more ids — the fixed cut is
+ * therefore safe in the direction the AAP says the catalog moves (versioned
+ * releases intended to grow). A much SMALLER catalog would seq-scan at this
+ * size, and that is fine: a seq scan of a small table is about one page, which
+ * is cheaper than the index it would otherwise descend.
+ *
+ * THE COMMON PATH KEEPS ITS STATEMENT COUNT. A realistic seven-day plan needs
+ * 37-42 distinct foods (§0.5.1's three-meals-a-day week, measured), so every
+ * ordinary hydration is ONE statement exactly as before; the 800-id stress
+ * shape costs three. Extra statements are close to free here, and the same
+ * measurement says why: in one WARM session (what the Prisma pool gives), the
+ * same 800 ids cost 4.40-6.65 ms execution with 2.05-2.91 ms of PLANNING
+ * unbounded, against 1.46-1.66 ms execution with 0.35-0.42 ms of planning at
+ * this chunk size. An oversized `IN` list is expensive to PLAN as well as to
+ * execute, so cutting it wins on both axes.
+ *
+ * The child relation statement rides along: at a 300-id chunk
+ * `catalog_food_portions` (31,537 rows / 469 pages) answers through
+ * `unique_default_catalog_food_portion`, so bounding the parent list keeps the
+ * portion read on its index too.
+ */
+const CATALOG_FACTS_ID_CHUNK_SIZE = 300;
+
+/**
  * The `catalog_foods` facts every shopping line needs, for the given ids.
  *
  * THE SANCTIONED EXCEPTION TO §5.1, documented the way `catalog.service.ts`
@@ -246,6 +299,31 @@ const toPlanDayKey = (date: Date, column: string, planId: string): string => {
  * so a projection that read "107 g" and "cup" without the "0.5" would state
  * half the real density for every food whose portion is not one of its unit,
  * and the catalog ships thousands that are not.
+ *
+ * THE ID LIST IS CUT INTO STATEMENTS OF AT MOST
+ * {@link CATALOG_FACTS_ID_CHUNK_SIZE}, and that bound is the point rather than
+ * a tidiness preference. One `IN` list holding more ids than roughly 5 % of the
+ * table's rows costs the planner more than the whole table, so it abandons the
+ * primary key and reads every page — a per-plan hydration silently becoming a
+ * whole-table read, at a cost that no longer falls when the plan is small (the
+ * constant's doc block carries the measurements). Keeping every list short is
+ * what holds the plan node on the primary key, so the cost of this read stays
+ * proportional to the plan's ingredient count.
+ *
+ * The chunks are awaited ONE AT A TIME rather than through `Promise.all`. `db`
+ * is a `Prisma.TransactionClient` on three of the four call sites, where the
+ * statements of one transaction are serialised on its single connection
+ * anyway; issuing them concurrently would only claim several pool connections
+ * for one request and let a grocery read starve the writes it runs beside.
+ * Sequential also keeps every chunk inside the caller's transaction, so the
+ * facts a diff is computed from still come from ONE snapshot.
+ *
+ * The result is one entry per DISTINCT id the catalog knows, exactly as the
+ * single-statement form returned: the ids are deduplicated before they are cut,
+ * so no food can be described twice by two chunks. Array ORDER is not
+ * contractual — every caller keys by id through `conversionFactsByFoodId` — and
+ * an id with no row contributes no entry, which `requireFactsFor` reports where
+ * a row needs it.
  */
 export const loadGroceryFoodFacts = async (
     catalogFoodIds: readonly string[],
@@ -257,29 +335,37 @@ export const loadGroceryFoodFacts = async (
         return [];
     }
 
-    const foods = await db.catalog_foods.findMany({
-        where: { id: { in: ids } },
-        select: {
-            id: true,
-            display_name: true,
-            category: true,
-            food_state: true,
-            density_g_per_ml: true,
-            catalog_food_portions: {
-                where: { is_default: true },
-                select: { description: true, amount: true, unit: true, gram_weight: true },
-            },
-        },
-    });
+    const facts: GroceryFoodFacts[] = [];
 
-    return foods.map((food) => ({
-        catalog_food_id: food.id,
-        food_state: food.food_state,
-        name: food.display_name,
-        category: food.category,
-        density_g_per_ml: food.density_g_per_ml,
-        default_portion: food.catalog_food_portions[0] ?? null,
-    }));
+    for (let offset = 0; offset < ids.length; offset += CATALOG_FACTS_ID_CHUNK_SIZE) {
+        const foods = await db.catalog_foods.findMany({
+            where: { id: { in: ids.slice(offset, offset + CATALOG_FACTS_ID_CHUNK_SIZE) } },
+            select: {
+                id: true,
+                display_name: true,
+                category: true,
+                food_state: true,
+                density_g_per_ml: true,
+                catalog_food_portions: {
+                    where: { is_default: true },
+                    select: { description: true, amount: true, unit: true, gram_weight: true },
+                },
+            },
+        });
+
+        for (const food of foods) {
+            facts.push({
+                catalog_food_id: food.id,
+                food_state: food.food_state,
+                name: food.display_name,
+                category: food.category,
+                density_g_per_ml: food.density_g_per_ml,
+                default_portion: food.catalog_food_portions[0] ?? null,
+            });
+        }
+    }
+
+    return facts;
 };
 
 /**

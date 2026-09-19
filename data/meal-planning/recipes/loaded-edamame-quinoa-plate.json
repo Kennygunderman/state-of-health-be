@@ -1,0 +1,112 @@
+{
+  "slug": "loaded-edamame-quinoa-plate",
+  "name": "Loaded edamame and quinoa plate",
+  "description": "Shelled edamame and cooked quinoa loaded with pan-cooked mushrooms and cauliflower over grated carrot and spinach, brightened with lemon — a large plate that needs no added oil, because the edamame carries the fat as well as the protein.",
+  "iconKey": "fork_knife",
+  "instructions": [
+    "Steam the shelled edamame for 5 minutes, until hot and tender.",
+    "Cook the sliced mushrooms and the small cauliflower florets in a dry non-stick pan over medium-high heat for 5 minutes, covered, so they soften in the liquid the mushrooms release.",
+    "Grate the carrot and toss it with the spinach and the salt in a large shallow bowl.",
+    "Warm the cooked quinoa through, spread it over the carrot and spinach, add the edamame, mushrooms and cauliflower, and squeeze the lemon over."
+  ],
+  "yieldServings": 1,
+  "servingDescription": "1 large plate",
+  "prepMinutes": 6,
+  "cookMinutes": 8,
+  "mealSlots": [
+    "lunch",
+    "dinner"
+  ],
+  "dietTags": [
+    "gluten_free",
+    "pescatarian",
+    "vegan",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "soy"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 2,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "dairy_free",
+    "vegan",
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:169282",
+      "quantity": 1.5,
+      "unit": "cup",
+      "gramWeight": 384,
+      "displayText": "1½ cups, shelled",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168917",
+      "quantity": 0.5,
+      "unit": "cup",
+      "gramWeight": 93,
+      "displayText": "½ cup",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169251",
+      "quantity": 4,
+      "unit": "cup",
+      "gramWeight": 280,
+      "displayText": "4 cups, sliced",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169986",
+      "quantity": 1,
+      "unit": "cup",
+      "gramWeight": 107,
+      "displayText": "1 cup, small florets",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168462",
+      "quantity": 3,
+      "unit": "cup",
+      "gramWeight": 90,
+      "displayText": "3 cups",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170393",
+      "quantity": 1,
+      "unit": "each",
+      "gramWeight": 61,
+      "displayText": "1 medium, grated",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:167746",
+      "quantity": 0.25,
+      "unit": "each",
+      "gramWeight": 21,
+      "displayText": "¼ lemon",
+      "sortOrder": 6,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 3,
+      "displayText": "½ tsp",
+      "sortOrder": 7,
+      "isOptional": false
+    }
+  ]
+}

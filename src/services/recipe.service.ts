@@ -11,6 +11,15 @@
 // place that queried `recipe_versions` would be a second place that could get
 // the visibility rule below wrong.
 //
+// BEING THE SINGLE OWNER IS ALSO WHERE THE READ COST OF THE CORPUS IS PAID.
+// `getRecipeVersionsForPlanning` loads the WHOLE plannable corpus, and both the
+// swap alternatives list and the swap preview need it, so it ran on every one
+// of those requests. It is now served from a process-local cache validated on
+// every call by a content hash of exactly the rows and columns it projects —
+// the one place that can hold such a cache, because it is the one place that
+// issues the read. The decision, and the invalidation designs rejected on the
+// way to it, are recorded with `PLANNING_CORPUS_STAMP_STATEMENT` below.
+//
 // Orchestration only (Rule backend-architecture §5). Every decision belongs to
 // a neighbour and is delegated to it:
 //
@@ -53,6 +62,7 @@ import { Prisma } from '../generated/prisma';
 import { prisma } from '../prisma/client';
 import { NutritionProvenance } from '../types/nutrition';
 import { RecipeVersionResponse } from '../types/recipe';
+import { describeErrorSafely, logSafeEvent } from '../utils/safeLogger';
 import { isCatalogAllergenStatus, isCatalogNutritionProvenance } from './catalog.logic';
 import { PlanRecipeCandidate } from './mealPlan.logic';
 import { RecipeVersionRow, mapRecipeVersion } from './recipe.mapper';
@@ -674,55 +684,240 @@ export const getRecipeVersionRowsByIds = async (
     return new Map(versions.map((version) => [version.id, version]));
 };
 
+/* ---------------------------------------------------------------------------
+ * Keeping the candidate projection off the request path
+ * ------------------------------------------------------------------------- */
+
 /**
- * Every plannable recipe version, as the candidate shape the planner and the
- * swap selector both consume.
+ * The plannable universe, as one statement's worth of predicate.
  *
- * WHAT THE WHERE CLAUSE FILTERS, and why that is not a second eligibility
- * rule. Three predicates define the plannable UNIVERSE, and all three are
- * properties of the recipe alone — no user, no preference, no request: the
- * version is `current`, its rolled-up nutrition is `source_backed`, and its
- * rolled-up allergen review is `known`. A row failing any of them is
- * unplannable for every user who will ever exist, so excluding it here removes
- * rows that could never be chosen rather than deciding anything. It is also
- * the direction a mistake has to fail in: the set handed to the search cannot
- * contain an estimate or an unreviewed dish even if a future caller forgot to
- * ask the rules.
- *
- * WHAT IT DELIBERATELY DOES NOT FILTER is everything that depends on the user
- * — diet, allergens, dislikes, the cooking-time limit and slot membership —
- * plus the per-ingredient half of provenance and review. Those stay with
- * `recipe.logic.ts::evaluatePlanningEligibility`, the SINGLE implementation the
- * generator, the swap selector and flag recomputation all call, because that is
- * the half where two copies would eventually disagree and one of them would
- * start serving an allergen (§5 "no business rules inline"). The rules
- * re-check the three columns above as well, so the query narrows the input and
- * the logic still owns every verdict.
- *
- * THE ORDER IS `slug, version`, AND IT IS LOAD-BEARING. The planner's candidate
- * pre-order is the portable identity `(slug, version, portion_multiplier)`
- * precisely because primary keys are `gen_random_uuid()` and differ between two
- * independently loaded databases; the seeded shuffle then walks that pre-order
- * once. Handing the search a set ordered by anything database-specific would
- * make the same inputs produce different plans on two machines holding the same
- * release — the determinism the second-database acceptance evidence checks. The
- * pair is unique (`recipes.slug` is unique and `(recipe_id, version)` is), so
- * the order is total.
- *
- * NO `userId` PARAMETER, by the §5.1 exception this file's header states:
- * recipes are shared reference data with no owner column, so there is nothing
- * to scope, and a parameter accepted only to be ignored would suggest otherwise.
- * The per-user half of planning is the PREFERENCES the caller passes to the
- * eligibility rules, which is where it belongs.
- *
- * Read whole rather than paged: forty-odd recipes with their ingredients is the
- * entire plannable universe, the in-memory search needs all of it before the
- * transaction opens (AAP §0.5.1), and a paged read would be a second source of
- * candidate ordering.
+ * Extracted as a `Prisma.Sql` fragment rather than written three times inside
+ * {@link PLANNING_CORPUS_STAMP_STATEMENT} so the freshness check and the
+ * projection cannot come to describe different sets: the fragment is bound from
+ * the SAME three typed constants the `findMany` below filters on, so a change
+ * to any of them moves both sides together. `v` is the `recipe_versions` alias
+ * every subquery of the stamp statement uses.
  */
-export const getRecipeVersionsForPlanning = async (
-    db: Prisma.TransactionClient = prisma,
-): Promise<PlanRecipeCandidate[]> => {
+const PLANNABLE_VERSION_PREDICATE = Prisma.sql`
+    v.status = ${CURRENT_VERSION_STATUS}
+    AND v.nutrition_provenance = ${SOURCE_BACKED_PROVENANCE}
+    AND v.allergen_status = ${REVIEWED_ALLERGEN_STATUS}
+`;
+
+/**
+ * What one execution of the freshness statement answers: three content hashes
+ * covering everything the candidate projection reads.
+ *
+ * Three columns rather than one so that a diagnosis can say WHICH part of the
+ * corpus moved — the versions, their ingredients or the live catalog rows
+ * behind those ingredients. They are concatenated into a single stamp by
+ * {@link readPlanningCorpusStamp}, which is the only value the cache compares.
+ */
+interface PlanningCorpusStampRow {
+    /** `recipe_versions` ⋈ `recipes`: identity, publication state and every projected column. */
+    versions_stamp: string;
+    /** `recipe_ingredients` of those versions: identity, snapshots, optionality and order. */
+    ingredients_stamp: string;
+    /** The LIVE `catalog_foods` columns the projection joins, plus `updated_at`. */
+    foods_stamp: string;
+}
+
+/**
+ * THE FRESHNESS CHECK: an ordered content hash of exactly what the candidate
+ * projection reads, in ONE statement.
+ *
+ * WHY A PER-READ CHECK IS THE ONLY CORRECT INVALIDATION HERE. Every writer of
+ * this corpus is a SEPARATE OPERATOR PROCESS — `scripts/recipes-seed.ts`,
+ * `catalog-load.ts`, `catalog-import-usda.ts`, `catalog-generate-ai.ts`,
+ * `catalog-validate.ts`, `catalog-release.ts` and the libraries they share. No
+ * service in `src/` writes `recipe_versions` or `catalog_foods` at all. An
+ * in-process invalidation hook could therefore never observe a publication: the
+ * API process that holds the cache is not the process that changes the data, so
+ * "invalidate on release load / recipe seed" can only be implemented as a check
+ * the reader makes against the database itself.
+ *
+ * AND NOT A TIME-TO-LIVE, for the same reason turned around: a TTL states how
+ * long a stale answer may be served, and the answer here carries an allergen
+ * review. There is no acceptable window for "this recipe was safe a minute ago",
+ * so freshness is asked per read and the cost of asking is what was minimised
+ * instead.
+ *
+ * WHY A HASH AND NOT A CHEAPER KEY. Two cheaper keys were considered and both
+ * admit a stale answer:
+ *
+ *  * The active release id in `catalog_import_runs` is O(1) but insufficient —
+ *    a recipe version can be published with no run row at all (every test
+ *    factory does exactly that), and `catalog-validate.ts` can change a food's
+ *    `allergen_status` without writing one.
+ *  * Row counts plus maximum timestamps are insufficient for the same class of
+ *    reason: `recipe_versions` carries NO `updated_at` column (only `status`,
+ *    `published_at` and `retired_at`), and fixtures publish with a FIXED
+ *    `published_at` literal, so a truncate-and-reseed between two tests can
+ *    reproduce a count and a maximum stamp while holding entirely different
+ *    rows — and the next read would be served the previous corpus.
+ *
+ * So the stamp hashes the IDENTITY AND THE CONTENT of the projected set, in a
+ * total order: the version rows (ordered by the same `slug, version` the
+ * projection is ordered by, with the id as the final tiebreaker), the ingredient
+ * rows of those versions ordered by id, and the live `catalog_foods` columns the
+ * projection joins — `allergen_status`, `food_group` and `updated_at`, which
+ * PostgreSQL bumps on any write because the column is `@updatedAt`. Anything
+ * that could change a single field of a single candidate changes the stamp.
+ *
+ * THAT IS WHAT PRESERVES THE AAP §0.7.3 SAFETY GUARANTEE. The projection reads
+ * `catalog_foods.{food_group, allergen_status}` live per row precisely so a
+ * withdrawn allergen review stops a recipe being planned immediately; hashing
+ * those very columns means a cached candidate set cannot outlive the review it
+ * was built from. The cache is invisible to eligibility: nothing is narrowed in
+ * SQL, so `recipe.logic.ts::evaluatePlanningEligibility` remains the single
+ * implementation and the candidate pre-order stays `(slug, version,
+ * portion_multiplier)`.
+ *
+ * ONE ROUND TRIP, BY CONSTRUCTION. Three correlated subqueries in one `SELECT`
+ * with no `FROM`, so a cache HIT costs a single statement against the
+ * four-statement projection it replaces. `concat_ws(chr(31), …)` separates
+ * fields and `chr(30)` separates rows — control characters that cannot occur in
+ * a slug, a name or a tag — so no concatenation of two fields can impersonate a
+ * third, and every nullable column is `coalesce`d so an absent value is
+ * distinguishable rather than skipped by `concat_ws`.
+ */
+const PLANNING_CORPUS_STAMP_STATEMENT = Prisma.sql`
+    SELECT
+        md5(coalesce((
+            SELECT string_agg(
+                       concat_ws(chr(31),
+                           v.id::text, r.slug, v.version::text, v.status,
+                           coalesce(v.published_at::text, ''), coalesce(v.retired_at::text, ''),
+                           v.nutrition_provenance, v.allergen_status, v.total_minutes::text,
+                           v.meal_slots::text, v.budget_tier::text,
+                           v.per_serving_calories::text, v.per_serving_protein_g::text,
+                           v.per_serving_carbs_g::text, v.per_serving_fat_g::text),
+                       chr(30) ORDER BY r.slug, v.version, v.id)
+            FROM recipe_versions v
+            JOIN recipes r ON r.id = v.recipe_id
+            WHERE ${PLANNABLE_VERSION_PREDICATE}
+        ), '')) AS versions_stamp,
+        md5(coalesce((
+            SELECT string_agg(
+                       concat_ws(chr(31),
+                           i.id::text, i.recipe_version_id::text, i.catalog_food_id::text,
+                           i.snapshot_name, i.snapshot_provenance,
+                           i.snapshot_allergen_tags::text, i.snapshot_diet_tags::text,
+                           i.is_optional::text, i.sort_order::text),
+                       chr(30) ORDER BY i.id)
+            FROM recipe_ingredients i
+            JOIN recipe_versions v ON v.id = i.recipe_version_id
+            WHERE ${PLANNABLE_VERSION_PREDICATE}
+        ), '')) AS ingredients_stamp,
+        md5(coalesce((
+            SELECT string_agg(
+                       concat_ws(chr(31), f.id::text, f.allergen_status, f.food_group,
+                           f.updated_at::text),
+                       chr(30) ORDER BY f.id)
+            FROM catalog_foods f
+            WHERE EXISTS (
+                SELECT 1
+                FROM recipe_ingredients i
+                JOIN recipe_versions v ON v.id = i.recipe_version_id
+                WHERE i.catalog_food_id = f.id AND ${PLANNABLE_VERSION_PREDICATE}
+            )
+        ), '')) AS foods_stamp
+`;
+
+/**
+ * The stamp of the corpus THIS caller can see, or `null` when the database did
+ * not answer the question.
+ *
+ * Run on the caller's own client, which is what makes the check honest inside
+ * an interactive transaction: a caller reading a REPEATABLE READ snapshot
+ * stamps THAT snapshot, so it is served candidates matching what it can
+ * actually see rather than what a pooled connection would see now.
+ *
+ * A FAILED CHECK FALLS THROUGH TO A FULL LOAD rather than failing the request —
+ * the posture `usda.service.ts` already documents for its own cache reads. The
+ * cache is an optimisation and must never be the reason a plannable set cannot
+ * be produced, and the fall-through is exactly the pre-cache behaviour: read the
+ * corpus. It is logged at `warn` because a check that cannot run means every
+ * later read pays the full projection again, which is an operator-visible cost
+ * and not a silent one.
+ */
+const readPlanningCorpusStamp = async (db: Prisma.TransactionClient): Promise<string | null> => {
+    try {
+        const rows = await db.$queryRaw<PlanningCorpusStampRow[]>(PLANNING_CORPUS_STAMP_STATEMENT);
+        const stamp = rows[0];
+
+        if (stamp === undefined) {
+            logSafeEvent('warn', 'planning_corpus_stamp_empty', { rows: rows.length });
+
+            return null;
+        }
+
+        return `${stamp.versions_stamp}:${stamp.ingredients_stamp}:${stamp.foods_stamp}`;
+    } catch (error) {
+        logSafeEvent('warn', 'planning_corpus_stamp_failed', describeErrorSafely(error));
+
+        return null;
+    }
+};
+
+/**
+ * The candidate set as one corpus produced it, held against the stamp that
+ * describes that corpus.
+ *
+ * `candidates` is `readonly` because the array inside this entry is never
+ * handed out: {@link getRecipeVersionsForPlanning} returns a shallow copy, so a
+ * consumer that sorts its result in place — `swap.logic.ts` and
+ * `mealPlan.logic.ts` both sort derived arrays today, and a future one may sort
+ * this one — cannot reorder the shared set behind every other caller.
+ */
+interface PlanningCandidateCacheEntry {
+    readonly stamp: string;
+    readonly candidates: readonly PlanRecipeCandidate[];
+}
+
+/**
+ * The one cached corpus, or `null` before the first load.
+ *
+ * SINGLE-ENTRY AND CONTENT-ADDRESSED, deliberately. Holding several stamps
+ * would serve two different corpora at once — useful only while a stale
+ * snapshot is still open — and would need an eviction policy to bound it. One
+ * entry costs at most one extra load when a caller reading an older snapshot
+ * interleaves with one reading the current corpus, and it can never serve the
+ * wrong content to either: the stamp is compared on EVERY call, so the entry is
+ * used only by a caller whose corpus hashes to it.
+ *
+ * PROCESS-LOCAL, so nothing here survives a restart and no invalidation has to
+ * cross a process boundary — which is the property that makes the per-read
+ * check above sufficient rather than merely convenient.
+ */
+let planningCandidateCache: PlanningCandidateCacheEntry | null = null;
+
+/**
+ * The loads that have not finished yet, keyed by the stamp each one is loading.
+ *
+ * Without this, N concurrent first requests would each run the full
+ * four-statement projection — the cold-start stampede the cache exists to
+ * prevent. The promise is the value, for the same reason
+ * `usda.service.ts::pendingRefreshes` holds promises: a later caller JOINS the
+ * load already running instead of starting a second one.
+ *
+ * An entry is removed by the load that owns it, whether it resolved or rejected,
+ * so a failed load is retried by the next caller rather than being remembered.
+ */
+const inFlightPlanningLoads = new Map<string, Promise<readonly PlanRecipeCandidate[]>>();
+
+/**
+ * The projection itself — the read this module has always issued, unchanged.
+ *
+ * Split out from the exported function so the cache above wraps it rather than
+ * being interleaved with it: the `where`, the `select` and the `orderBy` below
+ * are the plannable universe and the load-bearing pre-order documented on
+ * {@link getRecipeVersionsForPlanning}, and nothing in the caching layer may
+ * narrow or reorder them.
+ */
+const loadPlanningCandidates = async (
+    db: Prisma.TransactionClient,
+): Promise<readonly PlanRecipeCandidate[]> => {
     const versions = await db.recipe_versions.findMany({
         where: {
             status: CURRENT_VERSION_STATUS,
@@ -754,4 +949,131 @@ export const getRecipeVersionsForPlanning = async (
     });
 
     return versions.map(toPlanRecipeCandidate);
+};
+
+/**
+ * Loads one corpus once, and records it under its stamp.
+ *
+ * The cache write happens on the promise's own `then`, so every caller that
+ * joined an in-flight load sees the same array, and a REJECTED load writes
+ * nothing — the next call re-reads the stamp and tries again.
+ *
+ * A LATE LOAD CANNOT POISON THE CACHE. Two loads for different stamps can be in
+ * flight at once, and the one that finishes second wins the entry regardless of
+ * which corpus is newer. That is harmless precisely because the entry is
+ * content-addressed: whichever entry is resident is served only to a caller
+ * whose own stamp equals it, so "the older corpus won" costs a later reload and
+ * never a stale answer.
+ */
+const loadPlanningCandidatesForStamp = (
+    db: Prisma.TransactionClient,
+    stamp: string,
+): Promise<readonly PlanRecipeCandidate[]> => {
+    const inFlight = inFlightPlanningLoads.get(stamp);
+
+    if (inFlight !== undefined) {
+        return inFlight;
+    }
+
+    const load = loadPlanningCandidates(db)
+        .then((candidates) => {
+            planningCandidateCache = { stamp, candidates };
+
+            return candidates;
+        })
+        .finally(() => {
+            inFlightPlanningLoads.delete(stamp);
+        });
+
+    inFlightPlanningLoads.set(stamp, load);
+
+    return load;
+};
+
+/**
+ * Every plannable recipe version, as the candidate shape the planner and the
+ * swap selector both consume.
+ *
+ * SERVED FROM A FRESHNESS-VALIDATED PROCESS-LOCAL CACHE.
+ * {@link loadPlanningCandidates} above reads the whole plannable corpus — every
+ * current source-backed recipe version, its ingredients and those ingredients'
+ * catalog foods — and it ran on EVERY alternatives and preview request, which
+ * made the dominant term of both reads
+ * proportional to the catalog rather than to the request. It is now issued only
+ * when the corpus has actually changed: each call spends ONE statement on
+ * {@link readPlanningCorpusStamp} and reuses the candidates behind that stamp.
+ * The three rejected alternatives, and why a per-read content hash is the only
+ * correct invalidation for a corpus written by other processes, are recorded
+ * with that statement.
+ *
+ * THE RESULT IS A SHALLOW COPY of the cached array, and the copy is the contract
+ * the return type states: a mutable `PlanRecipeCandidate[]`, so a consumer may
+ * sort or truncate what it is handed, and the cached order is unaffected. The
+ * ELEMENTS are shared, so a caller must treat a candidate and its nested
+ * `per_serving` and `ingredients` as read-only — nothing does otherwise today
+ * (`swap.logic.ts::selectSwapCandidates` and
+ * `mealPlan.logic.ts::buildPlanCandidates` both build fresh arrays and sort
+ * those), and a consumer that needs to change a candidate must copy it.
+ *
+ * WHAT THAT READ'S WHERE CLAUSE FILTERS, and why it is not a second
+ * eligibility rule. Three predicates define the plannable UNIVERSE, and all three are
+ * properties of the recipe alone — no user, no preference, no request: the
+ * version is `current`, its rolled-up nutrition is `source_backed`, and its
+ * rolled-up allergen review is `known`. A row failing any of them is
+ * unplannable for every user who will ever exist, so excluding it in the query
+ * removes rows that could never be chosen rather than deciding anything. It is also
+ * the direction a mistake has to fail in: the set handed to the search cannot
+ * contain an estimate or an unreviewed dish even if a future caller forgot to
+ * ask the rules.
+ *
+ * WHAT IT DELIBERATELY DOES NOT FILTER is everything that depends on the user
+ * — diet, allergens, dislikes, the cooking-time limit and slot membership —
+ * plus the per-ingredient half of provenance and review. Those stay with
+ * `recipe.logic.ts::evaluatePlanningEligibility`, the SINGLE implementation the
+ * generator, the swap selector and flag recomputation all call, because that is
+ * the half where two copies would eventually disagree and one of them would
+ * start serving an allergen (§5 "no business rules inline"). The rules
+ * re-check the three columns themselves as well, so the query narrows the input
+ * and the logic still owns every verdict.
+ *
+ * THE ORDER IS `slug, version`, AND IT IS LOAD-BEARING. The planner's candidate
+ * pre-order is the portable identity `(slug, version, portion_multiplier)`
+ * precisely because primary keys are `gen_random_uuid()` and differ between two
+ * independently loaded databases; the seeded shuffle then walks that pre-order
+ * once. Handing the search a set ordered by anything database-specific would
+ * make the same inputs produce different plans on two machines holding the same
+ * release — the determinism the second-database acceptance evidence checks. The
+ * pair is unique (`recipes.slug` is unique and `(recipe_id, version)` is), so
+ * the order is total.
+ *
+ * NO `userId` PARAMETER, by the §5.1 exception this file's header states:
+ * recipes are shared reference data with no owner column, so there is nothing
+ * to scope, and a parameter accepted only to be ignored would suggest otherwise.
+ * The per-user half of planning is the PREFERENCES the caller passes to the
+ * eligibility rules, which is where it belongs.
+ *
+ * Read whole rather than paged: forty-odd recipes with their ingredients is the
+ * entire plannable universe, the in-memory search needs all of it before the
+ * transaction opens (AAP §0.5.1), and a paged read would be a second source of
+ * candidate ordering.
+ */
+export const getRecipeVersionsForPlanning = async (
+    db: Prisma.TransactionClient = prisma,
+): Promise<PlanRecipeCandidate[]> => {
+    const stamp = await readPlanningCorpusStamp(db);
+
+    // Freshness could not be established, so nothing may be served from the
+    // cache and nothing may be written to it: this call reads the corpus, which
+    // is what every call did before the cache existed.
+    if (stamp === null) {
+        return [...(await loadPlanningCandidates(db))];
+    }
+
+    const cached = planningCandidateCache;
+
+    if (cached !== null && cached.stamp === stamp) {
+        return [...cached.candidates];
+    }
+
+    return [...(await loadPlanningCandidatesForStamp(db, stamp))];
 };

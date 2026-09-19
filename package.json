@@ -5,7 +5,7 @@
   "main": "index.js",
   "scripts": {
     "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
-    "build": "tsc",
+    "build": "tsc && node -e \"const fs=require('fs');fs.rmSync('dist/generated',{recursive:true,force:true});fs.cpSync('src/generated','dist/generated',{recursive:true})\"",
     "start": "node dist/server.js",
     "prisma": "prisma",
     "test": "jest --ci --runInBand --coverage",

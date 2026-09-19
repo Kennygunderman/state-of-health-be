@@ -110,6 +110,40 @@ distinguished. There is no owner-less read of a user-owned resource, so "no such
 plan" and "not your plan" are one answer by construction — a client cannot probe
 for the existence of another user's plan, meal, grocery item or diary entry.
 
+**A caller with no account.** Firebase authentication and the `users` table are
+two separate records, and only `POST /api/user` creates the second one. A valid
+token whose uid has no `users` row therefore reaches these routes with nothing to
+own, and every mutating one answers:
+
+```json
+{"error": "user_not_found"}
+```
+
+with status `404`. It is refused before any write, so nothing is created — not a
+preferences row, not a plan, not an idempotency-ledger row — and the same request
+succeeds normally once `POST /api/user` has run. The check is one guard inside the
+per-user advisory lock every meal-planning write takes
+(`mealPlanningAction.service.ts::withUserLock`), which is why all nine mutating
+routes give the same answer and why a concurrent write cannot slip past it.
+
+Three things about this are deliberate. **The reads are unaffected** — `GET
+/meal-planning/preferences` still answers its `not_started` empty state, `GET
+/meal-planning/targets` still answers `targets: null`, and `GET
+/meal-planning/plans/current` still answers two nulls, because reading must
+neither provision an account nor refuse for the lack of one. **`PUT
+/meal-planning/preferences` answers `409 stale_revision` instead**, and correctly
+so: it edits an existing row and pins `expectedRevision`, so the absence of a row
+is already refused by its parser before the lock is reached, with the same
+`{currentRevision: 0}` body any other missing-row edit gets. And **the shipped
+`PUT /api/user/targets` keeps its human sentence** `{"error": "User not found"}`
+for this caller — the status agrees, the body stays what older clients read,
+because meal-planning bodies carry machine codes and the diary routes carry
+prose.
+
+`user_not_found` is a code the mobile client already declares, which is the point
+of using one: a `404` carrying it is a *confirmed* failure, so a keyed mutation
+neither retries it nor shows the unconfirmed-outcome state.
+
 **Body size.** The global `express.json()` limit (100 KB) bounds every request
 here. No per-route body parser is added for meal planning; the largest body in
 this contract is a full preferences update, which is orders of magnitude below
@@ -124,10 +158,12 @@ is enforced in code; the field codes are the `code` values that appear in
 
 | Input | Rule | Field code on failure |
 | --- | --- | --- |
-| Any path id (`:planId`, `:mealId`, `:itemId`, `:recipeVersionId`) | v4 UUID | `invalid_id` |
+| Any **meal-planning** path id (`:planId`, `:mealId` under `/meal-planning`, `:itemId`, `:recipeVersionId`) | v4 UUID | `invalid_id` |
+| Either **legacy diary** path id (`:mealId` of `POST /api/macros/meal/:mealId/entries`, `:id` of `PUT`/`DELETE /api/macros/entry/:id`) | any spelling the data layer parses — see [the legacy path-id grammar](#the-legacy-path-id-grammar) | `invalid_id` |
 | `idempotencyKey` | v4 UUID | `invalid_id` |
 | Any date (`date`, `startDate`) | real `YYYY-MM-DD` calendar day | `invalid_date` |
 | `startDate` window | within `[today, max(today + 30 days, activePlan.endDate + 1)]` in the user's zone | `out_of_range` |
+| `date` on the planned-log route | inside `[plan.startDate, plan.endDate]`, both ends inclusive | `outside_plan_week` |
 | `servings` | number in `[0.25, 10]`, at most two decimals | `below_minimum`, `above_maximum`, `invalid_type` |
 | `q` (catalog search) | 2–60 characters after trimming | `invalid` |
 | `page` | integer ≥ 1 (and ≤ 100,000) | `invalid`, `out_of_range` |
@@ -144,6 +180,17 @@ is enforced in code; the field codes are the `code` values that appear in
 | Manual targets | `calories` integer in `[800, 6000]`; each macro integer in `[1, 1000]` | `below_minimum`, `above_maximum`, `not_an_integer` |
 | Any `expectedRevision` / `expected*Revision` | integer within PostgreSQL's signed 32-bit range | `invalid_type`, `above_maximum` |
 | `:step` segment | one of the nine setup steps | `unknown_step` |
+
+One of these rules is judged later than the others, and the row above is where
+it belongs anyway. `date ∈ [plan.startDate, plan.endDate]` cannot be decided from
+the request alone — the parser does not know the plan's week — so it is applied
+inside the log transaction, after the plan has been read by `{id, user_id}`. It
+is still a verdict on the REQUEST and answers like one: `400 invalid_request`
+with `details: [{field: "date", code: "outside_plan_week"}]`, the same typing a
+malformed `date` on the same route gets. Late is not untyped. Its position after
+the ownership read is what keeps it from being an existence oracle: a date
+verdict is only ever given for a plan already proven to be the caller's, and a
+plan that is not answers `404` whatever the date says.
 
 Two bounds deserve their reasons, because the number alone reads arbitrary.
 
@@ -269,7 +316,8 @@ active it recomputes that plan's incompatibility flags in the same transaction.
 plan-settings banner — it is not a count of what changed in the request.
 
 Errors: `400 invalid_request` (including `unknown_step`),
-`409 stale_revision`, `503 feature_disabled`.
+`409 stale_revision`, `404 user_not_found` (a caller with no `users` row),
+`503 feature_disabled`.
 
 #### `PUT /meal-planning/preferences`
 
@@ -392,7 +440,8 @@ feasibility, and **there is no `422` on this route**.
 
 Errors: `400 invalid_request`, `409 stale_targets` (with `currentRevision`),
 `409 estimate_stale`, `409 estimate_unavailable` (the estimated branch, when the
-inputs it must recompute from are missing or unusable).
+inputs it must recompute from are missing or unusable), `404 user_not_found` (a
+caller with no `users` row).
 
 
 ### Plans
@@ -425,6 +474,7 @@ caption and the user decides.
 | `409` | `upcoming_exists` | At most one plan may start after today, and one already does. |
 | `422` | `targets_missing` | `{missing}` — names the unset target fields so the client can ask for exactly those. |
 | `422` | `no_matching_meals` | A feasibility verdict, not a failure. See below. |
+| `404` | `user_not_found` | The caller has no `users` row. Nothing is created, including no ledger row for the key. |
 | `502` | `plan_generation_failed` | The search could not complete. Nothing was persisted. |
 | `503` | `feature_disabled` | |
 
@@ -505,7 +555,8 @@ Errors: everything `POST /meal-planning/plans` can answer with, plus
 `409 stale_plan` (`{currentRevision}`) when the pinned revision has moved and
 `409 plan_not_active` when the plan is already superseded (`{replacementPlanId}`)
 or has ended (`{reason: "ended"}`), and `404` when the plan is not the
-caller's. On any error the old plan is left exactly as it was.
+caller's — or `404 user_not_found` when the caller has no `users` row at all. On
+any error the old plan is left exactly as it was.
 
 #### `GET /meal-planning/plans/:planId/affected-meals`
 
@@ -570,6 +621,7 @@ folded in silently.
 | --- | --- | --- |
 | `400` | `invalid_request` | |
 | `404` | — | The plan or meal is not the caller's. |
+| `404` | `user_not_found` | The caller has no `users` row. |
 | `409` | `preview_stale` | The server-recomputed portion differs from the request. |
 | `409` | `stale_plan` | `{currentRevision}` |
 | `409` | `plan_not_active` | `{replacementPlanId}` or `{reason: "ended"}` |
@@ -615,8 +667,8 @@ Checking *or* unchecking clears the item's `flag` and resets the baseline that
 later "was X, now Y" comparisons are made against, so repeated swaps keep
 comparing with the amount the user actually saw.
 
-Errors: `400 invalid_request`, `404`, `409 plan_not_active`,
-`503 feature_disabled`.
+Errors: `400 invalid_request`, `404` (including `user_not_found` for a caller
+with no `users` row), `409 plan_not_active`, `503 feature_disabled`.
 
 #### `POST /meal-planning/plans/:planId/groceries/uncheck-all`
 
@@ -624,8 +676,8 @@ Gated. No body. `200` → `UncheckAllGroceriesResponse` — `{checkedCount: 0}`.
 
 Clears every check and every flag.
 
-Errors: `400 invalid_request`, `404`, `409 plan_not_active`,
-`503 feature_disabled`.
+Errors: `400 invalid_request`, `404` (including `user_not_found` for a caller
+with no `users` row), `409 plan_not_active`, `503 feature_disabled`.
 
 ### Planned logging
 
@@ -638,9 +690,28 @@ planRevision}`.
 `diaryMealId` must be an existing diary meal owned by the caller **whose own
 date equals the `date` in the body**; clients obtain it from
 `GET /api/macros/:date`, which backfills the four default buckets for any date.
-`date` must fall inside the plan's week. **No `mealName` is accepted** — the
-server will not create or rename a diary bucket, because the diary's meals are a
-fixed per-day set.
+**No `mealName` is accepted** — the server will not create or rename a diary
+bucket, because the diary's meals are a fixed per-day set.
+
+`date` must fall inside the plan's week, both ends inclusive, and a well-formed
+day key outside it is a `400`, not a `404`:
+
+```json
+{
+  "error": "invalid_request",
+  "details": [{"field": "date", "code": "outside_plan_week"}]
+}
+```
+
+The two answers this route gives about a target are different in kind, and the
+split is the contract. The **date** is the caller's own input judged against a
+plan already proven theirs, so naming it costs nothing and tells the client which
+control to fix — a client told `404` instead refetched a plan that had not moved.
+Everything about the **diary bucket** stays one indistinguishable `404`: missing,
+deleted, someone else's, or filed under a different day are one answer, because
+distinguishing them would confirm what exists in another user's diary. A plan or
+meal that is not the caller's is likewise `404` whatever the date says, since
+ownership is settled first.
 
 The entry the server writes is derived server-side: the planned portion's
 nutrition rounded once into a per-serving snapshot, multiplied by the eaten
@@ -653,8 +724,10 @@ the diary the single source of truth: deleting the diary entry clears the meal's
 logged state, and editing its servings changes consumed totals without unlinking
 it.
 
-Errors: `400 invalid_request`, `404` (the plan, the meal, or a `diaryMealId`
-that is not the caller's or whose date does not match), `409 stale_plan`,
+Errors: `400 invalid_request` (the parser's field codes, and
+`outside_plan_week` for a date outside the plan's week), `404` (the plan, the
+meal, or a `diaryMealId` that is not the caller's or whose date does not match),
+`404 user_not_found` (a caller with no `users` row), `409 stale_plan`,
 `409 plan_not_active`, `409 idempotency_conflict`, `503 feature_disabled`.
 
 ### Catalog
@@ -924,9 +997,98 @@ The branch is chosen by a pure parser before either writer runs:
   `400 invalid_serving` — and the food row is never touched, so no personal food
   is created. **The legacy `food_id` dedupe path is never entered** for a catalog
   or a planned entry.
-- A body carrying **both** `foodId` and `catalogFoodId`, or matching neither
-  shape, is `400 invalid_payload` with the field named. An unknown or unpublished
-  catalog id is `404 catalog_food_not_found`.
+- A body carrying **both** `foodId` and `catalogFoodId` is
+  `400 {"error": "invalid_payload", "details": [{"field": "foodId", "code":
+  "conflicting_food_reference"}, {"field": "catalogFoodId", "code":
+  "conflicting_food_reference"}]}`. Neither writer can be chosen and guessing
+  would pick which food the user meant to eat. The sentence below is deliberately
+  *not* used here: `catalogFoodId` is new in this release, so no shipped client
+  can produce this body, and such a body routinely carries all five legacy fields
+  — "name, calories, protein, carbs, and fat are required" would be factually
+  false.
+- A body matching **neither** shape — no `foodId`, no `catalogFoodId`, and no
+  legacy intent field at all — keeps the frozen sentence and carries the code
+  beside it:
+
+  ```json
+  {
+    "error": "name, calories, protein, carbs, and fat are required",
+    "code": "invalid_payload",
+    "details": [{"field": "body", "code": "unrecognized_payload"}]
+  }
+  ```
+
+  Both halves are required and neither is optional. AAP §0.3.1 names
+  `invalid_payload` as the code for this refusal, and AAP §0.5.2 says existing
+  contracts change additively only — that sentence is the answer this route has
+  given for two versions, so replacing it with the code would have been a third
+  observable difference in a frozen body rather than an addition to it. A shipped
+  client reading `error` is unaffected; a new one may branch on `code`. Note that
+  the mobile `getApiErrorCode` reads `error` and therefore returns the sentence
+  for this body — which is correct and harmless, because AAP §0.2.5 defines the
+  confirmed/unknown classification on `error` being *a decodable string* and no
+  client compares `invalid_payload` as a top-level code.
+
+  The narrowing matters: the sentence is returned verbatim, with no `code` and no
+  `details`, whenever the body carries **any** legacy intent field (`{"name":
+  "x"}`, a blank name, a body with only `servings`, a negative macro), exactly as
+  before. Only the no-shape-at-all case gained the two extra members.
+- An unknown or unpublished catalog id is `404 catalog_food_not_found`.
+
+**The legacy path-id grammar.** <a id="the-legacy-path-id-grammar"></a>The two
+legacy diary path ids accept **every spelling the data layer can parse**, and
+answer `404` — `{"error": "Meal not found"}` or `{"error": "Entry not found"}` —
+for one that names no row of the caller's. Four forms parse:
+
+| Form | Example |
+| --- | --- |
+| simple, 32 hex digits | `9b2fbd4c7c214a178b361d5a2d4f9c10` |
+| hyphenated, `8-4-4-4-12`, **any** version nibble | `9b2fbd4c-7c21-1a17-8b36-1d5a2d4f9c10` |
+| braced, wrapping the **hyphenated** form | `{9b2fbd4c-7c21-4a17-8b36-1d5a2d4f9c10}` |
+| `urn:uuid:` prefixed, wrapping the **hyphenated** form, lowercase prefix | `urn:uuid:9b2fbd4c-7c21-4a17-8b36-1d5a2d4f9c10` |
+
+Anything else — 31 or 33 hex digits, misplaced hyphens, a braced *simple* form,
+an uppercase `URN:UUID:`, surrounding whitespace, an embedded NUL, arbitrary text
+— is `400 invalid_request` with `{"field": "<name>", "code": "invalid_id"}`.
+
+Both halves of that rule are the contract, for one reason each. **The 404 is
+restored deliberately.** A stricter v4-only check had turned four *parsable*
+spellings (a v1 UUID, the simple form, the braced form, the urn form) from `404`
+into `400`, and a shipped client acts on that 404 — it means "the entry is gone,
+drop it from the cache" — so per AAP §0.5.2 and the §0.5.1 note that
+`updateMealEntry` adopts its owner-bearing predicate "with unchanged HTTP
+semantics", every id the query can run must still reach the query. **The 400 is
+kept deliberately too**, because those spellings previously raised a driver parse
+error and surfaced as `500`; a typed refusal is strictly better and breaks no
+branch a client could have relied on.
+
+The **new** meal-planning path ids are unaffected and remain strict v4, which is
+what AAP §0.5.2 requires of them. The two rules live in separate predicates in
+`nutrition.logic.ts` (`isDatabaseParsableUuid` for the legacy ids, `isUuidV4` for
+everything else) so neither can drift into the other.
+
+**Consumed totals round half-up everywhere.** `GET /api/macros/:date`,
+`GET /api/macros/history` and the per-meal breakdowns now agree field for field.
+They did not before: the day read rounds in JavaScript (`Math.round`, half-up)
+while the history and breakdown aggregates round in SQL, and PostgreSQL's
+`round(double precision)` is half-to-even — so any value landing on `.5` differed
+by 1 between two screens showing the same day. All ten SQL aggregate sites use
+`SUM(FLOOR((x * servings)::numeric + 0.5))::int`, which is `Math.round`'s
+definition rather than an approximation of it. Casting to `numeric` and keeping
+`ROUND` is *not* equivalent: `round(numeric)` rounds negative halves away from
+zero where `Math.round` rounds them towards positive infinity, and negative
+macros are storable through the legacy body. The reasoning is recorded beside the
+queries and in `planning-policy.md` §5.2.
+
+**Two lazy inserts now refuse an unprovisioned caller.** `GET /api/macros/:date`
+backfills the four meal buckets and `GET /api/foods` seeds the starter foods, and
+both insert rows keyed by `user_id`. For a valid token whose uid has no `users`
+row they reached a foreign key and answered `500`; they now answer
+`404 {"error": "User not found"}` — the prose body, matching the shipped
+`PUT /api/user/targets` rather than the machine code the meal-planning routes
+use, because these are diary routes and their family carries prose. The guard is
+asked only on the path that actually inserts, so an already-materialised day and
+a non-empty food list cost no extra query.
 
 **`PUT /api/macros/entry/:id` gains detachment semantics.** An edit that changes
 only `servings` keeps the plan and catalog links, the input method and the
@@ -963,13 +1125,14 @@ reader already understands, with any payload members alongside the code.
 Failures are logged server-side with `console.error`; **the raw error object is
 never part of the body**.
 
-All twenty-one meal-planning error classes, each with exactly one status:
+All twenty-two meal-planning error classes, each with exactly one status:
 
 | Code | Status | Routes that can return it | Class |
 | --- | --- | --- | --- |
 | `preferences_incomplete` | `409` | plan generate, regenerate | `PreferencesIncompleteError` |
 | `stale_revision` | `409` | preferences step save, preferences save, plan generate, regenerate | `StaleRevisionError` |
 | `invalid_request` + `read_only_field` detail | `400` | preferences save, preferences step save | `ReadOnlyFieldError` |
+| `invalid_request` + `outside_plan_week` detail | `400` | planned log | `OutsidePlanWeekError` |
 | `estimate_unavailable` | `409` | target estimate, target save | `EstimateUnavailableError` |
 | `estimate_stale` | `409` | target save | `EstimateStaleError` |
 | `stale_targets` | `409` | target save | `StaleTargetsError` |
@@ -989,16 +1152,17 @@ All twenty-one meal-planning error classes, each with exactly one status:
 | `catalog_food_not_found` | `404` | `POST /api/macros/meal/:mealId/entries` (catalog body) | `CatalogFoodNotFoundError` |
 | `feature_disabled` | `503` | the sixteen gated routes | `MealPlanningDisabledError` |
 
-Four more outcomes are absent from `mealPlanning.errors.ts`, by design. Three of
-them are produced without any error class; the fourth has one, in the diary
-domain:
+Five more outcomes are absent from `mealPlanning.errors.ts`, by design. Three of
+them are produced without any error class; the other two have one, in the diary
+and user domains:
 
 | Code | Status | Routes | Why it is not in `mealPlanning.errors.ts` |
 | --- | --- | --- | --- |
 | `invalid_request` | `400` | every route with a parser | No class: field validation returns a verdict rather than throwing, which is what keeps the parsers testable without exceptions. The `read_only_field` variant in the table above is the one thrown case. |
-| `invalid_payload` | `400` | `POST /api/macros/meal/:mealId/entries` | No class, same reason — a body matching neither shape is a parser verdict. |
+| `invalid_payload` | `400` | `POST /api/macros/meal/:mealId/entries` | No class, same reason — a body matching neither shape is a parser verdict. **This is the one code that is not the body's `error`**: for the no-shape case it travels as a `code` member beside the route's frozen sentence, which stays the `error` value (see [the legacy body shapes](#changes-to-the-shipped-contract)). For the both-food-ids case it is the `error`, because no shipped client can produce that body. |
 | `invalid_serving` | `400` | `POST /api/macros/meal/:mealId/entries` (catalog body) | Has a class, but not this file's: `InvalidServingError` is declared in `nutrition.logic.ts` beside the catalog writer that raises it and mapped to this status by `nutrition.controller.ts`, because a failure belongs to the module that raises it — the same boundary that keeps `EstimateFailedError` in `estimate.service.ts`. |
 | `Recipe not found` | `404` | `GET /recipes/:recipeVersionId` | The service returns `null` and the controller maps it, so "no such version" and "not visible to you" cannot diverge. |
+| `user_not_found` | `404` | every mutating `/meal-planning/*` route (see [a caller with no account](#conventions)) | Has a class — `UserNotProvisionedError` — but in `user.service.ts`, because the condition belongs to the user domain and predates meal planning: the legacy diary and food services raise it too, and neither should import a meal-planning module to say "this caller has no account". The guard that raises it runs inside `withUserLock`; the meal-planning controller maps it to the machine code above, while the shipped diary routes keep their `User not found` sentence. |
 
 Two bodies across the two tables above carry a human string rather than a
 machine code (`Plan not found` from the class table, `Recipe not found` from the

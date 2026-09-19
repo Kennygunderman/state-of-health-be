@@ -24,7 +24,18 @@
  * It lives here rather than beside the module because Jest's `roots` is
  * `<rootDir>/src` (jest.config.ts), so a test file under `scripts/` would never
  * be collected; the relative imports are the consequence of that. It needs no
- * database of its own — nothing it imports touches Prisma.
+ * database of its own: the two stages it drives reach Prisma only through a
+ * dynamic import inside their `main()`, so importing them for their publication
+ * functions opens no connection and starts no run.
+ *
+ * IT ALSO OWNS THE OTHER HALF OF THE SAME SUBJECT. The sections at the bottom
+ * drive the two stages that PUBLISH into a shared report directory —
+ * `catalog-validate.ts::publishValidationReport` and
+ * `catalog-generate-ai.ts::writeGenerationReport` — against real temporary
+ * directories, because what is under test there is also what the disk is left
+ * holding: which of an artefact's sections survive a second writer, whether
+ * tens of megabytes of per-item acceptance evidence are carried through without
+ * being parsed, and whether a run pointed at another database is refused.
  */
 import fs from 'fs';
 import os from 'os';
@@ -52,6 +63,36 @@ import {
     writeJsonFile,
 } from '../../../scripts/lib/manifest';
 import type { ArtifactLockIdentity, ArtifactPublicationLock } from '../../../scripts/lib/manifest';
+import {
+    FRESHNESS_OBLIGATIONS_FIELD,
+    mergeStageReport,
+} from '../../../scripts/lib/manifest';
+import {
+    VALIDATION_REPORT_NOTE_KEY,
+    buildValidationReportPublication,
+    publishValidationReport,
+    validationReportHeaderPrefix,
+} from '../../../scripts/catalog-validate';
+import {
+    ITEMS_KEY,
+    REPORT_STAGE_NAME,
+    VALIDATION_REPORT_FILE,
+    VALIDATION_REPORT_STALENESS_KEY,
+    dischargedValidationReportStaleness,
+    mergeOwnedFields,
+    readStagedReportDocument,
+} from '../../../scripts/catalog-report';
+import {
+    GENERATION_REPORT_FILE,
+    writeGenerationReport,
+} from '../../../scripts/catalog-generate-ai';
+import {
+    CATALOG_ARTIFACT_TARGET_DIGEST_FIELD,
+    CATALOG_ARTIFACT_TARGET_IDENTITY_KEY,
+    CatalogArtifactTargetError,
+} from '../../services/catalog.logic';
+import { createLogger } from '../../../scripts/lib/logger';
+import type { LogLevel, ScriptLogger } from '../../../scripts/lib/logger';
 
 /**
  * A pid that cannot be live: one past the 32-bit signed maximum is above every
@@ -1679,5 +1720,535 @@ describe('the publication lock under takeover (SEC3-manifest-stale-lock-race)', 
             (JSON.parse(fs.readFileSync(finalPath, 'utf-8')) as Record<string, unknown>).generation,
         ).toBe(1);
         expect(fs.existsSync(path.join(workspace, JOURNAL_NAME))).toBe(false);
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * ONE DOCUMENT, TWO WRITERS, NOTHING LOST (CATREP-artefact-overwrite).
+ *
+ * THE DEFECT THESE PIN. `data/meal-planning/reports/latest/validation-report.json`
+ * is written by `catalog-validate.ts` (the judgement half, sixteen keys) and by
+ * `catalog-report.ts` (the aggregate half AND the per-item records AAP §0.9.3
+ * names as the acceptance evidence). The validate stage published with a bare
+ * `writeJsonFile`, so its sixteen keys replaced the whole file: QA ran a report
+ * against one database and a validate pass against another and watched the
+ * committed artefact go from twenty-four sections to sixteen, with
+ * `'items' in doc` → False, while the sibling `import-report.json` went on
+ * asserting agreement with it.
+ *
+ * The fourteen sections named in FOURTEEN_REPORT_OWNED_SECTIONS are exactly the
+ * ones QA measured as lost. They are asserted by NAME and by VALUE, on a real
+ * file, because "the merge preserves what it is not given" is a claim about the
+ * bytes left on disk and nothing short of reading them back can make it.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * The sections a validate write destroyed, in the order QA listed them.
+ *
+ * `items` and `itemRecords` are the acceptance evidence; the other twelve are
+ * the aggregate half a reviewer reads the catalog's shape out of.
+ */
+const FOURTEEN_REPORT_OWNED_SECTIONS: readonly string[] = [
+    'policy',
+    'checkVocabulary',
+    'boundsMeasuredAgainst',
+    'observationLegend',
+    'checksOverPublishedItems',
+    'categoriesLegend',
+    'categories',
+    'nutritionMethodBreakdown',
+    'identityEvidenceSummary',
+    'advisoryReview',
+    'integrityReconciliation',
+    'measurementGaps',
+    'itemRecords',
+    'items',
+];
+
+const TARGET_DIGEST = '1661b5560863';
+const OTHER_DIGEST = 'ffeeddccbbaa';
+
+/** A logger that captures its lines, so a case can assert what the run said. */
+const capturingLogger = (): { logger: ScriptLogger; entries: () => Record<string, unknown>[] } => {
+    const lines: { level: LogLevel; line: string }[] = [];
+    return {
+        logger: createLogger('catalog-validate', {
+            level: 'debug',
+            write: (line, level) => {
+                lines.push({ line, level });
+            },
+            now: () => new Date('2026-09-19T00:00:00.000Z'),
+        }),
+        entries: () => lines.map((entry) => JSON.parse(entry.line) as Record<string, unknown>),
+    };
+};
+
+/**
+ * The document a `catalog:report` run leaves: its own twelve aggregate sections,
+ * `itemRecords`, the streamed `items` map LAST, and a database identity.
+ *
+ * Written through `writeJsonFile` rather than assembled by hand, because that is
+ * the function every artefact in this pipeline is serialised by — so the
+ * `"items"` member lands at exactly the indentation the bounded reader looks
+ * for, and a case that passed against a hand-rolled shape would prove nothing
+ * about the real file.
+ */
+const writeReportStageArtefact = (
+    target: string,
+    options: { readonly targetDigest?: string; readonly items?: Record<string, unknown> } = {},
+): Record<string, unknown> => {
+    const items = options.items ?? {
+        'usda:1': { sourceKey: 'usda:1', checks: [{ name: 'kcal_ceiling', pass: true, observed: 52, bound: 900 }] },
+        'usda:2': { sourceKey: 'usda:2', checks: [{ name: 'kcal_ceiling', pass: true, observed: 322, bound: 900 }] },
+    };
+
+    const document: Record<string, unknown> = {
+        // Two keys the validate stage owns as well, so the case can show they
+        // are REPLACED while everything else is preserved.
+        stage: 'catalog-report-predecessor',
+        generatedAt: '2026-09-01T00:00:00.000Z',
+        reportVersion: 'v1',
+        reportKind: 'catalog-validation-evidence',
+        purpose: 'Acceptance evidence for every published catalog food.',
+        producedBy: { aggregateFieldsCommand: 'npm run catalog:report' },
+        scope: { stage: 'catalog-report', rowsScanned: 744 },
+        requirement: { publishedItems: 424, requirementMet: false },
+        policy: { coveragePlanVersion: 'v1' },
+        checkVocabulary: { vocabularySize: 23 },
+        boundsMeasuredAgainst: { maxKcalPer100g: 900 },
+        observationLegend: { pass: 'Whether the record satisfied the bound.' },
+        tierRollup: { itemsMeasured: 424 },
+        checksOverPublishedItems: { checkEntriesRecorded: 7695 },
+        categoriesLegend: { published: 'Rows the catalog publishes.' },
+        categories: [{ category: 'produce_fruit', published: 12 }],
+        quarantine: { total: 253, perCategory: { produce_fruit: 3 } },
+        withheldIdentityAudit: { identities: { rejected: [] } },
+        provenance: { usdaPublicDomain: true },
+        nutritionMethodBreakdown: { 'read per 100 g': 424 },
+        identityEvidenceSummary: { retrievalRecords: 424 },
+        advisoryReview: { promotions: 0 },
+        integrityReconciliation: { publishedItemsWithoutValidationRecord: 0 },
+        measurementGaps: [{ field: 'the cause of any per-category shortfall', value: null, reason: 'not measured' }],
+        itemRecords: { oneRecordPerPublishedFood: true, recordedChecksPerItem: { 18: 424 } },
+    };
+
+    if (options.targetDigest !== undefined) {
+        document[CATALOG_ARTIFACT_TARGET_IDENTITY_KEY] = {
+            [CATALOG_ARTIFACT_TARGET_DIGEST_FIELD]: options.targetDigest,
+            digestBasis: 'A one-way digest of the database this artefact describes.',
+        };
+    }
+
+    // LAST, like the streamed write puts it.
+    document[ITEMS_KEY] = items;
+
+    writeJsonFile(target, document);
+    return document;
+};
+
+/** The sixteen-key document a validate pass publishes. */
+const validateReport = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+    stage: 'catalog-validate',
+    generatedAt: '2026-09-19T00:00:00.000Z',
+    runId: 'run-1',
+    coveragePlanVersion: 'v1',
+    options: { dryRun: false, review: false },
+    curatorDecisions: { source: 'none', decisions: [] },
+    counts: { judged: 2, published: 2 },
+    failedChecks: {},
+    reviewFlags: {},
+    duplicateIdentities: 0,
+    duplicateIdentityAccounting: { lostIdentitiesTotal: 0 },
+    invocation: { resumed: false, judged: 2 },
+    skipped: { vanished: [], raced: [], identityGroupMoved: [] },
+    coverage: { publishedActualTotal: 2, shortfallTotal: 0 },
+    modelCalls: { reserved: 0, used: 0 },
+    dryRun: null,
+    ...overrides,
+});
+
+describe('a validate write preserves the report stage`s half of validation-report.json', () => {
+    let workspace: string;
+    let target: string;
+
+    beforeEach(() => {
+        workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'soh-validate-publish-'));
+        target = path.join(workspace, VALIDATION_REPORT_FILE);
+    });
+
+    afterEach(() => {
+        fs.rmSync(workspace, { recursive: true, force: true });
+    });
+
+    const readPublished = (): Record<string, unknown> =>
+        JSON.parse(fs.readFileSync(target, 'utf-8')) as Record<string, unknown>;
+
+    it('leaves all fourteen report-owned sections in place, byte for byte', () => {
+        const before = writeReportStageArtefact(target, { targetDigest: TARGET_DIGEST });
+        const { logger } = capturingLogger();
+
+        publishValidationReport({ target, report: validateReport(), targetDigest: TARGET_DIGEST, logger });
+
+        const after = readPublished();
+        // THE ASSERTION THE FINDING IS ABOUT: every one of the fourteen is
+        // still there, and still holds what the report stage measured.
+        for (const section of FOURTEEN_REPORT_OWNED_SECTIONS) {
+            expect(Object.prototype.hasOwnProperty.call(after, section)).toBe(true);
+            expect(after[section]).toEqual(before[section]);
+        }
+        // And the per-item acceptance records specifically, by identity.
+        expect(Object.keys(after[ITEMS_KEY] as Record<string, unknown>).sort()).toEqual(['usda:1', 'usda:2']);
+
+        // This write's own sixteen keys replaced the predecessor's, which is
+        // the half it does own.
+        expect(after.stage).toBe('catalog-validate');
+        expect(after.runId).toBe('run-1');
+        expect(after.counts).toEqual({ judged: 2, published: 2 });
+
+        // The document is still one parseable artefact ending in the
+        // terminator every artefact here ends with.
+        expect(fs.readFileSync(target, 'utf-8').endsWith('}\n')).toBe(true);
+    });
+
+    it('carries the item map through without parsing it, byte-identical to what was there', () => {
+        // A map big enough that "it was copied, not rebuilt" is a measurable
+        // claim: the bytes are compared, and the copy runs in 1 MiB chunks, so
+        // this crosses the chunk boundary.
+        const items: Record<string, unknown> = {};
+        for (let index = 0; index < 4000; index += 1) {
+            items[`usda:${index}`] = {
+                sourceKey: `usda:${index}`,
+                checks: [{ name: 'kcal_ceiling', pass: true, observed: index, bound: 900 }],
+                notApplicableChecks: [{ name: 'missing_density', applicable: false, reason: 'not a volume basis' }],
+            };
+        }
+        writeReportStageArtefact(target, { targetDigest: TARGET_DIGEST, items });
+
+        const original = readStagedReportDocument(target);
+        expect(original).not.toBeNull();
+        expect(original?.itemsOffset).not.toBeNull();
+        const originalTail = fs.readFileSync(target).subarray(original?.itemsOffset ?? 0);
+        expect(originalTail.length).toBeGreaterThan(1024 * 1024);
+
+        const { logger, entries } = capturingLogger();
+        publishValidationReport({ target, report: validateReport(), targetDigest: TARGET_DIGEST, logger });
+
+        const republished = readStagedReportDocument(target);
+        const republishedTail = fs.readFileSync(target).subarray(republished?.itemsOffset ?? 0);
+        expect(republishedTail.equals(originalTail)).toBe(true);
+        expect(Object.keys(readPublished()[ITEMS_KEY] as Record<string, unknown>)).toHaveLength(4000);
+
+        const written = entries().filter((entry) => entry.event === 'report_written');
+        expect(written).toHaveLength(1);
+        expect(written[0].itemRecordsPreserved).toBe(true);
+        expect(Number(written[0].itemBytesPreserved)).toBe(originalTail.length);
+    });
+
+    it('records the freshness obligation catalog-report still owes, naming the sections', () => {
+        writeReportStageArtefact(target, { targetDigest: TARGET_DIGEST });
+        const { logger, entries } = capturingLogger();
+
+        publishValidationReport({ target, report: validateReport(), targetDigest: TARGET_DIGEST, logger });
+
+        const marker = readPublished()[VALIDATION_REPORT_STALENESS_KEY] as Record<string, unknown>;
+        expect(marker[FRESHNESS_OBLIGATIONS_FIELD]).toEqual([REPORT_STAGE_NAME]);
+        // A PRESERVED SECTION MUST NOT POSE AS FRESH: the marker names every
+        // one of them, including the carried item records.
+        for (const section of FOURTEEN_REPORT_OWNED_SECTIONS) {
+            expect(marker.sectionsOutstanding).toContain(section);
+        }
+        expect(marker.command).toBe('npm run catalog:report');
+
+        // The note says what was preserved and what was carried rather than
+        // measured, so a reader can tell the two apart.
+        const note = readPublished()[VALIDATION_REPORT_NOTE_KEY] as Record<string, unknown>;
+        expect(note.stage).toBe('catalog-validate');
+        expect(note.itemRecordsPreserved).toBe(true);
+        expect(note.carriedAggregateAssertions).toEqual(['measurementGaps']);
+        expect(note.preservedKeys).toContain('policy');
+        expect(note.preservedKeys).not.toContain('measurementGaps');
+        expect(entries().filter((entry) => entry.event === 'report_written')).toHaveLength(1);
+    });
+
+    it('is discharged by the next report-stage write, which takes the marker away', () => {
+        writeReportStageArtefact(target, { targetDigest: TARGET_DIGEST });
+        const { logger } = capturingLogger();
+        publishValidationReport({ target, report: validateReport(), targetDigest: TARGET_DIGEST, logger });
+        expect(readPublished()).toHaveProperty(VALIDATION_REPORT_STALENESS_KEY);
+
+        // The report stage's half of the same mechanism, applied to the
+        // document the validate write left.
+        const onDisk = readStagedReportDocument(target);
+        const republished = mergeOwnedFields(onDisk?.header ?? null, [
+            ['policy', { coveragePlanVersion: 'v1', remeasured: true }],
+            [VALIDATION_REPORT_STALENESS_KEY, dischargedValidationReportStaleness(onDisk?.header ?? null)],
+        ]);
+
+        expect(republished).not.toHaveProperty(VALIDATION_REPORT_STALENESS_KEY);
+        // And the validate half it does not own is still there.
+        expect(republished.counts).toEqual({ judged: 2, published: 2 });
+    });
+
+    it('writes the whole document when the path holds nothing, and when it holds no item map', () => {
+        const { logger, entries } = capturingLogger();
+
+        publishValidationReport({ target, report: validateReport(), targetDigest: TARGET_DIGEST, logger });
+        expect(readPublished().stage).toBe('catalog-validate');
+        // Nothing to preserve, so nothing is claimed as outstanding.
+        expect(readPublished()).not.toHaveProperty(VALIDATION_REPORT_STALENESS_KEY);
+        expect(entries().filter((entry) => entry.event === 'report_written')[0].itemRecordsPreserved).toBe(false);
+
+        // A document with sections but no `items` key: the header still merges.
+        writeJsonFile(target, { policy: { coveragePlanVersion: 'v1' }, [CATALOG_ARTIFACT_TARGET_IDENTITY_KEY]: { [CATALOG_ARTIFACT_TARGET_DIGEST_FIELD]: TARGET_DIGEST } });
+        publishValidationReport({ target, report: validateReport({ runId: 'run-2' }), targetDigest: TARGET_DIGEST, logger });
+        expect(readPublished().policy).toEqual({ coveragePlanVersion: 'v1' });
+        expect(readPublished().runId).toBe('run-2');
+    });
+
+    it('refuses a document describing another database and leaves it byte-identical', () => {
+        writeReportStageArtefact(target, { targetDigest: OTHER_DIGEST });
+        const before = fs.readFileSync(target);
+        const { logger } = capturingLogger();
+
+        let thrown: unknown = null;
+        try {
+            publishValidationReport({ target, report: validateReport(), targetDigest: TARGET_DIGEST, logger });
+        } catch (error) {
+            thrown = error;
+        }
+
+        expect(thrown).toBeInstanceOf(CatalogArtifactTargetError);
+        expect((thrown as CatalogArtifactTargetError).code).toBe('artefact_target_mismatch');
+        expect((thrown as CatalogArtifactTargetError).context).toEqual({
+            file: VALIDATION_REPORT_FILE,
+            recordedDigest: OTHER_DIGEST,
+            runDigest: TARGET_DIGEST,
+        });
+        expect(fs.readFileSync(target).equals(before)).toBe(true);
+        // Nothing staged, and the publication lock released.
+        expect(fs.readdirSync(workspace)).toEqual([VALIDATION_REPORT_FILE]);
+    });
+
+    it('adopts a document that records no database at all, loudly, and stamps its own', () => {
+        // The state of every artefact committed before the field existed. A
+        // refusal here would break the legitimate pipeline until someone
+        // re-published, and would mean editing a committed file to accommodate
+        // a code change.
+        writeReportStageArtefact(target);
+        const { logger, entries } = capturingLogger();
+
+        publishValidationReport({ target, report: validateReport(), targetDigest: TARGET_DIGEST, logger });
+
+        const adopted = entries().filter((entry) => entry.event === 'artefact_target_adopted');
+        expect(adopted).toHaveLength(1);
+        expect(adopted[0].level).toBe('warn');
+        expect(adopted[0].recordedDigest).toBe('none');
+        expect(adopted[0].targetDigest).toBe(TARGET_DIGEST);
+        expect(String(adopted[0].basis)).toContain('adopted rather than refused');
+
+        // Stamped, so the next write against another database is refused
+        // instead of adopted a second time.
+        expect(readPublished()[CATALOG_ARTIFACT_TARGET_IDENTITY_KEY]).toMatchObject({
+            [CATALOG_ARTIFACT_TARGET_DIGEST_FIELD]: TARGET_DIGEST,
+        });
+        expect(FOURTEEN_REPORT_OWNED_SECTIONS.every((section) => section in readPublished())).toBe(true);
+
+        const { logger: second } = capturingLogger();
+        expect(() =>
+            publishValidationReport({ target, report: validateReport(), targetDigest: OTHER_DIGEST, logger: second }),
+        ).toThrow(CatalogArtifactTargetError);
+    });
+
+    it('refuses to publish while another stage holds the report directory`s lock', () => {
+        writeReportStageArtefact(target, { targetDigest: TARGET_DIGEST });
+        const before = fs.readFileSync(target);
+        const held = acquireArtifactPublicationLock(workspace, 'catalog-report:artefacts');
+        const { logger } = capturingLogger();
+
+        try {
+            expect(() =>
+                publishValidationReport({ target, report: validateReport(), targetDigest: TARGET_DIGEST, logger }),
+            ).toThrow(ManifestError);
+            expect(fs.readFileSync(target).equals(before)).toBe(true);
+        } finally {
+            held.release();
+        }
+    });
+});
+
+describe('buildValidationReportPublication', () => {
+    it('states which sections it preserved, which it carried, and which are outstanding', () => {
+        const publication = buildValidationReportPublication({
+            file: VALIDATION_REPORT_FILE,
+            existing: {
+                stage: 'catalog-report-predecessor',
+                policy: { coveragePlanVersion: 'v1' },
+                measurementGaps: [{ field: 'a gap', value: null, reason: 'not measured' }],
+                aggregatedAt: '2026-09-01T00:00:00.000Z',
+                [VALIDATION_REPORT_NOTE_KEY]: { stage: 'catalog-validate' },
+            },
+            report: validateReport(),
+            itemRecordsPreserved: true,
+            targetDigest: TARGET_DIGEST,
+        });
+
+        expect(publication.preservedKeys).toEqual(['policy']);
+        // Both aggregate-owned assertions the document carried are kept rather
+        // than dropped: this write changes nothing either describes, and one of
+        // them (`measurementGaps`) is one of the fourteen sections.
+        expect(publication.carriedAggregateAssertions).toEqual(['aggregatedAt', 'measurementGaps']);
+        expect(publication.sectionsAwaitingReportStage).toEqual([
+            'aggregatedAt',
+            'items',
+            'measurementGaps',
+            'policy',
+        ]);
+        expect(publication.targetDecision.verdict).toBe('adopted');
+        // This write's own note is not claimed as a key it preserved from
+        // another stage — it is its own previous bookkeeping.
+        expect(publication.preservedKeys).not.toContain(VALIDATION_REPORT_NOTE_KEY);
+        expect(publication.sectionsAwaitingReportStage).not.toContain(VALIDATION_REPORT_NOTE_KEY);
+    });
+
+    it('claims nothing outstanding on a first write, and names no compound block', () => {
+        const publication = buildValidationReportPublication({
+            file: VALIDATION_REPORT_FILE,
+            existing: null,
+            report: validateReport(),
+            itemRecordsPreserved: false,
+            targetDigest: TARGET_DIGEST,
+        });
+
+        expect(publication.preservedKeys).toEqual([]);
+        expect(publication.carriedAggregateAssertions).toEqual([]);
+        expect(publication.sectionsAwaitingReportStage).toEqual([]);
+        expect(publication.document).not.toHaveProperty(VALIDATION_REPORT_STALENESS_KEY);
+        expect(publication.targetDecision.verdict).toBe('first_write');
+        // The two writers of this document own disjoint top-level keys, so
+        // there is no co-written block to merge by sub-key — stated rather than
+        // inherited from the import report's default.
+        expect((publication.document[VALIDATION_REPORT_NOTE_KEY] as Record<string, unknown>).compoundBlocks).toEqual([]);
+    });
+});
+
+describe('validationReportHeaderPrefix', () => {
+    it('ends where the copied item map begins, so the two compose into one document', () => {
+        const prefix = validationReportHeaderPrefix({ a: 1, b: { c: 2 } });
+        const tail = `\n  ${JSON.stringify(ITEMS_KEY)}: {\n    "usda:1": {}\n  }\n}\n`;
+
+        expect(prefix.endsWith(',')).toBe(true);
+        expect(JSON.parse(`${prefix}${tail}`)).toEqual({ a: 1, b: { c: 2 }, [ITEMS_KEY]: { 'usda:1': {} } });
+        // Identical in shape to a single stringify at the same indent, so a
+        // rerun of the other writer diffs as changed fields rather than a
+        // reformat of the whole file.
+        expect(`${prefix}${tail}`).toBe(
+            `${JSON.stringify({ a: 1, b: { c: 2 }, [ITEMS_KEY]: { 'usda:1': {} } }, null, 2)}\n`,
+        );
+    });
+
+    it('takes no separator for an empty header, so the composition stays valid', () => {
+        expect(validationReportHeaderPrefix({})).toBe('{');
+        expect(JSON.parse(`${validationReportHeaderPrefix({})}\n  "${ITEMS_KEY}": {}\n}\n`)).toEqual({ [ITEMS_KEY]: {} });
+    });
+});
+
+describe('the generation stage`s canonical write', () => {
+    let workspace: string;
+    let target: string;
+
+    beforeEach(() => {
+        workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'soh-generation-publish-'));
+        target = path.join(workspace, GENERATION_REPORT_FILE);
+    });
+
+    afterEach(() => {
+        fs.rmSync(workspace, { recursive: true, force: true });
+    });
+
+    const readPublished = (): Record<string, unknown> =>
+        JSON.parse(fs.readFileSync(target, 'utf-8')) as Record<string, unknown>;
+
+    it('stamps its target and keeps the sibling stages` sections', () => {
+        writeJsonFile(target, {
+            stage: 'catalog-import-usda',
+            counts: { planned: 12057 },
+            usdaRequests: { attempts: 583 },
+        });
+        const { logger, entries } = capturingLogger();
+
+        writeGenerationReport(target, { stage: 'catalog-generate-ai', aiGenerationCounts: { executedBatches: 2 } }, TARGET_DIGEST, logger);
+
+        const after = readPublished();
+        expect(after.counts).toEqual({ planned: 12057 });
+        expect(after.usdaRequests).toEqual({ attempts: 583 });
+        expect(after.stage).toBe('catalog-generate-ai');
+        expect(after[CATALOG_ARTIFACT_TARGET_IDENTITY_KEY]).toMatchObject({
+            [CATALOG_ARTIFACT_TARGET_DIGEST_FIELD]: TARGET_DIGEST,
+        });
+        // Adopted, because the document it merged into recorded no identity.
+        expect(entries().filter((entry) => entry.event === 'artefact_target_adopted')).toHaveLength(1);
+    });
+
+    it('refuses a document describing another database, leaving it byte-identical', () => {
+        writeJsonFile(target, {
+            stage: 'catalog-import-usda',
+            counts: { planned: 12057 },
+            [CATALOG_ARTIFACT_TARGET_IDENTITY_KEY]: { [CATALOG_ARTIFACT_TARGET_DIGEST_FIELD]: OTHER_DIGEST },
+        });
+        const before = fs.readFileSync(target);
+        const { logger } = capturingLogger();
+
+        expect(() => writeGenerationReport(target, { stage: 'catalog-generate-ai' }, TARGET_DIGEST, logger)).toThrow(
+            CatalogArtifactTargetError,
+        );
+        expect(fs.readFileSync(target).equals(before)).toBe(true);
+    });
+
+    it('agrees with a document it already stamped, and says so without warning', () => {
+        const { logger, entries } = capturingLogger();
+        writeGenerationReport(target, { stage: 'catalog-generate-ai', aiGenerationCounts: {} }, TARGET_DIGEST, logger);
+        writeGenerationReport(target, { stage: 'catalog-generate-ai', aiGenerationCounts: {} }, TARGET_DIGEST, logger);
+
+        const checked = entries().filter((entry) => entry.event === 'artefact_target_checked');
+        expect(checked).toHaveLength(1);
+        expect(checked[0].verdict).toBe('agrees');
+        expect(entries().filter((entry) => entry.event === 'artefact_target_adopted')).toHaveLength(1);
+    });
+
+    it('replaces a document it cannot parse rather than refusing it, and says which', () => {
+        // An unparseable file records no identity, so the rule reads it as the
+        // adoption case — the run must not be stopped by a half-written report
+        // when its work is already committed to the database.
+        fs.writeFileSync(target, '{ not json', 'utf-8');
+        const { logger, entries } = capturingLogger();
+
+        writeGenerationReport(target, { stage: 'catalog-generate-ai' }, TARGET_DIGEST, logger);
+
+        expect(readPublished().stage).toBe('catalog-generate-ai');
+        expect(entries().filter((entry) => entry.event === 'report_replaced')).toHaveLength(1);
+        expect(entries().filter((entry) => entry.event === 'artefact_target_adopted')).toHaveLength(1);
+    });
+});
+
+describe('the merge the two report writers share', () => {
+    it('discharges only the writing stage`s own obligation, whichever writer calls it', () => {
+        // `mergeStageReport` is the import report's path and
+        // `dischargedValidationReportStaleness` the validation report's; both
+        // must remove one stage and leave the rest, or a marker would be
+        // cleared by a stage that measured nothing.
+        const marker = {
+            [VALIDATION_REPORT_STALENESS_KEY]: {
+                [FRESHNESS_OBLIGATIONS_FIELD]: [REPORT_STAGE_NAME, 'catalog-import-usda'],
+            },
+        };
+
+        const viaMerge = mergeStageReport(marker, { counts: 1 }, { noteKey: 'reportStageWrite', stage: REPORT_STAGE_NAME });
+        expect(
+            (viaMerge.document[VALIDATION_REPORT_STALENESS_KEY] as Record<string, unknown>)[FRESHNESS_OBLIGATIONS_FIELD],
+        ).toEqual(['catalog-import-usda']);
+
+        expect(dischargedValidationReportStaleness(marker)).toEqual({
+            [FRESHNESS_OBLIGATIONS_FIELD]: ['catalog-import-usda'],
+        });
     });
 });

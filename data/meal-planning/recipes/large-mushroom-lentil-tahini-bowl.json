@@ -1,0 +1,95 @@
+{
+  "slug": "large-mushroom-lentil-tahini-bowl",
+  "name": "Large mushroom, lentil and tahini bowl",
+  "description": "A very large soy-free vegan lunch or dinner bowl for a high calorie target: seventeen cups of sliced mushrooms seared hard in dry pans over warm cooked lentils, dressed with loosened tahini and finished with sunflower seeds and torn basil. Sesame carries most of the fat, so it suits a soy and nut free plan.",
+  "iconKey": "bowl",
+  "instructions": [
+    "Set two wide non-stick pans over high heat, divide the mushrooms between them in a single layer and leave them undisturbed for 4 minutes so they brown rather than steam.",
+    "Stir once, add the salt, and cook for 4 minutes more until both pans are dry again.",
+    "Divide the lentils between the pans and warm them through for 2 minutes.",
+    "Loosen the tahini in a small dish with a spoonful of the hot liquid from the pans until it pours.",
+    "Tip everything into one very large bowl, spoon the tahini over, then scatter the sunflower seeds and the torn basil on top."
+  ],
+  "yieldServings": 1,
+  "servingDescription": "1 large bowl",
+  "prepMinutes": 5,
+  "cookMinutes": 10,
+  "mealSlots": [
+    "lunch",
+    "dinner"
+  ],
+  "dietTags": [
+    "gluten_free",
+    "pescatarian",
+    "vegan",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "sesame"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 2,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "dairy_free",
+    "vegan",
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:169251",
+      "quantity": 17,
+      "unit": "cup",
+      "gramWeight": 1190,
+      "displayText": "17 cups, sliced",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:172421",
+      "quantity": 175,
+      "unit": "g",
+      "gramWeight": 175,
+      "displayText": "175 g, warm",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170189",
+      "quantity": 2,
+      "unit": "tbsp",
+      "gramWeight": 30,
+      "displayText": "2 tbsp",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170562",
+      "quantity": 22,
+      "unit": "g",
+      "gramWeight": 22,
+      "displayText": "22 g",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:172232",
+      "quantity": 0.5,
+      "unit": "cup",
+      "gramWeight": 12,
+      "displayText": "½ cup, leaves",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 3,
+      "displayText": "½ tsp",
+      "sortOrder": 5,
+      "isOptional": false
+    }
+  ]
+}

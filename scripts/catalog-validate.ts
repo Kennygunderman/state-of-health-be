@@ -209,15 +209,40 @@ import type { LogFields, LogLevel, SafeErrorFields } from './lib/logger';
 // and the other stores is a difference in what the catalog contains.
 import { boundedModelText, canonicalJsonString, sha256Hex } from './lib/catalogFoodFacts';
 import {
+    AGGREGATE_OWNED_ASSERTION_KEYS,
+    FRESHNESS_OBLIGATIONS_FIELD,
     ManifestError,
+    assertStagedDocumentComplete,
     loadCoveragePlan,
     loadEvidenceAllowlist,
+    mergeStageReport,
+    openArtifactForWriteSync,
+    promoteStagedArtifacts,
     readJsonFile,
     reportPath,
+    stagingPathFor,
     withArtifactPublicationLockSync,
     writeJsonFile,
 } from './lib/manifest';
-import type { CatalogFoodState, CoveragePlan } from './lib/manifest';
+import type { CatalogFoodState, CoveragePlan, StagedArtifact } from './lib/manifest';
+// THE OTHER WRITER OF THE SAME DOCUMENT, imported for the three things both
+// stages have to agree on: the artefact's name, the key whose value is streamed
+// rather than held in memory, and the bounded no-follow read that recovers the
+// header without parsing the item records. `catalog-report.ts` owns that
+// document format — it writes the `items` map — so the format's reader lives
+// there and this stage uses it rather than keeping a second copy of a
+// symlink-refusing read that could weaken independently. Importing it runs
+// nothing: its `main()` is guarded by `require.main === module`, and its only
+// module-level effects are the same bootstrap and database-origin guard this
+// file has already imported above.
+import {
+    ITEMS_KEY,
+    REPORT_STAGE_NAME,
+    VALIDATION_REPORT_FILE,
+    VALIDATION_REPORT_STALENESS_KEY,
+    readStagedReportDocument,
+} from './catalog-report';
+import type { ReportDocumentOnDisk } from './catalog-report';
 import {
     ModelBudgetError,
     getCatalogModelCallBudget,
@@ -260,9 +285,14 @@ import type { ComponentDerivationAssessment } from './lib/catalogEvidence';
 // is reached from main() because constructing it is a module-load side effect.
 import {
     CATALOG_ALLERGEN_STATUSES,
+    CATALOG_ARTIFACT_TARGET_IDENTITY_KEY,
+    CATALOG_ARTIFACT_UNIDENTIFIED_TARGET,
     CATALOG_CHECK_NAMES,
     CATALOG_REVIEW_CHECK_NAMES,
+    CatalogArtifactTargetError,
     PER_100G_BASIS_AMOUNT,
+    assertCatalogArtifactTarget,
+    catalogArtifactTargetIdentity,
     catalogCheckTier,
     dedupeIdentity,
     isCatalogFoodState,
@@ -270,6 +300,7 @@ import {
     resolveCategoryBounds,
     validateCatalogCandidate,
 } from '../src/services/catalog.logic';
+import type { CatalogArtifactTargetDecision } from '../src/services/catalog.logic';
 // `CatalogAdvisoryReview` is deliberately NOT imported: the advisory answer has
 // no type-level route into a judgement any more, so this file carries the
 // confirmed names as plain strings for the record and its counters, and nothing
@@ -7350,6 +7381,463 @@ export const reviewOwedByRun = (row: ValidationFoodRow, runId: string): boolean 
 };
 
 // ---------------------------------------------------------------------------
+// PUBLISHING THE VALIDATION REPORT — one document, two writers, nothing lost.
+//
+// THE DEFECT THIS SECTION CLOSES. This stage used to publish with a bare
+// `writeJsonFile(target, report)`: the sixteen keys it owns REPLACED the whole
+// document. `catalog-report.ts` writes the same file — its aggregate half and,
+// decisively, the per-item records AAP §0.9.3 names as the acceptance evidence
+// ("validation-report.json committed with per-item records for every published
+// row") — so every validate pass deleted all of it. QA measured a committed
+// artefact go from twenty-four sections to sixteen, with `'items' in doc` →
+// False, while the sibling `import-report.json` went on asserting agreement
+// with it.
+//
+// WHAT A PRESERVING WRITE HAS TO GET RIGHT, in the order the code below does it:
+//
+//   1. THE TARGET. A document produced against another database is evidence for
+//      another catalog, so this write refuses to merge into one whose recorded
+//      digest is not this run's (`catalog.logic.ts`, EVIDENCE ARTEFACTS). An
+//      artefact recording NO digest is adopted and the adoption is logged.
+//
+//   2. THE MERGE. `scripts/lib/manifest.ts::mergeStageReport` is the merge all
+//      three writers of `import-report.json` already share: it keeps key
+//      POSITION as well as value, so a rerun of one stage diffs as the fields
+//      that changed rather than a reordered artefact, and it writes a note
+//      recording what this write preserved.
+//
+//   3. THE AGGREGATE-OWNED ASSERTIONS. That merge REMOVES a key asserting
+//      something about the whole document when the write does not supply it,
+//      because such a claim is only true as of the write that produced it. That
+//      rule was written for `import-report.json`, and one of the keys it names —
+//      `measurementGaps` — is a section of THIS document that the report stage
+//      owns. This write changes nothing it describes (it is a legend about what
+//      the aggregate pass does and does not measure), so it is carried
+//      verbatim and named in the note as carried rather than measured. Dropping
+//      it would lose one of the sections this whole section exists to keep.
+//
+//   4. THE FRESHNESS OBLIGATION. A preserved section must not silently pose as
+//      fresh. The marker mechanism the library already provides
+//      (`PROVISIONAL_REPORT_MARKER_KEYS`, `FRESHNESS_OBLIGATIONS_FIELD`) is how
+//      that is said: this write records that `catalog-report` still owes the
+//      document a measurement of the sections named, and
+//      `catalog-report.ts::dischargedValidationReportStaleness` crosses itself
+//      off on its next write and removes the marker when nothing is left.
+//
+//   5. THE ITEM RECORDS. `items` is tens of megabytes — 93 MB on the committed
+//      v1 artefact — and the report stage streams it precisely so the whole
+//      document never exists in memory. This write therefore never parses it:
+//      the header is merged in memory and the item map is copied through BYTE
+//      FOR BYTE from the offset the reader found, so preserving the acceptance
+//      evidence costs a bounded buffer rather than a gigabyte of heap.
+// ---------------------------------------------------------------------------
+
+/** The key under which this stage records what its write preserved. Each writer
+ * of this document has its own, so the notes sit beside each other. */
+export const VALIDATION_REPORT_NOTE_KEY = 'validationStageWrite';
+
+// `O_NOFOLLOW` is POSIX and present on every platform this pipeline runs on,
+// but it is not in Node's constants on every platform, and `undefined` in a
+// bitwise OR becomes 0 silently — which would quietly remove the protection.
+// Read once, explicitly, so an absent constant is a documented degradation
+// rather than an invisible one. Stated here for the same reason
+// `catalog-report.ts` states its own copy: `manifest.ts` keeps one private, and
+// the three are deliberately identical.
+const O_NOFOLLOW_READ_FLAG = typeof fs.constants.O_NOFOLLOW === 'number' ? fs.constants.O_NOFOLLOW : 0;
+
+/**
+ * The indent every artefact in this pipeline is serialised at.
+ *
+ * Stated here because this stage assembles a document by hand — header text
+ * plus a copied tail — and the shape has to be identical to what
+ * `manifest.ts::writeJsonFile` and `catalog-report.ts::writeValidationReport`
+ * produce, or a rerun of the other writer would diff as a reformat of the whole
+ * file.
+ */
+const REPORT_JSON_INDENT = 2;
+
+/** How much of the preserved item map is copied per read. Bounds memory: the
+ * point of copying rather than parsing is that the map never has to fit. */
+const ITEMS_COPY_CHUNK_BYTES = 1024 * 1024;
+
+export type CatalogEvidenceWriteErrorCode = 'items_block_moved';
+
+/**
+ * The preserved item map could not be copied from the document this write
+ * merged its header out of.
+ *
+ * Raised when the file changed under the publication lock — a different size,
+ * or different bytes where the reader found the `items` key. The write produces
+ * nothing rather than a document whose header describes one generation of the
+ * artefact and whose item records come from another, which is the one outcome
+ * worse than not publishing: it would read as reconciled evidence.
+ */
+export class CatalogEvidenceWriteError extends Error {
+    constructor(
+        public readonly code: CatalogEvidenceWriteErrorCode,
+        message: string,
+    ) {
+        super(message);
+        this.name = 'CatalogEvidenceWriteError';
+    }
+}
+
+const asReportRecord = (value: unknown): Record<string, unknown> | null =>
+    value !== null && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+
+const hasOwnKey = (target: Readonly<Record<string, unknown>>, key: string): boolean =>
+    Object.prototype.hasOwnProperty.call(target, key);
+
+export interface ValidationReportPublication {
+    /** The header this write publishes. The preserved `items` map is not in it. */
+    readonly document: Record<string, unknown>;
+    /** Top-level keys this write left exactly as it found them. */
+    readonly preservedKeys: readonly string[];
+    /**
+     * Aggregate-owned assertions carried verbatim rather than dropped, because
+     * this write changes nothing they describe (see step 3 above).
+     */
+    readonly carriedAggregateAssertions: readonly string[];
+    /**
+     * The sections `catalog-report` still owes this document a measurement of,
+     * as the freshness marker names them. `items` appears here when the map was
+     * preserved, because a carried-through record set is exactly as old as the
+     * pass that wrote it.
+     */
+    readonly sectionsAwaitingReportStage: readonly string[];
+    readonly targetDecision: CatalogArtifactTargetDecision;
+}
+
+/**
+ * Builds the document this write publishes, or refuses the write.
+ *
+ * Pure and exported for its test: everything that decides what the artefact
+ * ends up holding is here, and the only thing left outside is the filesystem.
+ * `existing` is the document's own top-level fields WITHOUT its `items` map —
+ * what {@link readStagedReportDocument} returns — and `null` for a path that
+ * holds nothing.
+ */
+export const buildValidationReportPublication = (input: {
+    /** The artefact's file name, for the refusal message. Never its path. */
+    readonly file: string;
+    readonly existing: Readonly<Record<string, unknown>> | null;
+    readonly report: Readonly<Record<string, unknown>>;
+    /** Whether the document on disk carries an `items` map this write preserves. */
+    readonly itemRecordsPreserved: boolean;
+    readonly targetDigest: string;
+}): ValidationReportPublication => {
+    const targetDecision = assertCatalogArtifactTarget({
+        file: input.file,
+        existing: input.existing,
+        runDigest: input.targetDigest,
+    });
+
+    const base = input.existing;
+
+    // What this write MEASURED, plus the identity of the database it measured
+    // it against. Everything else in the document belongs to the other writer.
+    const own: Record<string, unknown> = {
+        ...input.report,
+        [CATALOG_ARTIFACT_TARGET_IDENTITY_KEY]: catalogArtifactTargetIdentity(input.targetDigest),
+    };
+
+    // The sections this write does not supply and therefore does not refresh.
+    // The two note keys and the marker itself are excluded: they are bookkeeping
+    // about the writes rather than measurements the report stage owes.
+    const sectionsAwaitingReportStage = [
+        ...(base === null
+            ? []
+            : Object.keys(base).filter(
+                  (key) =>
+                      !hasOwnKey(own, key) &&
+                      key !== VALIDATION_REPORT_NOTE_KEY &&
+                      key !== VALIDATION_REPORT_STALENESS_KEY,
+              )),
+        ...(input.itemRecordsPreserved ? [ITEMS_KEY] : []),
+    ].sort();
+
+    const carriedAggregateAssertions =
+        base === null
+            ? []
+            : AGGREGATE_OWNED_ASSERTION_KEYS.filter((key) => hasOwnKey(base, key) && !hasOwnKey(own, key))
+                  .slice()
+                  .sort();
+
+    const written: Record<string, unknown> = { ...own };
+    for (const key of carriedAggregateAssertions) {
+        written[key] = (base as Record<string, unknown>)[key];
+    }
+
+    if (sectionsAwaitingReportStage.length > 0) {
+        written[VALIDATION_REPORT_STALENESS_KEY] = {
+            [FRESHNESS_OBLIGATIONS_FIELD]: [REPORT_STAGE_NAME],
+            sectionsOutstanding: sectionsAwaitingReportStage,
+            command: 'npm run catalog:report',
+            basis:
+                'The sections named here were written by an earlier catalog:report run and are preserved exactly as ' +
+                'it left them \u2014 this pass judged the catalog and measured none of them, so it neither replaced ' +
+                'them nor may present them as its own. They describe the catalog as that run measured it, and this ' +
+                'pass has just changed publication statuses, so run the command above to re-measure them and this ' +
+                'marker disappears. items is listed when the per-item records were carried through: they are the ' +
+                'acceptance evidence, and a carried record set is exactly as old as the pass that wrote it.',
+        };
+    }
+
+    // The same merge the three writers of import-report.json share, so key
+    // position survives and a note records what was preserved.
+    // `compoundBlocks: []` states a measured fact about THIS document rather
+    // than accepting the default: `duplicatesRemoved` and `failuresByCheck` are
+    // co-written in the import report and neither exists here, so the two
+    // writers of this file own disjoint top-level keys and there is no block to
+    // merge by sub-key.
+    const merged = mergeStageReport(base, written, {
+        noteKey: VALIDATION_REPORT_NOTE_KEY,
+        stage: STAGE,
+        compoundBlocks: [],
+    });
+
+    merged.document[VALIDATION_REPORT_NOTE_KEY] = {
+        ...(asReportRecord(merged.document[VALIDATION_REPORT_NOTE_KEY]) ?? {}),
+        itemRecordsPreserved: input.itemRecordsPreserved,
+        sectionsAwaitingReportStage,
+        // Named rather than silently kept: the shared merge would have removed
+        // each of these as a claim outliving its write, and a reader has to be
+        // able to tell "this write measured it" from "this write carried it".
+        carriedAggregateAssertions,
+        targetIdentityVerdict: targetDecision.verdict,
+        basisForPreserving:
+            'This stage owns the judgement half of this artefact and catalog:report owns the aggregate half and the ' +
+            'per-item records. A write that replaced the document deleted the per-item records AAP \u00a70.9.3 names ' +
+            'as acceptance evidence, so this write preserves every key it does not measure, carries the item map ' +
+            'through byte for byte without parsing it, and records under ' +
+            `${VALIDATION_REPORT_STALENESS_KEY} which sections catalog:report still owes a measurement of.`,
+    };
+
+    return {
+        document: merged.document,
+        preservedKeys: merged.preservedKeys,
+        carriedAggregateAssertions,
+        sectionsAwaitingReportStage,
+        targetDecision,
+    };
+};
+
+/**
+ * The document's text up to — and not including — the `items` member, with the
+ * separator the copied tail needs in front of it.
+ *
+ * `JSON.stringify(x, null, 2)` ends a non-empty object with `"\n}"`, so
+ * dropping the last two characters and adding a comma leaves a prefix the
+ * preserved tail (which begins `"\n  \"items\":"`) completes into exactly the
+ * document `catalog-report.ts::writeValidationReport` produces. An EMPTY header
+ * takes no comma, which is what keeps this total rather than a slice that
+ * happens to be safe for the callers there are today.
+ */
+export const validationReportHeaderPrefix = (document: Readonly<Record<string, unknown>>): string => {
+    const text = JSON.stringify(document, null, REPORT_JSON_INDENT);
+    return text === '{}' ? '{' : `${text.slice(0, text.length - 2)},`;
+};
+
+/**
+ * Copies the preserved item map out of `source` and into the open descriptor
+ * `into`, re-verifying first that it is still the document the header was
+ * merged out of.
+ *
+ * NO-FOLLOW and descriptor-based, for the reason `catalog-report.ts`'s reader
+ * gives: this pipeline's stages take an output directory from a flag, so a
+ * symlink planted at the artefact's name would have the copy read bytes this
+ * pipeline never wrote into the document it is about to publish as evidence.
+ *
+ * The re-verification is the answer to a narrower question than a symlink: the
+ * header was read through one descriptor and the tail is read through another,
+ * and between them a writer outside this pipeline could have replaced the file
+ * — which would splice one generation's records onto another's header. The size
+ * and the marker bytes at the offset are read from the SAME descriptor the copy
+ * then reads from, so what is checked is what is copied.
+ */
+const copyPreservedItemRecords = (source: string, onDisk: ReportDocumentOnDisk, itemsOffset: number, into: number): number => {
+    const marker = `\n  ${JSON.stringify(ITEMS_KEY)}:`;
+    const descriptor = fs.openSync(source, fs.constants.O_RDONLY | O_NOFOLLOW_READ_FLAG);
+
+    try {
+        const opened = fs.fstatSync(descriptor);
+        if (!opened.isFile() || opened.size !== onDisk.size) {
+            throw new CatalogEvidenceWriteError(
+                'items_block_moved',
+                `${path.basename(source)} changed while it was being republished, so its per-item records were not ` +
+                    'carried forward and nothing was written \u2014 the previous artefact is intact. Re-run ' +
+                    'catalog:validate with no other writer touching the report directory.',
+            );
+        }
+
+        const head = Buffer.alloc(marker.length);
+        let filled = 0;
+        while (filled < head.length) {
+            const read = fs.readSync(descriptor, head, filled, head.length - filled, itemsOffset + filled);
+            if (read === 0) {
+                break;
+            }
+            filled += read;
+        }
+        if (filled !== head.length || head.toString('utf-8') !== marker) {
+            throw new CatalogEvidenceWriteError(
+                'items_block_moved',
+                `${path.basename(source)} no longer carries its "${ITEMS_KEY}" key where this run read it, so the ` +
+                    'per-item records were not carried forward and nothing was written \u2014 the previous artefact ' +
+                    'is intact. Re-run catalog:validate with no other writer touching the report directory.',
+            );
+        }
+
+        const buffer = Buffer.alloc(ITEMS_COPY_CHUNK_BYTES);
+        let position = itemsOffset;
+        let copied = 0;
+        for (;;) {
+            const read = fs.readSync(descriptor, buffer, 0, buffer.length, position);
+            if (read === 0) {
+                break;
+            }
+            fs.writeSync(into, buffer, 0, read);
+            position += read;
+            copied += read;
+        }
+        return copied;
+    } finally {
+        fs.closeSync(descriptor);
+    }
+};
+
+/**
+ * Publishes `document` over `target`, carrying that file's existing item map
+ * through, and returns how many bytes of it were carried.
+ *
+ * Staged and renamed rather than written in place, like every artefact this
+ * pipeline publishes: an interrupted write leaves the previous complete
+ * document instead of a truncated one, and the staged file is checked for its
+ * terminator before the rename makes it the artefact.
+ */
+const publishWithPreservedItemRecords = (
+    target: string,
+    document: Readonly<Record<string, unknown>>,
+    onDisk: ReportDocumentOnDisk,
+    itemsOffset: number,
+): { readonly staged: StagedArtifact; readonly itemBytesPreserved: number } => {
+    const staged: StagedArtifact = { finalPath: target, stagingPath: stagingPathFor(target) };
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+
+    const descriptor = openArtifactForWriteSync(staged.stagingPath);
+    let itemBytesPreserved = 0;
+    try {
+        fs.writeSync(descriptor, validationReportHeaderPrefix(document), null, 'utf-8');
+        itemBytesPreserved = copyPreservedItemRecords(target, onDisk, itemsOffset, descriptor);
+        fs.fsyncSync(descriptor);
+    } catch (error) {
+        fs.closeSync(descriptor);
+        fs.rmSync(staged.stagingPath, { force: true });
+        throw error;
+    }
+    fs.closeSync(descriptor);
+
+    // Checked before it replaces anything: the tail was copied byte for byte
+    // from a document ending `}\n`, so a staged file that does not is a copy
+    // that stopped short.
+    assertStagedDocumentComplete(staged);
+    promoteStagedArtifacts([staged]);
+
+    return { staged, itemBytesPreserved };
+};
+
+/**
+ * Publishes this pass's half of `validation-report.json`, PRESERVING the other
+ * writer's half.
+ *
+ * Published, not written in place: this artefact is evidence a reviewer reads
+ * and `catalog-report.ts` publishes the same file with its own half. So the
+ * write takes the artefact directory's lock — no two publishers interleaved,
+ * and, since the merge is a read-modify-write, no read of a half-replaced
+ * document either — and lands through a staged-then-renamed write that leaves
+ * the previous complete report in place if this run is interrupted.
+ */
+export const publishValidationReport = (input: {
+    readonly target: string;
+    readonly report: Readonly<Record<string, unknown>>;
+    readonly targetDigest: string;
+    readonly logger: ScriptLogger;
+}): void => {
+    withArtifactPublicationLockSync(path.dirname(input.target), `${STAGE}:report`, () => {
+        const file = path.basename(input.target);
+        const onDisk = readStagedReportDocument(input.target);
+        const publication = buildValidationReportPublication({
+            file,
+            existing: onDisk === null ? null : onDisk.header,
+            report: input.report,
+            itemRecordsPreserved: onDisk !== null && onDisk.itemsOffset !== null,
+            targetDigest: input.targetDigest,
+        });
+
+        logArtifactTargetDecision(file, publication.targetDecision, input.logger);
+
+        let itemBytesPreserved = 0;
+        if (onDisk === null || onDisk.itemsOffset === null) {
+            // Nothing to carry: either the path holds nothing, or the document
+            // there has no item records (a report run has not happened yet).
+            // One atomic write of the merged header is the whole publication.
+            writeJsonFile(input.target, publication.document);
+        } else {
+            itemBytesPreserved = publishWithPreservedItemRecords(
+                input.target,
+                publication.document,
+                onDisk,
+                onDisk.itemsOffset,
+            ).itemBytesPreserved;
+        }
+
+        input.logger.info('report_written', {
+            stage: STAGE,
+            file,
+            preservedKeys: publication.preservedKeys.length,
+            preservedKeyNames: [...publication.preservedKeys].join(','),
+            carriedAggregateAssertions: [...publication.carriedAggregateAssertions].join(','),
+            sectionsAwaitingReportStage: [...publication.sectionsAwaitingReportStage].join(','),
+            itemRecordsPreserved: itemBytesPreserved > 0,
+            itemBytesPreserved,
+        });
+    });
+};
+
+/**
+ * Says which database the artefact this write merged into describes, and
+ * whether this run had to adopt it.
+ *
+ * ADOPTION IS WARNED, not logged at info: it is the state of every artefact
+ * published before the identity field existed, so it is expected once per file
+ * and then never again — and a second adoption of the same artefact means a
+ * write in between dropped the identity, which is worth seeing.
+ */
+const logArtifactTargetDecision = (file: string, decision: CatalogArtifactTargetDecision, log: ScriptLogger): void => {
+    const fields: LogFields = {
+        stage: STAGE,
+        file,
+        verdict: decision.verdict,
+        recordedDigest: decision.recordedDigest ?? 'none',
+        targetDigest: decision.runDigest,
+    };
+
+    if (decision.verdict === 'adopted') {
+        log.warn('artefact_target_adopted', {
+            ...fields,
+            basis:
+                'The artefact records no database identity, so this run cannot tell whether it describes the ' +
+                'database this pass judged. It is adopted rather than refused \u2014 every artefact published ' +
+                'before this field existed records none \u2014 and this write stamps its own digest, so the next ' +
+                'write against a different database is refused instead of merged.',
+        });
+        return;
+    }
+
+    log.info('artefact_target_checked', fields);
+};
+
+// ---------------------------------------------------------------------------
 // Reporting.
 // ---------------------------------------------------------------------------
 
@@ -7410,6 +7898,16 @@ const describeFailure = (error: unknown): { code: string; error: SafeErrorFields
     // for why they travel as data rather than inside the rendered sentence.
     if (isThrownInstanceOf(error, CheckpointError)) {
         return { code: error.code, error: safeError(error), detail: checkpointErrorFields(error) };
+    }
+    // The two ways publishing the evidence artefact can refuse. Each carries
+    // its own code because each has its own remedy: the first is an operator
+    // decision about which database this pass should have addressed, and the
+    // second is a concurrent writer in the report directory.
+    if (isThrownInstanceOf(error, CatalogArtifactTargetError)) {
+        return { code: error.code, error: safeError(error) };
+    }
+    if (isThrownInstanceOf(error, CatalogEvidenceWriteError)) {
+        return { code: error.code, error: safeError(error) };
     }
     // No rate-limiter branch: this stage makes no rate-limited vendor request —
     // the USDA limiter belongs to catalog-import-usda.ts — so a
@@ -7545,16 +8043,18 @@ const main = async (): Promise<number> => {
             logger,
             now: () => new Date(),
             writeReport: (report) => {
-                // Published, not written in place: this artefact is evidence a
-                // reviewer reads, and `catalog-report.ts` publishes the same
-                // file with its own half. So the write takes the artefact
-                // directory's lock (no two publishers interleaved) and lands
-                // through the staged-then-renamed write in
-                // scripts/lib/manifest.ts, which leaves the previous complete
-                // report in place if this run is interrupted.
-                const target = reportPath('validation-report.json');
-                withArtifactPublicationLockSync(path.dirname(target), `${STAGE}:report`, () => {
-                    writeJsonFile(target, report);
+                // PRESERVING, not replacing (see PUBLISHING THE VALIDATION
+                // REPORT): a bare write here deleted the aggregate half and the
+                // per-item acceptance records `catalog-report.ts` owns. The
+                // target identity comes from the origin classified at the top
+                // of main(), where the database is read once and never again
+                // (Rule backend-architecture §9), so the identity this write
+                // stamps cannot differ from the one the guard admitted.
+                publishValidationReport({
+                    target: reportPath(VALIDATION_REPORT_FILE),
+                    report: report as Record<string, unknown>,
+                    targetDigest: String(originLogFields(origin).targetDigest),
+                    logger,
                 });
             },
             // The vendor and the ledger are supplied only when a call may

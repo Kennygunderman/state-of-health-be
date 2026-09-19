@@ -1,0 +1,117 @@
+{
+  "slug": "feta-lentil-dinner-skillet",
+  "name": "Feta and lentil skillet",
+  "description": "Cooked lentils simmered down with tomato, onion and garlic, spinach folded through, finished with crumbled feta and a spoonful of Greek yogurt.",
+  "iconKey": "pot",
+  "instructions": [
+    "Warm the olive oil in a large skillet over medium heat and cook the onion until soft, about 5 minutes.",
+    "Add the garlic and the tomato and cook until the tomato collapses, about 4 minutes.",
+    "Stir in the cooked lentils with the black pepper and heat them through.",
+    "Fold in the spinach and cook just until it wilts.",
+    "Take the pan off the heat, crumble the feta cheese over the top and finish each plate with a spoonful of the Greek yogurt."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 plate",
+  "prepMinutes": 10,
+  "cookMinutes": 15,
+  "mealSlots": [
+    "dinner"
+  ],
+  "dietTags": [
+    "gluten_free",
+    "pescatarian",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "milk"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": [
+    "high_protein",
+    "gluten_free"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:172421",
+      "quantity": 1.75,
+      "unit": "cup",
+      "gramWeight": 346.5,
+      "displayText": "1¾ cups",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173420",
+      "quantity": 1.75,
+      "unit": "oz",
+      "gramWeight": 49.7,
+      "displayText": "1¾ oz, crumbled",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:2705424",
+      "quantity": 1,
+      "unit": "cup",
+      "gramWeight": 245,
+      "displayText": "1 cup",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168462",
+      "quantity": 5,
+      "unit": "cup",
+      "gramWeight": 150,
+      "displayText": "5 cups",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170457",
+      "quantity": 1.5,
+      "unit": "each",
+      "gramWeight": 184.5,
+      "displayText": "1½ medium",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170000",
+      "quantity": 0.5,
+      "unit": "cup",
+      "gramWeight": 80,
+      "displayText": "½ cup, chopped",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169230",
+      "quantity": 3,
+      "unit": "clove",
+      "gramWeight": 9,
+      "displayText": "3 cloves",
+      "sortOrder": 6,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 1,
+      "unit": "tbsp",
+      "gramWeight": 13.5,
+      "displayText": "1 tbsp",
+      "sortOrder": 7,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170931",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 1.15,
+      "displayText": "½ tsp",
+      "sortOrder": 8,
+      "isOptional": false
+    }
+  ]
+}

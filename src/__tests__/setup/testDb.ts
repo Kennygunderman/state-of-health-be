@@ -27,9 +27,9 @@
  * run BEFORE anything can reach a database. That is why there is no
  * module-scope import of `@prisma/client`, `../../generated/prisma`,
  * `../../prisma/client`, `pg` or `../../app` anywhere below —
- * `src/prisma/client.ts` constructs its client on the second line of the file,
- * at import time, so importing it here would put a live client in the module
- * graph before `jestSetup.ts` had checked a single condition. The Prisma client
+ * `src/prisma/client.ts` constructs its client at import time, so importing it
+ * here would put a live client in the module graph before `jestSetup.ts` had
+ * checked a single condition. The Prisma client
  * is therefore required LAZILY, inside the one function that needs it, after
  * the guard has passed. `testDb.test.ts` proves that from outside the process,
  * where it is provable: it spawns a child with an unsafe `DATABASE_URL` and a
@@ -262,6 +262,72 @@ export const assertTestDatabase = (env: NodeJS.ProcessEnv = process.env): void =
             `(${origin.reason}), not as a test database.`,
         'unrecognised_database_origin',
     );
+};
+
+/**
+ * The Prisma datasource parameter that sizes a client's connection pool. The
+ * same literal `src/prisma/client.ts` uses, duplicated rather than imported
+ * because production code must not reach into the test harness for a
+ * constant; `testDb.test.ts` holds the two together by reading that file as
+ * text, so a rename there fails here.
+ */
+export const CONNECTION_LIMIT_PARAMETER = 'connection_limit';
+
+/**
+ * The connection pool every Prisma client in the test process is held to.
+ *
+ * Why the suite needs a bound of its own: Prisma's default pool is
+ * `physical_cores * 2 + 1` — 113 on the 56-core host this suite runs on — and
+ * `npm test` routinely runs against a PostgreSQL shared with other work. An
+ * exhausted server does not fail the suite with an assertion; it fails it with
+ * hundreds of PostgreSQL 53300 "too many clients already" errors scattered
+ * across unrelated suites, which read exactly like product defects. Bounding
+ * the pool makes the suite's footprint a number someone chose.
+ *
+ * Five, measured rather than guessed: the worst-case suite
+ * (`api/concurrency.test.ts`, which races writes deliberately) peaked at eight
+ * backends against its own database, several of them its own contending
+ * clients that already pin `connection_limit=3` each, so the shared
+ * singleton's own demand sits well below five; a serial suite
+ * (`api/grocery.test.ts`) peaked at one. Five therefore never queues here, and
+ * leaves a 100-connection server usable by everything else running beside it.
+ */
+export const TEST_CONNECTION_LIMIT = 5;
+
+/**
+ * `databaseUrl` carrying `connection_limit`, so every Prisma client the test
+ * process builds — the `src/prisma/client.ts` singleton and the extra clients
+ * a few suites construct for themselves — inherits one bound from the one
+ * environment variable they all read.
+ *
+ * Pure and total. A URL that already names the parameter is returned
+ * unchanged, so a caller that chose its own bound keeps it; an absent, empty
+ * or unparseable URL is returned exactly as it arrived, because sizing a pool
+ * is no licence to reject a connection string — `assertTestDatabase` refuses
+ * an unparseable `DATABASE_URL` on its own terms and with its own message, and
+ * this must not pre-empt that with a worse one.
+ */
+export const pinConnectionLimit = (
+    databaseUrl: string | undefined,
+    connectionLimit: number = TEST_CONNECTION_LIMIT,
+): string | undefined => {
+    if (databaseUrl === undefined || databaseUrl.length === 0) {
+        return databaseUrl;
+    }
+
+    let parsed: URL;
+    try {
+        parsed = new URL(databaseUrl);
+    } catch {
+        return databaseUrl;
+    }
+
+    if (parsed.searchParams.has(CONNECTION_LIMIT_PARAMETER)) {
+        return databaseUrl;
+    }
+
+    parsed.searchParams.set(CONNECTION_LIMIT_PARAMETER, String(connectionLimit));
+    return parsed.toString();
 };
 
 /**

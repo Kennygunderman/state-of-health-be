@@ -16,9 +16,10 @@ COPY package*.json ./
 RUN npm ci --omit=dev
 # Schema + migrations for `migrate deploy` at boot
 COPY prisma ./prisma
+# The generated Prisma client is plain JS, so `tsc` emits nothing for it; `npm run
+# build` mirrors it into dist/generated, and it travels inside this one copy.
+# A second COPY of src/generated would write the same ~40 MB into a second layer.
 COPY --from=build /app/dist ./dist
-# Generated Prisma client is plain JS; dist imports resolve it at ./dist/generated
-COPY --from=build /app/src/generated ./dist/generated
 # Coolify passes the deployed commit as SOURCE_COMMIT; surfaced via /health
 ARG SOURCE_COMMIT
 ENV GIT_SHA=$SOURCE_COMMIT

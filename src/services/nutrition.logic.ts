@@ -26,8 +26,8 @@ export interface LogEntryFieldError {
 }
 
 /**
- * Which 400 the caller earned. Two of these are the wire code itself; the third
- * is a compatibility verdict that no response ever spells.
+ * Which 400 the caller earned. Two of these are the wire code itself; the other
+ * two are compatibility verdicts that no response ever spells as `error`.
  *
  * - `legacy_fields_required` — the shipped `isValidMacroPayload` guard refused a
  *   legacy body. The controller answers it with the historical message-only
@@ -38,16 +38,33 @@ export interface LogEntryFieldError {
  *   `{error: 'invalid_request', details}`: the machine code plus the per-field
  *   codes, which is the contract the catalog shape shipped with and which the
  *   app's ApiErrorUtility already maps.
- * - `invalid_payload` — no shape could be chosen at all: the body named both a
- *   personal and a catalog food, or neither. Rendered as
- *   `{error: 'invalid_payload', details}`.
+ * - `invalid_payload` — the body named BOTH a personal and a catalog food, so no
+ *   shape could be chosen. Rendered as `{error: 'invalid_payload', details}`.
+ *   §0.3.1 names this refusal and this code; it is also a body no shipped client
+ *   can produce, since `catalogFoodId` is new in this release, so there is no
+ *   historical `error` string to preserve for it — and the frozen sentence would
+ *   be false here, because such a body routinely carries all five legacy fields.
+ * - `unrecognized_payload` — the body named NEITHER shape. Also §0.3.1's
+ *   `invalid_payload`, but rendered `{error: <the frozen legacy sentence>, code:
+ *   'invalid_payload', details}`: this is the one refusal a shipped client can
+ *   still reach (an empty or unrecognised body is a client bug, not a new
+ *   feature), and it has always been answered with the frozen sentence. Carrying
+ *   the sentence as `error` and the code beside it satisfies §0.3.1's
+ *   machine-readable code and §0.5.2's additive-only rule at once — a client
+ *   rendering `error` verbatim no longer shows a user the literal string
+ *   `invalid_payload`. **Not a wire value** as `error`.
  *
- * The distinction exists because the two bodies are not interchangeable: the
- * legacy one is a frozen string kept for compatibility, and reusing it for a
- * catalog failure loses the code and field details the client needs to say
- * which field to fix.
+ * The distinction exists because the bodies are not interchangeable: the legacy
+ * sentence is a frozen string kept for compatibility, and reusing it for a
+ * catalog failure loses the code and field details the client needs to say which
+ * field to fix — while dropping it from the one refusal that predates the
+ * catalog shape changes a response shipped clients read.
  */
-export type LogEntryErrorCode = 'legacy_fields_required' | 'invalid_request' | 'invalid_payload';
+export type LogEntryErrorCode =
+    | 'legacy_fields_required'
+    | 'invalid_request'
+    | 'invalid_payload'
+    | 'unrecognized_payload';
 
 /**
  * The verdict of {@link parseLogEntryBody}. `legacy` and `catalog` name which
@@ -119,10 +136,29 @@ const ENTRY_ID_PATH_FIELD = 'id';
 // design: both shapes use them, so neither may act as a shape signal.
 const LEGACY_INTENT_FIELDS: readonly string[] = ['foodId', 'name', 'rawInput', ...LEGACY_MACRO_FIELDS];
 
-// The exact text this endpoint has always returned for a malformed legacy body.
+/**
+ * The exact text this endpoint has always returned for a body it cannot log,
+ * and the `error` value of TWO verdicts rather than one: the legacy guard's
+ * refusal, and the body that names no shape at all.
+ *
+ * The second is why this constant is worth a comment. A body with no
+ * recognisable field ( `{}`, `[1,2,3]`, `{"somethingElse":1}` ) has earned this
+ * sentence since long before the catalog shape existed, because the shipped
+ * `isValidMacroPayload` guard refused everything that was not a legacy body. It
+ * is also the only one of this parser's refusals a SHIPPED client can still
+ * reach — nothing that predates this release sends `catalogFoodId` — so
+ * replacing the sentence with a machine code would change a live response for
+ * the one caller that cannot have been updated, and a client that renders
+ * `error` verbatim would show a user the literal word `invalid_payload`. The
+ * code travels alongside it instead (§0.3.1 + §0.5.2).
+ *
+ * A more precise sentence for that case ("either catalogFoodId or name,
+ * calories, …") was deliberately dropped: it named the new shape to a caller
+ * that cannot send it, and the machine code plus `details` is what a
+ * catalog-aware client reads.
+ */
 const LEGACY_REQUIRED_MESSAGE = 'name, calories, protein, carbs, and fat are required';
 const CONFLICTING_REFERENCE_MESSAGE = 'foodId and catalogFoodId cannot both be provided';
-const UNRECOGNIZED_MESSAGE = 'either catalogFoodId or name, calories, protein, carbs, and fat are required';
 
 const MIN_SERVINGS = 0.25;
 const MAX_SERVINGS = 10;
@@ -131,6 +167,75 @@ const SERVINGS_SCALE = 10 ** SERVINGS_DECIMALS;
 const SERVINGS_SCALE_TOLERANCE = 1e-9;
 
 const UUID_V4_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+/* ---------------------------------------------------------------------------
+ * The ids the database layer can parse
+ *
+ * `isUuidV4` above is the validation contract for ids this release INTRODUCES
+ * (§0.5.2: "every path id is a UUID v4 (`invalid_id`)"), and it is deliberately
+ * narrower than what the data layer accepts. The legacy diary-entry routes need
+ * the wider grammar, and the difference is a compatibility rule rather than a
+ * preference — see {@link isDatabaseParsableUuid}.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * The 8-4-4-4-12 body, with NO version or variant constraint. Shared by three of
+ * the four accepted forms below so the grammar is written once.
+ */
+const HYPHENATED_UUID_SOURCE = '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}';
+
+/**
+ * Exactly the four textual forms the ORM's UUID parameter parser accepts, in the
+ * order its own parser tries them:
+ *
+ *  1. simple      — 32 hex digits, no separators
+ *  2. hyphenated  — 8-4-4-4-12, any version and variant nibble (a v1 id included)
+ *  3. braced      — `{` + the HYPHENATED form + `}` (braces around the simple
+ *                   form are rejected, because the parser dispatches on length)
+ *  4. urn         — `urn:uuid:` + the HYPHENATED form, lower-case prefix only
+ *                   (`URN:UUID:` and `urn:uuid:` + the simple form are rejected)
+ *
+ * Hex digits are case-insensitive in every form; the literal braces and the URN
+ * prefix are not. Anything outside this union raises Prisma P2023 before the
+ * statement runs, which is the class the routes below answer `400`.
+ */
+const DATABASE_PARSABLE_UUID_PATTERNS: readonly RegExp[] = [
+    /^[0-9a-fA-F]{32}$/,
+    new RegExp(`^${HYPHENATED_UUID_SOURCE}$`),
+    new RegExp(`^\\{${HYPHENATED_UUID_SOURCE}\\}$`),
+    new RegExp(`^urn:uuid:${HYPHENATED_UUID_SOURCE}$`),
+];
+
+/**
+ * Whether the data layer can turn this value into a `uuid` parameter at all.
+ *
+ * The predicate the LEGACY diary-entry path ids are judged by, and the reason it
+ * is not {@link isUuidV4}. An id in any of the four forms above reaches the
+ * query, matches no row and earns the `404` those routes have always answered —
+ * so refusing it with a `400` would change a branch shipped clients act on ("the
+ * entry is gone, drop it from the cache" becomes a generic error), which §0.5.2
+ * forbids: existing contracts change additively only, and §0.5.1 grants
+ * `updateMealEntry` its owner-bearing predicate "with unchanged HTTP semantics".
+ * A v1 id, a 32-hex id, a braced id and a `urn:uuid:` id are all well-formed to
+ * the parser and were all `404`s before this release.
+ *
+ * Everything else is the case the routes used to answer `500` for — an
+ * unparsable id is a syntax error, not a missing row — and turning that into a
+ * typed `400 invalid_request` is the improvement this release keeps.
+ *
+ * Deciding it here, over the request, rather than translating Prisma's P2023 at
+ * the controller is the same reasoning {@link containsNulCharacter} rests on:
+ * `backend-architecture` §9 forbids branching on a vendor's error shape, and a
+ * pure predicate is testable without a database (§11).
+ *
+ * Narrower than PostgreSQL's own `uuid_in`, deliberately: `uuid_in` also accepts
+ * hyphens after any group of four digits (`A0EEBC99-9C0B4EF8-BB6D6BB9-BD380A11`),
+ * but the ORM's parser refuses those before the value ever reaches the server,
+ * and the routes never hand these ids to raw SQL. The grammar that governs is
+ * the one the code path actually uses.
+ */
+export const isDatabaseParsableUuid = (value: unknown): value is string =>
+    typeof value === 'string' && DATABASE_PARSABLE_UUID_PATTERNS.some((pattern) => pattern.test(value));
 
 /**
  * The method a catalog entry stores. `logCatalogMealEntry` stamps it
@@ -193,8 +298,18 @@ const invalidPayload = (message: string, details: LogEntryFieldError[]): LogEntr
     details,
 });
 
-const unrecognizedPayload = (): LogEntryErrorVerdict =>
-    invalidPayload(UNRECOGNIZED_MESSAGE, [{ field: 'body', code: FIELD_ERROR_CODES.UNRECOGNIZED_PAYLOAD }]);
+// Its own verdict code, not `invalid_payload`, because the two are rendered
+// differently: this one keeps the frozen sentence as the response's `error` and
+// carries the machine code beside it (see LEGACY_REQUIRED_MESSAGE), while the
+// conflicting-reference refusal — a body no shipped client can send — spells the
+// code as `error`. The controller's renderer is exhaustive over these codes, so
+// the distinction cannot be lost there.
+const unrecognizedPayload = (): LogEntryErrorVerdict => ({
+    kind: 'error',
+    code: 'unrecognized_payload',
+    message: LEGACY_REQUIRED_MESSAGE,
+    details: [{ field: 'body', code: FIELD_ERROR_CODES.UNRECOGNIZED_PAYLOAD }],
+});
 
 /* ---------------------------------------------------------------------------
  * Storable text
@@ -412,10 +527,19 @@ export const parseLogEntryBody = (body: unknown): ParsedLogEntryBody => {
  * neither the `404` this endpoint owes a well-formed id it does not own nor the
  * `400 invalid_request` the validation contract promises (§0.5.2).
  *
- * v4 specifically, as `grocery.logic.ts` and `plannedMealLog.logic.ts` also
- * read `invalid_id`: `meals.id` and `meal_entries.id` are `gen_random_uuid()`
- * columns, so every id these routes can legitimately be given IS a v4 UUID, and
- * a syntactically valid non-v4 one could only ever have been a 404.
+ * The line between the two answers is {@link isDatabaseParsableUuid} and NOT
+ * `isUuidV4`, and that is the whole compatibility rule of these two parsers.
+ * `meals.id` and `meal_entries.id` are `gen_random_uuid()` columns, so an id
+ * outside v4 can only ever have been a 404 — but it EARNED that 404 by reaching
+ * the query, and a shipped client reads it as "the row is gone". Narrowing these
+ * routes to v4 turned four well-formed forms (a v1 id, an unhyphenated id, a
+ * braced id, a `urn:uuid:` id) from 404 into 400, which §0.5.2 does not sanction
+ * on an existing contract. So the predicate accepts everything the data layer
+ * can parse and refuses only what it cannot — precisely the inputs that used to
+ * answer 500.
+ *
+ * The new meal-planning routes keep the strict v4 rule §0.5.2 states for them;
+ * their parsers live in their own modules and are not affected by this one.
  *
  * The verdicts are the same `LogEntryErrorVerdict` a body failure returns, so
  * the controller renders both through one exhaustive function.
@@ -427,8 +551,8 @@ export type ParsedEntryPath = { kind: 'ok'; entryId: string } | LogEntryErrorVer
 
 /** Validates `:mealId` on `POST /macros/meal/:mealId/entries`, for both body shapes. */
 export const parseMealEntryPath = (params: { mealId?: unknown }): ParsedMealEntryPath => {
-    if (!isUuidV4(params.mealId)) {
-        return invalidRequest(`${MEAL_ID_PATH_FIELD} must be a v4 UUID`, [
+    if (!isDatabaseParsableUuid(params.mealId)) {
+        return invalidRequest(`${MEAL_ID_PATH_FIELD} must be a UUID`, [
             { field: MEAL_ID_PATH_FIELD, code: FIELD_ERROR_CODES.INVALID_ID },
         ]);
     }
@@ -438,8 +562,8 @@ export const parseMealEntryPath = (params: { mealId?: unknown }): ParsedMealEntr
 
 /** Validates `:id` on `PUT` and `DELETE /macros/entry/:id`. */
 export const parseEntryPath = (params: { id?: unknown }): ParsedEntryPath => {
-    if (!isUuidV4(params.id)) {
-        return invalidRequest(`${ENTRY_ID_PATH_FIELD} must be a v4 UUID`, [
+    if (!isDatabaseParsableUuid(params.id)) {
+        return invalidRequest(`${ENTRY_ID_PATH_FIELD} must be a UUID`, [
             { field: ENTRY_ID_PATH_FIELD, code: FIELD_ERROR_CODES.INVALID_ID },
         ]);
     }

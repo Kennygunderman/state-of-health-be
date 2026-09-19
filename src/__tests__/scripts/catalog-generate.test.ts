@@ -53,11 +53,15 @@
  * offline is not those variables being absent: it is that every vendor seam is
  * injected and every model name is passed in as data.
  */
+import os from 'os';
+import path from 'path';
+
 import { prisma } from '../../prisma/client';
 import {
     CATALOG_ALLERGEN_TAGS,
     CATALOG_CHECK_NAMES,
     CATALOG_DIET_TAGS,
+    CatalogArtifactTargetError,
 } from '../../services/catalog.logic';
 import type { CatalogValidationVerdict } from '../../services/catalog.logic';
 import type { EvidenceFetchResult } from '../../services/evidence.service';
@@ -65,12 +69,17 @@ import { OpenRouterError } from '../../services/openrouter.service';
 import type { OpenRouterErrorKind } from '../../services/openrouter.service';
 import {
     CatalogGenerationError,
+    GENERATION_REPORT_DESTINATIONS,
+    GENERATION_REPORT_FILE,
     buildGenerationPlan,
+    describeFailure,
     buildGenerationUserContent,
     generationOutputTokenCeiling,
     generationPromptFingerprint,
     generationPromptIdentity,
     generationPublicationStatus,
+    generationReportDestination,
+    generationReportTarget,
     generationRunScope,
     parseArgs,
     parseGeneratedFoods,
@@ -85,6 +94,7 @@ import type {
     GenerationDeps,
     GenerationEvidenceFetcher,
     GenerationModelClient,
+    GenerationReportDestination,
     GenerationSummary,
 } from '../../../scripts/catalog-generate-ai';
 import {
@@ -290,6 +300,21 @@ interface LoggedLine {
     readonly line: string;
 }
 
+/**
+ * One `writeReport` call as the harness observed it.
+ *
+ * The DESTINATION is captured beside the document because it is the whole of
+ * the dry-run contract: a preview and the committed artefact are the same shape
+ * (`GENERATION_REPORT_DESTINATIONS`), so a case that only read the document
+ * could not tell a run that wrote the evidence from one that wrote a preview —
+ * which is exactly the defect that let `--dry-run` rewrite
+ * `data/meal-planning/reports/latest/import-report.json`.
+ */
+interface Publication {
+    readonly report: unknown;
+    readonly destination: GenerationReportDestination;
+}
+
 interface Harness {
     readonly deps: GenerationDeps;
     readonly budgetLimit: number;
@@ -297,6 +322,8 @@ interface Harness {
     readonly evidenceCalls: readonly EvidenceCall[];
     readonly interactions: readonly Interaction[];
     readonly reports: readonly unknown[];
+    /** Every report this invocation published, with the destination it named. */
+    readonly publications: readonly Publication[];
     readonly lines: readonly LoggedLine[];
     /** Every captured line, parsed. */
     entries(): Record<string, unknown>[];
@@ -500,6 +527,7 @@ const createHarness = (harnessOptions: HarnessOptions = {}): Harness => {
     const evidenceCalls: EvidenceCall[] = [];
     const interactions: Interaction[] = [];
     const reports: unknown[] = [];
+    const publications: Publication[] = [];
     const lines: LoggedLine[] = [];
 
     const openRouter: GenerationModelClient = {
@@ -567,8 +595,9 @@ const createHarness = (harnessOptions: HarnessOptions = {}): Harness => {
         model: MODEL,
         batchSize: harnessOptions.batchSize ?? 1,
         budgetLimit,
-        writeReport: (report) => {
+        writeReport: (report, destination) => {
             reports.push(report);
+            publications.push({ report, destination });
         },
     };
 
@@ -582,6 +611,7 @@ const createHarness = (harnessOptions: HarnessOptions = {}): Harness => {
         evidenceCalls,
         interactions,
         reports,
+        publications,
         lines,
         entries,
         entriesFor: (event) => entries().filter((entry) => entry.event === event),
@@ -2441,6 +2471,100 @@ describe('one run per coverage-plan version', () => {
         expect(await prisma.catalog_import_runs.count()).toBe(0);
         expect(await prisma.catalog_generation_batches.count()).toBe(0);
         expect(dry.modelCalls).toHaveLength(0);
+    });
+});
+
+/* -------------------------------------------------------------------------- *
+ * A DRY RUN DOES NOT WRITE THE COMMITTED EVIDENCE.
+ *
+ * THE DEFECT THESE PIN (CATGEN-dryrun-writes-report). The dry-run branch is
+ * headed "A DRY RUN OPENS NO RUN ROW, MAKES NO MODEL CALL AND WRITES NO
+ * CANDIDATE" and then published its report through the one writer that
+ * read-modify-writes `data/meal-planning/reports/latest/import-report.json`.
+ * QA ran `npm run catalog:generate -- --dry-run` against a clean checkout and
+ * watched the committed artefact's hash move from `7ba8c860…` to `2237329e…`,
+ * dirtying the repository: a preview of a run that had not happened replaced
+ * the record of the run that had, and it did so holding no stage lock, so it
+ * could equally have overwritten the report of a generation running beside it.
+ *
+ * What the fix is, and therefore what these cases assert, is the DESTINATION
+ * contract the sibling import stage already carries: the destination is named
+ * by the caller from the options, a dry run names the preview, and only a real
+ * run names the artefact. The destination is asserted rather than the file,
+ * because `runGeneration` never touches a filesystem — `main()` resolves the
+ * destination to a path — and because a preview and the artefact are the same
+ * document shape, so the destination is the only thing that distinguishes them.
+ * -------------------------------------------------------------------------- */
+
+describe('a dry run previews its report instead of writing the committed artefact', () => {
+    beforeEach(async () => {
+        await truncateFeatureTables();
+    });
+
+    it('names the preview for a dry run and the artefact for every other invocation', () => {
+        expect(generationReportDestination(optionsOf({ dryRun: true }))).toBe('dry_run_preview');
+        expect(generationReportDestination(optionsOf({ dryRun: false }))).toBe('canonical');
+        // The two members are the whole vocabulary: a third destination would
+        // be a third place evidence could land, and it would have to be
+        // reviewed here first.
+        expect([...GENERATION_REPORT_DESTINATIONS]).toEqual(['canonical', 'dry_run_preview']);
+    });
+
+    it('resolves the preview outside the data tree and the artefact inside it', () => {
+        const canonical = generationReportTarget('canonical');
+        const preview = generationReportTarget('dry_run_preview');
+
+        expect(path.basename(canonical)).toBe(GENERATION_REPORT_FILE);
+        expect(canonical).toContain(path.join('data', 'meal-planning', 'reports', 'latest'));
+
+        // Outside the repository entirely, so no preview can be committed, and
+        // per-process, so two operators previewing at once do not overwrite
+        // each other's file.
+        expect(path.dirname(preview)).toBe(os.tmpdir());
+        expect(path.basename(preview)).toBe(`soh-catalog-generate-dry-run-${process.pid}.json`);
+        expect(preview).not.toContain(path.join('data', 'meal-planning'));
+        expect(preview).not.toBe(canonical);
+    });
+
+    it('publishes a dry run`s figures to the preview destination and never to the artefact', async () => {
+        const dry = createHarness({ coveragePlan: narrowedPlan(2), maxBatches: null });
+
+        await runGeneration({ ...dry.deps, options: { ...dry.deps.options, dryRun: true } });
+
+        expect(dry.publications).toHaveLength(1);
+        expect(dry.publications[0].destination).toBe('dry_run_preview');
+        expect(dry.publications.map((entry) => entry.destination)).not.toContain('canonical');
+
+        // The document names itself, because a file copied out of TMPDIR is
+        // otherwise indistinguishable from the evidence.
+        const preview = dry.publications[0].report as {
+            readonly stopReason: string;
+            readonly runId: string | null;
+            readonly reportKind: string;
+            readonly reportKindBasis: string;
+        };
+        expect(preview.reportKind).toBe('dry_run_preview');
+        expect(preview.stopReason).toBe('dry_run');
+        expect(preview.runId).toBeNull();
+        expect(preview.reportKindBasis).toContain('The canonical import-report.json was not touched.');
+
+        // And the run says where the preview went, so the operator who asked
+        // for it can read it.
+        const planned = dry.entriesFor('dry_run_planned');
+        expect(planned).toHaveLength(1);
+        expect(planned[0].previewReport).toBe(generationReportTarget('dry_run_preview'));
+        expect(String(planned[0].note)).toContain('the canonical generation is unaffected');
+    });
+
+    it('publishes a real run`s measurements to the artefact', async () => {
+        const real = createHarness();
+
+        await runGeneration(real.deps);
+
+        expect(real.publications).toHaveLength(1);
+        expect(real.publications[0].destination).toBe('canonical');
+        // A real run reports no preview path, because it wrote no preview.
+        expect(real.entriesFor('dry_run_planned')).toHaveLength(0);
     });
 });
 
@@ -4336,3 +4460,39 @@ describe('the stage`s log lines', () => {
     });
 });
 
+
+/* ---------------------------------------------------------------------------
+ * THE STAGE EDGE (CATREP-artefact-overwrite).
+ *
+ * A refusal to merge into an artefact describing a different database is a
+ * typed error raised deep in the publication path, and this stage maps every
+ * refusal to an operator-facing code exactly once — here. Without this branch
+ * it would be logged as `unexpected_error`, which reads as a defect in the
+ * stage rather than as the operator decision it is: the run addressed a
+ * database the committed evidence was not produced against.
+ * ------------------------------------------------------------------------- */
+describe('describeFailure', () => {
+    it('reports an artefact this run must not overwrite under its own code', () => {
+        const refusal = new CatalogArtifactTargetError(
+            `${GENERATION_REPORT_FILE} records target 1661b5560863 and this run addresses ffeeddccbbaa.`,
+            { file: GENERATION_REPORT_FILE, recordedDigest: '1661b5560863', runDigest: 'ffeeddccbbaa' },
+        );
+
+        const described = describeFailure(refusal);
+
+        expect(described.code).toBe('artefact_target_mismatch');
+        expect(described.error).toEqual({ name: 'CatalogArtifactTargetError', code: 'artefact_target_mismatch' });
+        // What reaches the log is the code and the name, never the rendered
+        // sentence — so the refusal carries no connection string even though
+        // its message names the artefact an operator has to look at.
+        expect(Object.keys(described.error)).not.toContain('message');
+        expect(refusal.message).toContain(GENERATION_REPORT_FILE);
+        expect(refusal.message).not.toContain('postgresql://');
+        expect(refusal.context.file).toBe(GENERATION_REPORT_FILE);
+    });
+
+    it('still reports anything it has no branch for as an unexpected error', () => {
+        expect(describeFailure(new TypeError('cannot read properties of undefined')).code).toBe('unexpected_error');
+        expect(describeFailure('a thrown string').code).toBe('unexpected_error');
+    });
+});

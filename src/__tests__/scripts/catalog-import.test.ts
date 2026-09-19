@@ -40,11 +40,20 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
+// The database-origin guard's value side, for the one arm of this stage's
+// failure reporter that deliberately WITHHOLDS a first-party sentence. Free to
+// import: dbGuard's only dependency is the logger, and its module-load
+// assertion is a no-op when no entry script is being run — under Jest
+// `process.argv[1]` is the runner, which is exactly the case dbGuard.test.ts
+// covers from the other side.
+import { DatabaseOriginError, classifyDatabaseOrigin } from '../../../scripts/lib/dbGuard';
+
 import {
     ALLERGEN_CLASSES,
     ARTIFACT_LOCK_STALE_MS,
     COST_CLASSES,
     COVERAGE_CATEGORIES,
+    COVERAGE_PLAN_FILE,
     FRESHNESS_OBLIGATIONS_FIELD,
     MANIFEST_FOOD_STATES,
     MERGED_REPORT_COMPOUND_BLOCKS,
@@ -85,13 +94,16 @@ import {
     IMPORT_REPORT_FILE,
     IMPORT_REPORT_NOTE_KEY,
     USDA_SOURCE_CACHE_KEY_SCHEME,
+    assertCategoryFiltersDeclared,
     assertManifestMatchesCoveragePlan,
     buildImportPlan,
     buildRefusalBlock,
     buildRequirementHeadroomBlock,
+    buildValidationRecordData,
     checkManifestAgainstCoveragePlan,
     combineImportReportFigures,
     describeFailure,
+    importRecordOutcome,
     importReportDestination,
     importReportTarget,
     importRunScope,
@@ -104,6 +116,8 @@ import {
     runImport,
     sourceCacheKeySchemeDisagreements,
     toBatchRetrieval,
+    undeclaredCategoryFilters,
+    withArtifactTargetIdentity,
     writeImportReport,
 } from '../../../scripts/catalog-import-usda';
 import type {
@@ -120,7 +134,10 @@ import type {
 // the `ScriptLogger` the import stage is handed, and the functions whose
 // redaction contract is what makes handing it anything safe.
 import {
+    UNEXPECTED_FAILURE_REMEDY,
+    classifyInfrastructureFailure,
     createLogger,
+    firstPartyMessage,
     hostOf,
     redactUrlUserinfo,
     safeError,
@@ -204,6 +221,7 @@ import {
     normalizeStageLockWaitMs,
     openOrResumeRun,
     openRun,
+    resolveCounts,
     saveCheckpoint,
     validationRunKeyInputPart,
     withCatalogStageLock,
@@ -257,6 +275,16 @@ import {
 import type { ReportDb, ReportFoodRow, ReportOutcome, ValidationRecordRow } from '../../../scripts/catalog-report';
 import { validateCatalogCandidate } from '../../services/catalog.logic';
 import type { CatalogValidationPolicy } from '../../services/catalog.logic';
+// The artefact-target rule. Its truth table belongs to `catalog.logic.test.ts`;
+// what this file needs are the key names the committed document uses and the
+// error the refusal raises, so the wiring can be pinned without restating the
+// field names as literals.
+import {
+    CATALOG_ARTIFACT_TARGET_DIGEST_FIELD,
+    CATALOG_ARTIFACT_TARGET_IDENTITY_KEY,
+    CatalogArtifactTargetError,
+    catalogArtifactTargetIdentity,
+} from '../../services/catalog.logic';
 import { prisma } from '../../prisma/client';
 // The FORMAT of the vendor-deny log, from the side-effect-free half of that
 // pair. Its installing half (`../setup/vendorNetworkDeny`) is deliberately NOT
@@ -1222,6 +1250,145 @@ describe('the manifest is checked against the coverage plan', () => {
     });
 });
 
+/**
+ * AN UNDECLARED `--category` IS A REFUSAL, NOT A NARROW RUN
+ * (CATIMP-unknown-category-noop).
+ *
+ * WHAT WAS WRONG. The values were collected by `parseArgs` and applied by
+ * membership (`inScope` in `buildImportPlan`), and nothing checked them against
+ * the document that defines the vocabulary. So `--category not_a_category`
+ * matched no manifest entry and no swept record: the whole work list landed
+ * under `skippedCategoryFilter`, the plan held zero batches and the stage
+ * completed — exit 0 on a run that imported nothing, while the two sibling
+ * stages refuse the same typo with `unknown_category` (generation) and
+ * `unknown_category_filter` (reporting).
+ *
+ * The first case below pins the no-op these refusals prevent, so the reason for
+ * the refusal stays visible rather than becoming folklore; the rest pin the
+ * refusal itself and that a DECLARED filter is untouched by it.
+ */
+describe('an undeclared --category is refused rather than run as a no-op', () => {
+    const declaredCategories = coveragePlan.categories.map((row) => row.category as string);
+
+    const sweptRow = (index: number): UsdaFoodSummary => ({
+        fdcId: 950000 + index,
+        description: `Carrots, raw, sample ${index}`,
+        dataType: 'SR Legacy',
+    });
+
+    it('would otherwise plan nothing at all, which is why it cannot be allowed to run', async () => {
+        const listFoods = async (_dataType: string, _pageSize: number, page: number): Promise<UsdaFoodSummary[]> =>
+            page === 1 ? [sweptRow(0), sweptRow(1)] : [];
+
+        const plan = await buildImportPlan(
+            manifest,
+            coveragePlan,
+            listFoods,
+            options({ categories: ['not_a_category'] }),
+            silentLogger,
+        );
+
+        // Nothing to fetch, nothing to write, and a counter that says the
+        // filter refused the entire work list — the honest report of a run an
+        // operator cannot distinguish from a finished import by its exit code.
+        expect(plan.batches).toEqual([]);
+        expect(plan.assignments.size).toBe(0);
+        // Every curated entry plus every swept row this listing offered (two
+        // per sweep), so the counter accounts for the whole work list and not
+        // merely for part of it.
+        expect(plan.skipped.skippedCategoryFilter).toBe(curatedEntries.length + manifest.datasetSweeps.length * 2);
+    });
+
+    it('names every undeclared value and every declared category, sorted', () => {
+        const failure = ((): unknown => {
+            try {
+                assertCategoryFiltersDeclared(coveragePlan, ['not_a_category', 'protein_egg', 'dariy'], silentLogger);
+            } catch (error) {
+                return error;
+            }
+            return null;
+        })();
+
+        expect(failure).toBeInstanceOf(CatalogImportError);
+        expect((failure as CatalogImportError).code).toBe('unknown_category_filter');
+        // The operator's two mistakes in the order they typed them, and the
+        // declared vocabulary they have to choose from — the declared list is
+        // sorted so two runs of the same refusal read identically.
+        expect((failure as CatalogImportError).message).toContain('--category not_a_category, dariy');
+        expect((failure as CatalogImportError).message).toContain([...declaredCategories].sort().join(', '));
+        expect((failure as CatalogImportError).message).toContain(COVERAGE_PLAN_FILE);
+    });
+
+    it('reports the declared vocabulary as fields, because the message never reaches a log', () => {
+        // `safeError` withholds `message` (it is where a URL bearing `api_key=`
+        // would appear), so the code alone reaches the operator's log stream.
+        // The remedy therefore travels as data on a named line of its own.
+        const errors: { event: string; fields?: Record<string, unknown> }[] = [];
+        const recordingLogger: ScriptLogger = {
+            ...silentLogger,
+            error: (event: string, fields?: Record<string, unknown>) => {
+                errors.push({ event, fields });
+            },
+            child: () => recordingLogger,
+        };
+
+        expect(() => assertCategoryFiltersDeclared(coveragePlan, ['not_a_category'], recordingLogger)).toThrow(
+            CatalogImportError,
+        );
+
+        expect(errors).toHaveLength(1);
+        expect(errors[0].event).toBe('unknown_category_filter');
+        expect(errors[0].fields?.undeclaredCategories).toEqual(['not_a_category']);
+        expect(errors[0].fields?.declaredCategories).toEqual([...declaredCategories].sort());
+        expect(String(errors[0].fields?.remedy)).toContain(COVERAGE_PLAN_FILE);
+    });
+
+    it('de-duplicates a value the operator repeated', () => {
+        expect(undeclaredCategoryFilters(coveragePlan, ['dariy', 'dariy', 'protein_egg'])).toEqual(['dariy']);
+    });
+
+    it('passes every declared category, and an empty filter, with no log line', () => {
+        const errors: string[] = [];
+        const recordingLogger: ScriptLogger = {
+            ...silentLogger,
+            error: (event: string) => {
+                errors.push(event);
+            },
+            child: () => recordingLogger,
+        };
+
+        expect(undeclaredCategoryFilters(coveragePlan, declaredCategories)).toEqual([]);
+        expect(undeclaredCategoryFilters(coveragePlan, [])).toEqual([]);
+        // The whole declared vocabulary at once, and the no-filter default a
+        // bare `catalog:import` gets: a gate the shipped plan cannot pass would
+        // make the stage unrunnable.
+        expect(() => assertCategoryFiltersDeclared(coveragePlan, declaredCategories, recordingLogger)).not.toThrow();
+        expect(() => assertCategoryFiltersDeclared(coveragePlan, [], recordingLogger)).not.toThrow();
+        expect(errors).toEqual([]);
+    });
+
+    it('leaves a declared filter planning exactly what it planned before', async () => {
+        const listFoods = async (_dataType: string, _pageSize: number, page: number): Promise<UsdaFoodSummary[]> =>
+            page === 1 ? [sweptRow(0), sweptRow(1)] : [];
+        const wanted = curatedEntries[0].category as string;
+
+        const plan = await buildImportPlan(
+            manifest,
+            coveragePlan,
+            listFoods,
+            options({ categories: [wanted] }),
+            silentLogger,
+        );
+
+        const categoryOf = (assignment: ImportAssignment): string =>
+            assignment.kind === 'curated' ? (assignment.entry.category as string) : (assignment.category as string);
+
+        expect(undeclaredCategoryFilters(coveragePlan, [wanted])).toEqual([]);
+        expect(plan.assignments.size).toBeGreaterThan(0);
+        expect([...plan.assignments.values()].every((assignment) => categoryOf(assignment) === wanted)).toBe(true);
+    });
+});
+
 describe('reviewed allergen and diet metadata (N01)', () => {
     it('gives every curated manifest entry a reviewed safety determination', () => {
         const missing = curatedEntries.filter((entry) => entry.reviewedSafety === undefined);
@@ -1738,6 +1905,150 @@ describe('the import holds a record its own evidence cannot support (SEC3)', () 
 
         expect(verdict.publicationStatus).toBe('published');
         expect(importPublicationStatus(one, verdict)).toBe('candidate');
+    });
+});
+
+/**
+ * THE OUTCOME AND THE STATUS ARE ONE STATEMENT ABOUT ONE RECORD
+ * (VALREP-rejected-outcome-mismatch).
+ *
+ * WHAT WAS WRONG. The import-stage floor — an unclassified category or
+ * incomplete retrieval evidence — decided `catalog_validation_records.outcome`
+ * unconditionally. A row that ALSO failed a reject-tier check was therefore
+ * persisted `publication_status: 'rejected'` with `outcome: 'quarantined'`
+ * beside reject-tier check evidence, which is the self-contradiction the field
+ * exists to avoid: the committed v1 validation report carries 33 of them. It
+ * could not self-heal, because `catalog-validate` re-judges `candidate`,
+ * `published` and `quarantined` rows only.
+ *
+ * THE RULE. `rejected` is final (AAP §0.7.3 makes a reject-tier failure
+ * `rejected` and never publishable); the floor may only downgrade an otherwise
+ * `accepted` verdict to `quarantined`; with no floor the verdict stands.
+ */
+describe('the import-stage floor may downgrade an outcome, never override a rejection', () => {
+    const base = curatedEntries[0] as UsdaManifestFood;
+    const policy: CatalogValidationPolicy = {
+        categories: coveragePlan.categories,
+        validationBounds: coveragePlan.validationBounds,
+    };
+    const fetchedAt = new Date('2026-09-14T08:30:00.000Z');
+    const reviewedAt = new Date('2026-09-14T08:31:00.000Z');
+
+    const soundRecord = (): PreparedCatalogFood =>
+        prepareCatalogFood(detailFor(base), { kind: 'curated', entry: base }, manifest, fetchedAt, {
+            requestedFdcIds: [base.fdcId as number],
+            cacheKey: 'POST /foods?#{"fdcIds":[' + String(base.fdcId) + '],"format":"full"}',
+            responseSha256: 'd'.repeat(64),
+            source: 'import_run',
+            httpStatus: 200,
+            cachedAt: null,
+        });
+
+    /**
+     * The same record with a swept record's unclassified category, which is
+     * what `curatorReviewRequired` means (`!curated && !assignment.classified`).
+     * Overridden rather than re-prepared so the candidate, the checks and the
+     * verdict are held constant and the floor is the only variable.
+     */
+    const heldForReview = (one: PreparedCatalogFood): PreparedCatalogFood => ({
+        ...one,
+        curatorReviewRequired: true,
+    });
+
+    /** A record whose nutrients fail a reject-tier bound: kcal/100 g over the ceiling. */
+    const rejectTier = (one: PreparedCatalogFood): PreparedCatalogFood => ({
+        ...one,
+        candidate: { ...one.candidate, calories: 5000 },
+    });
+
+    const outcomeOf = (one: PreparedCatalogFood): { outcome: unknown; publicationStatus: unknown } => {
+        const verdict = validateCatalogCandidate(one.candidate, policy);
+        const publicationStatus = importPublicationStatus(one, verdict);
+        const record = buildValidationRecordData(one, verdict, publicationStatus, reviewedAt);
+
+        return { outcome: record.outcome, publicationStatus: record.publication_status };
+    };
+
+    it('records a reject-tier failure as rejected even while the curator-review floor holds', () => {
+        const one = heldForReview(rejectTier(soundRecord()));
+        const verdict = validateCatalogCandidate(one.candidate, policy);
+
+        // The premise: the checks really do reject this record, and the status
+        // written for it is `rejected`.
+        expect(verdict.publicationStatus).toBe('rejected');
+        expect(verdict.decidingCheckNames).toContain('kcal_ceiling');
+        expect(importPublicationStatus(one, verdict)).toBe('rejected');
+
+        expect(importRecordOutcome(one, verdict, 'rejected')).toBe('rejected');
+        expect(outcomeOf(one)).toEqual({ outcome: 'rejected', publicationStatus: 'rejected' });
+    });
+
+    it('still downgrades an otherwise accepted verdict to quarantined while the floor holds', () => {
+        const one = heldForReview(soundRecord());
+        const verdict = validateCatalogCandidate(one.candidate, policy);
+
+        // Unchanged behaviour, and the reason the floor exists: an
+        // unclassified food's identity is sound but its category is a
+        // placeholder, so it is held rather than accepted — and it is held as
+        // a `candidate`, which is the status validation re-judges.
+        expect(verdict.outcome).toBe('accepted');
+        expect(importRecordOutcome(one, verdict, 'candidate')).toBe('quarantined');
+        expect(outcomeOf(one)).toEqual({ outcome: 'quarantined', publicationStatus: 'candidate' });
+    });
+
+    it('leaves the verdict alone when no floor holds', () => {
+        const one = soundRecord();
+        const verdict = validateCatalogCandidate(one.candidate, policy);
+
+        expect(importRecordOutcome(one, verdict, 'candidate')).toBe(verdict.outcome);
+        expect(outcomeOf(one)).toEqual({ outcome: 'accepted', publicationStatus: 'candidate' });
+    });
+
+    it('agrees with the status when the evidence floor is the one that holds', () => {
+        // The evidence half of the floor moves the STATUS as well (a record
+        // with no observed retrieval status is quarantined however clean its
+        // numbers), so this pair has always agreed — pinned here so the new
+        // precedence cannot break the case it was already right about.
+        const sound = soundRecord();
+        const one: PreparedCatalogFood = {
+            ...sound,
+            evidence: { ...sound.evidence, http_status: null } as PreparedCatalogFood['evidence'],
+        };
+
+        expect(importEvidenceAssessment(one).complete).toBe(false);
+        expect(outcomeOf(one)).toEqual({ outcome: 'quarantined', publicationStatus: 'quarantined' });
+    });
+
+    it('never writes an outcome its own publication status contradicts', () => {
+        // The invariant, over every combination this stage can produce: a
+        // rejected row reads `rejected`, a quarantined row reads
+        // `quarantined`, and a candidate row reads `accepted` (clean) or
+        // `quarantined` (held) — never `rejected`.
+        const permitted: Record<string, readonly string[]> = {
+            rejected: ['rejected'],
+            quarantined: ['quarantined'],
+            candidate: ['accepted', 'quarantined'],
+        };
+
+        const sound = soundRecord();
+        const noStatus: PreparedCatalogFood = {
+            ...sound,
+            evidence: { ...sound.evidence, http_status: null } as PreparedCatalogFood['evidence'],
+        };
+
+        for (const one of [
+            sound,
+            heldForReview(sound),
+            rejectTier(sound),
+            heldForReview(rejectTier(sound)),
+            noStatus,
+            heldForReview(noStatus),
+            rejectTier(noStatus),
+            heldForReview(rejectTier(noStatus)),
+        ]) {
+            const { outcome, publicationStatus } = outcomeOf(one);
+            expect(permitted[String(publicationStatus)]).toContain(String(outcome));
+        }
     });
 });
 
@@ -2873,6 +3184,189 @@ describe('describeFailure', () => {
         expect(described.code).toBe('rate_limit_misconfigured');
         expect(described.error.name).toBe('RateLimitConfigError');
     });
+
+    /**
+     * THE DATABASE ARM, and the reason this block grew.
+     *
+     * This stage takes a per-user advisory lock through checkpoint.ts's own
+     * `pg` session before it writes a row, so a database that will not accept a
+     * connection fails BEFORE Prisma exists to translate it: what arrives is a
+     * node-postgres `DatabaseError` whose `name` is the literal lower-case
+     * `'error'` and whose `code` is a five-character SQLSTATE. It matched none
+     * of the classes above and `machineCodeOf` dropped the SQLSTATE (its
+     * pattern required a leading letter), so the most ordinary failure an
+     * operator can cause was reported as
+     * `{"code":"unexpected_error","error":{"name":"error"}}` — no class, no
+     * SQLSTATE, no remedy, while every other failure class in this file names
+     * itself. Driven here through `describeFailure` rather than through the
+     * classifier alone, because the defect was in how the two composed.
+     */
+    describe('a database that will not serve the run', () => {
+        const driverFailure = (sqlState: string): Error => {
+            // The shape node-postgres really throws: `name` is `'error'`, the
+            // class name is `DatabaseError`, and the SQLSTATE is on `code`.
+            // A real one is exercised against PostgreSQL by the suites that
+            // hold a connection; what matters here is that this stage's
+            // reporter answers it, and that is decided by these two members.
+            const error = new Error(`connection failure (${sqlState})`);
+            error.name = 'error';
+            (error as unknown as { code: string }).code = sqlState;
+
+            return error;
+        };
+
+        it('names a refused connection rather than reporting a surprise', () => {
+            const described = describeFailure(driverFailure('53300'));
+
+            expect(described.code).toBe('database_unavailable');
+            // The SQLSTATE now survives beside the name, which is the one
+            // machine-readable fact the driver supplied.
+            expect(described.error).toEqual({ name: 'error', code: '53300' });
+            expect(described.detail?.remedy).toContain('DATABASE_URL');
+        });
+
+        it('adds the one thing the shared remedy cannot know: this stage resumes', () => {
+            // The taxonomy lives in logger.ts so every stage answers alike, and
+            // an import is the stage where re-running from zero costs hours of
+            // vendor requests. The clause is appended here, not there.
+            expect(describeFailure(driverFailure('08006')).detail?.remedy).toContain('--resume');
+        });
+
+        it.each([
+            ['3D000', 'database_missing', 'a database that does not exist'],
+            ['28P01', 'database_authentication_failed', 'a rejected password'],
+            ['42P01', 'database_error', 'a target that was never migrated'],
+        ])('reports SQLSTATE %s as %s — %s', (sqlState, expected) => {
+            const described = describeFailure(driverFailure(sqlState));
+
+            expect(described.code).toBe(expected);
+            expect(described.error.code).toBe(sqlState);
+        });
+
+        it('gives the same answer when Prisma is the client that failed', () => {
+            // Two clients reach the same database on this pipeline, and an
+            // operator's fix does not depend on which one noticed.
+            const prismaFailure = new Error('cannot reach database server');
+            prismaFailure.name = 'PrismaClientInitializationError';
+            (prismaFailure as unknown as { code: string }).code = 'P1001';
+
+            expect(describeFailure(prismaFailure).code).toBe('database_unavailable');
+        });
+
+        it('does not file a Prisma query error as infrastructure', () => {
+            // P2002 is a unique-constraint violation: a defect in this stage's
+            // own data or logic wearing a database code. Reporting it under the
+            // one heading an operator reads as "not your code" would send them
+            // to the wrong place, so it stays unclassified.
+            const violation = new Error('unique constraint failed');
+            violation.name = 'PrismaClientKnownRequestError';
+            (violation as unknown as { code: string }).code = 'P2002';
+
+            const described = describeFailure(violation);
+
+            expect(described.code).toBe('unexpected_error');
+            expect(described.detail?.remedy).toBe(UNEXPECTED_FAILURE_REMEDY);
+        });
+
+        it('reports no message on any of them, so the widening cost nothing', () => {
+            // The remedy is fixed prose from this repository and the SQLSTATE is
+            // five characters the driver assigned. Neither is vendor text, and
+            // the driver's own sentence — which quotes the database name — is
+            // still absent.
+            const described = describeFailure(driverFailure('3D000'));
+
+            expect(described.error).not.toHaveProperty('message');
+            expect(JSON.stringify(described)).not.toContain('connection failure');
+        });
+    });
+
+    /**
+     * The arms that forward their OWN sentence, and the one that must not.
+     *
+     * `safeError` carries no `message` because that field is where a request URL
+     * bearing `api_key=` reaches a log. That rule is about text this repository
+     * did not author. A refusal this file composed is the opposite case: it
+     * names the file, the field and the two values that disagree, and none of
+     * that survives in a code — so it travels under its own member, scrubbed
+     * and bounded, at the sites that have already narrowed to a first-party
+     * class. `DatabaseOriginError` is first-party too and is still withheld,
+     * because its sentence is the host and database the guard refused.
+     */
+    describe('the sentences a first-party failure is allowed to carry', () => {
+        it('carries the stage’s own sentence beside its typed context', () => {
+            const described = describeFailure(
+                new CatalogImportError('usda_request_failed', 'batch 12 stopped after 3 attempts', { batchIndex: 12 }),
+            );
+
+            expect(described.detail).toEqual({
+                batchIndex: 12,
+                firstPartyMessage: 'batch 12 stopped after 3 attempts',
+            });
+        });
+
+        it('scrubs that sentence even though this repository wrote it', () => {
+            // The narrowing obligation is not the only defence: a first-party
+            // message can still interpolate a DSN or a key, and this one does.
+            const described = describeFailure(
+                new CatalogImportError('usda_request_failed', `connect to ${DSN_WITH_AT_IN_PASSWORD} failed`),
+            );
+
+            expect(described.detail?.firstPartyMessage).toBe(`connect to ${DSN_REDACTED} failed`);
+            expectNoCredentialFragment(String(described.detail?.firstPartyMessage));
+            // The whole reported object, checked for the fragments that cannot
+            // occur in a field name. `expectNoCredentialFragment` above is the
+            // stricter list and is aimed at the forwarded VALUE, because two of
+            // its fragments are two characters long — `ss` occurs in the key
+            // `firstPartyMessage` itself, so applying it to the rendered
+            // document would assert about this member's name rather than about
+            // the credential.
+            for (const fragment of ['pa@ss', 'user:', ':pa']) {
+                expect(JSON.stringify(described)).not.toContain(fragment);
+            }
+        });
+
+        it('carries a manifest refusal’s sentence, which is the half an operator acts on', () => {
+            const described = describeFailure(
+                new ManifestError(
+                    'version_mismatch',
+                    'data/meal-planning/usda-manifest.v1.json declares v2 and --manifest asked for v1',
+                ),
+            );
+
+            expect(described.detail?.firstPartyMessage).toBe(
+                'data/meal-planning/usda-manifest.v1.json declares v2 and --manifest asked for v1',
+            );
+        });
+
+        it('withholds a database-origin refusal’s sentence, because it names the target', () => {
+            const described = describeFailure(
+                new DatabaseOriginError(
+                    'DATABASE_URL names database "state_of_health" on host "db.example.com"',
+                    'unrecognised_origin',
+                    classifyDatabaseOrigin('postgresql://svc:secret@db.example.com:5432/state_of_health'),
+                ),
+            );
+
+            expect(described.code).toBe('unrecognised_origin');
+            expect(described.detail).toBeUndefined();
+            // dbGuard reports this refusal itself, with the target reduced to a
+            // digest. Forwarding the sentence would publish the topology that
+            // line takes care to withhold.
+            expect(JSON.stringify(described)).not.toContain('db.example.com');
+            expect(JSON.stringify(described)).not.toContain('state_of_health');
+        });
+
+        it('gives a genuinely unclassified failure something to do', () => {
+            // The end of the ladder used to be an empty hand: a code that says
+            // only "we do not know" and a name. It now carries the shared
+            // remedy, which is the same sentence every stage prints there.
+            const described = describeFailure(new TypeError('cannot read properties of undefined'));
+
+            expect(described.code).toBe('unexpected_error');
+            expect(described.detail?.remedy).toBe(UNEXPECTED_FAILURE_REMEDY);
+            expect(described.error).not.toHaveProperty('message');
+        });
+    });
 });
 
 /**
@@ -3446,11 +3940,20 @@ describe('writeImportReport merges into the sibling artefact (§0.7.3)', () => {
     // and the merge removes it instead of carrying it forward.
     const AGGREGATE_ASSERTION_KEY = 'aggregatedAt';
 
+    // The database identity every write now stamps. The merge cases below are
+    // about MERGING, so their fixture records this run's own digest: that is
+    // what an artefact this pipeline published looks like from the first write
+    // onward, and it keeps the target check on its silent path so a warning in
+    // these cases means a merge defect rather than an adoption notice. The
+    // adoption, agreement and refusal paths have their own cases further down.
+    const TEST_TARGET_DIGEST = 'aabbccdd1122';
+
     const existingDocument = (): Record<string, unknown> => ({
         [SIBLING_ONLY_KEY]: 'v1',
         [AGGREGATE_ASSERTION_KEY]: '2026-09-10T00:00:00.000Z',
         producedBy: 'catalog-report.ts',
         [SHARED_KEY]: { inserted: 999 },
+        [CATALOG_ARTIFACT_TARGET_IDENTITY_KEY]: catalogArtifactTargetIdentity(TEST_TARGET_DIGEST),
     });
 
     const warnings: { event: string; fields?: Record<string, unknown> }[] = [];
@@ -3481,7 +3984,7 @@ describe('writeImportReport merges into the sibling artefact (§0.7.3)', () => {
         fs.mkdirSync(path.dirname(target), { recursive: true });
         fs.writeFileSync(target, JSON.stringify(existingDocument(), null, 2), 'utf-8');
 
-        writeImportReport(target, { [SHARED_KEY]: { inserted: 20 }, usdaRequests: { attempts: 1 } }, warnCapturingLogger);
+        writeImportReport(target, { [SHARED_KEY]: { inserted: 20 }, usdaRequests: { attempts: 1 } }, TEST_TARGET_DIGEST, warnCapturingLogger);
         const merged = readTarget();
 
         // The sibling's half is still the sibling's, byte-for-byte.
@@ -3508,7 +4011,7 @@ describe('writeImportReport merges into the sibling artefact (§0.7.3)', () => {
         fs.mkdirSync(path.dirname(target), { recursive: true });
         fs.writeFileSync(target, JSON.stringify(existingDocument(), null, 2), 'utf-8');
 
-        writeImportReport(target, { [SHARED_KEY]: { inserted: 20 } }, warnCapturingLogger);
+        writeImportReport(target, { [SHARED_KEY]: { inserted: 20 } }, TEST_TARGET_DIGEST, warnCapturingLogger);
         const note = readTarget()[IMPORT_REPORT_NOTE_KEY] as Record<string, unknown>;
 
         expect(note.mergedIntoExisting).toBe(true);
@@ -3534,7 +4037,7 @@ describe('writeImportReport merges into the sibling artefact (§0.7.3)', () => {
     it('creates the document, and its directory, when no sibling has written one', () => {
         expect(fs.existsSync(target)).toBe(false);
 
-        writeImportReport(target, { [SHARED_KEY]: { inserted: 0 } }, warnCapturingLogger);
+        writeImportReport(target, { [SHARED_KEY]: { inserted: 0 } }, TEST_TARGET_DIGEST, warnCapturingLogger);
         const written = readTarget();
         const note = written[IMPORT_REPORT_NOTE_KEY] as Record<string, unknown>;
 
@@ -3550,7 +4053,7 @@ describe('writeImportReport merges into the sibling artefact (§0.7.3)', () => {
         fs.mkdirSync(path.dirname(target), { recursive: true });
         fs.writeFileSync(target, '{"counts": {"inserted": 2', 'utf-8');
 
-        writeImportReport(target, { [SHARED_KEY]: { inserted: 20 } }, warnCapturingLogger);
+        writeImportReport(target, { [SHARED_KEY]: { inserted: 20 } }, TEST_TARGET_DIGEST, warnCapturingLogger);
         const written = readTarget();
 
         // The work is already committed to the database by the time the report
@@ -3568,7 +4071,7 @@ describe('writeImportReport merges into the sibling artefact (§0.7.3)', () => {
         fs.mkdirSync(path.dirname(target), { recursive: true });
         fs.writeFileSync(target, JSON.stringify([{ counts: { inserted: 2 } }]), 'utf-8');
 
-        writeImportReport(target, { [SHARED_KEY]: { inserted: 20 } }, warnCapturingLogger);
+        writeImportReport(target, { [SHARED_KEY]: { inserted: 20 } }, TEST_TARGET_DIGEST, warnCapturingLogger);
         const written = readTarget();
         const note = written[IMPORT_REPORT_NOTE_KEY] as Record<string, unknown>;
 
@@ -3583,7 +4086,7 @@ describe('writeImportReport merges into the sibling artefact (§0.7.3)', () => {
     });
 
     it('writes a trailing newline so the artefact stays a well-formed text file', () => {
-        writeImportReport(target, { [SHARED_KEY]: { inserted: 0 } }, warnCapturingLogger);
+        writeImportReport(target, { [SHARED_KEY]: { inserted: 0 } }, TEST_TARGET_DIGEST, warnCapturingLogger);
 
         // The committed artefact ends in a newline; a write that dropped it
         // would show as a whole-file diff on every import.
@@ -3607,6 +4110,12 @@ describe('writeImportReport merges into the sibling artefact (§0.7.3)', () => {
                         basisAtGeneration: 'what the generation run merged',
                     },
                     failuresByCheck: { generationStage: { reject: { brand_pattern_name: 3 } } },
+                    // The sibling stage that wrote this document stamped the
+                    // database it addressed, as every stage now does; carrying
+                    // it keeps this case about compound-block merging rather
+                    // than about the adoption of an unstamped artefact, which
+                    // has its own cases below.
+                    [CATALOG_ARTIFACT_TARGET_IDENTITY_KEY]: catalogArtifactTargetIdentity(TEST_TARGET_DIGEST),
                 },
                 null,
                 2,
@@ -3620,6 +4129,7 @@ describe('writeImportReport merges into the sibling artefact (§0.7.3)', () => {
                 duplicatesRemoved: { skippedDuplicateInPlanAtImport: 4, basisAtImport: 'what this import skipped' },
                 failuresByCheck: { importStage: { reject: {}, quarantine: {}, review: {} } },
             },
+            TEST_TARGET_DIGEST,
             warnCapturingLogger,
         );
         const merged = readTarget();
@@ -3660,7 +4170,7 @@ describe('writeImportReport merges into the sibling artefact (§0.7.3)', () => {
         }) as typeof fs.renameSync);
 
         try {
-            writeImportReport(target, { counts: { inserted: 20 } }, warnCapturingLogger);
+            writeImportReport(target, { counts: { inserted: 20 } }, TEST_TARGET_DIGEST, warnCapturingLogger);
         } finally {
             renameSpy.mockRestore();
         }
@@ -3691,7 +4201,7 @@ describe('writeImportReport merges into the sibling artefact (§0.7.3)', () => {
             // the evidence.
             const failure = (() => {
                 try {
-                    writeImportReport(target, { counts: { inserted: 20 } }, warnCapturingLogger);
+                    writeImportReport(target, { counts: { inserted: 20 } }, TEST_TARGET_DIGEST, warnCapturingLogger);
                     return null;
                 } catch (error) {
                     return error;
@@ -3706,6 +4216,204 @@ describe('writeImportReport merges into the sibling artefact (§0.7.3)', () => {
         } finally {
             held.release();
         }
+    });
+});
+
+/**
+ * WHICH DATABASE THE ARTEFACT DESCRIBES (§0.7.3, §0.9.3).
+ *
+ * `import-report.json` is merged into by three stages, and because the merge
+ * PRESERVES the keys a write does not supply, an import pointed at a second
+ * database used to fold its own counters into a document describing the first
+ * — leaving an artefact whose two halves came from two catalogs with nothing on
+ * its face saying so. Every write now records the digest of the database it
+ * addressed, and a write whose digest disagrees with the one on disk is
+ * refused rather than merged.
+ *
+ * The decision itself is pure and lives in `src/services/catalog.logic.ts`,
+ * where `catalog.logic.test.ts` owns its truth table. What these cases pin is
+ * the WIRING: that this stage asks before it merges, that the refusal leaves
+ * the file byte-identical, that the identity it stamps is the origin's own, and
+ * that stamping it did not make the artefact non-deterministic.
+ */
+describe('writeImportReport records and checks the database the artefact describes (§0.7.3)', () => {
+    const RUN_DIGEST = 'aabbccdd1122';
+    const OTHER_DIGEST = 'ffeeddccbbaa';
+
+    let workspace: string;
+    let target: string;
+    const events: { level: 'info' | 'warn'; event: string; fields?: Record<string, unknown> }[] = [];
+    const recordingLogger: ScriptLogger = {
+        debug: () => undefined,
+        info: (event: string, fields?: Record<string, unknown>) => {
+            events.push({ level: 'info', event, fields });
+        },
+        warn: (event: string, fields?: Record<string, unknown>) => {
+            events.push({ level: 'warn', event, fields });
+        },
+        error: () => undefined,
+        child: () => recordingLogger,
+    };
+
+    const identityBlock = (): Record<string, unknown> =>
+        (JSON.parse(fs.readFileSync(target, 'utf-8')) as Record<string, unknown>)[
+            CATALOG_ARTIFACT_TARGET_IDENTITY_KEY
+        ] as Record<string, unknown>;
+
+    const eventNames = (name: string): Record<string, unknown>[] =>
+        events.filter((entry) => entry.event === name).map((entry) => entry.fields ?? {});
+
+    beforeEach(() => {
+        workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'soh-import-target-'));
+        target = path.join(workspace, 'import-report.json');
+        events.length = 0;
+    });
+
+    afterEach(() => {
+        fs.rmSync(workspace, { recursive: true, force: true });
+    });
+
+    it('stamps the digest of the database it wrote against, on a first write', () => {
+        writeImportReport(target, { counts: { inserted: 3 } }, RUN_DIGEST, recordingLogger);
+
+        const identity = identityBlock();
+        expect(identity[CATALOG_ARTIFACT_TARGET_DIGEST_FIELD]).toBe(RUN_DIGEST);
+        // The basis travels with the value: a reader of the committed file has
+        // to know what the digest is of, and that it discloses no host name.
+        expect(String(identity.digestBasis)).toContain('one-way digest');
+        // A first write has no recorded identity to disagree with, so it is
+        // reported as such rather than as an adoption — and quietly.
+        const checked = eventNames('artefact_target_checked');
+        expect(checked).toHaveLength(1);
+        expect(checked[0]?.verdict).toBe('first_write');
+        expect(checked[0]?.recordedDigest).toBe('none');
+        expect(eventNames('artefact_target_adopted')).toEqual([]);
+    });
+
+    it('adopts an artefact that records no identity, and warns rather than refusing', () => {
+        // Exactly the committed v1 artefact's shape: published before the field
+        // existed. Refusing it would make the field impossible to introduce.
+        fs.writeFileSync(target, `${JSON.stringify({ catalogRelease: 'v1', counts: { inserted: 1 } }, null, 2)}\n`, 'utf-8');
+
+        writeImportReport(target, { counts: { inserted: 3 } }, RUN_DIGEST, recordingLogger);
+
+        const adopted = eventNames('artefact_target_adopted');
+        expect(adopted).toHaveLength(1);
+        expect(adopted[0]?.verdict).toBe('adopted');
+        expect(adopted[0]?.recordedDigest).toBe('none');
+        expect(adopted[0]?.targetDigest).toBe(RUN_DIGEST);
+        expect(String(adopted[0]?.basis)).toContain('adopted rather than refused');
+        // The write went through, the sibling's key survived, and the document
+        // now carries an identity — so the NEXT write against another database
+        // is refused instead of merged.
+        const written = JSON.parse(fs.readFileSync(target, 'utf-8')) as Record<string, unknown>;
+        expect(written.catalogRelease).toBe('v1');
+        expect(written.counts).toEqual({ inserted: 3 });
+        expect(identityBlock()[CATALOG_ARTIFACT_TARGET_DIGEST_FIELD]).toBe(RUN_DIGEST);
+    });
+
+    it('merges without a warning when the artefact already records this run\u2019s database', () => {
+        writeImportReport(target, { counts: { inserted: 1 } }, RUN_DIGEST, recordingLogger);
+        events.length = 0;
+
+        writeImportReport(target, { counts: { inserted: 3 } }, RUN_DIGEST, recordingLogger);
+
+        const checked = eventNames('artefact_target_checked');
+        expect(checked).toHaveLength(1);
+        expect(checked[0]?.verdict).toBe('agrees');
+        expect(checked[0]?.recordedDigest).toBe(RUN_DIGEST);
+        expect(eventNames('artefact_target_adopted')).toEqual([]);
+        expect(events.filter((entry) => entry.level === 'warn')).toEqual([]);
+    });
+
+    it('refuses an artefact describing a different database, and leaves it byte-identical', () => {
+        writeImportReport(target, { counts: { inserted: 1 }, catalogRelease: 'v1' }, OTHER_DIGEST, recordingLogger);
+        const before = fs.readFileSync(target);
+        events.length = 0;
+
+        const failure = (() => {
+            try {
+                writeImportReport(target, { counts: { inserted: 3 } }, RUN_DIGEST, recordingLogger);
+                return null;
+            } catch (error) {
+                return error;
+            }
+        })();
+
+        expect(failure).toBeInstanceOf(CatalogArtifactTargetError);
+        const refusal = failure as CatalogArtifactTargetError;
+        expect(refusal.code).toBe('artefact_target_mismatch');
+        // The remedy is in the message, and the file name is the only path-like
+        // value in it: an absolute path is environment, and the URL is a secret.
+        expect(refusal.message).toContain('nothing was written');
+        expect(refusal.message).toContain('catalog:report --out');
+        expect(refusal.context.file).toBe('import-report.json');
+        expect(refusal.context.recordedDigest).toBe(OTHER_DIGEST);
+        expect(refusal.context.runDigest).toBe(RUN_DIGEST);
+        // NOT "the counters are unchanged" — the whole file, byte for byte.
+        // A refusal that rewrote the document differently would still have
+        // corrupted the evidence it claims to have protected.
+        expect(fs.readFileSync(target).equals(before)).toBe(true);
+        // And the refusal is reported under its own code, so an operator reads
+        // "which database did I mean" rather than a defect report.
+        expect(describeFailure(refusal).code).toBe('artefact_target_mismatch');
+        expect(describeFailure(refusal).error.name).toBe('CatalogArtifactTargetError');
+    });
+
+    it('adds no per-write value to the artefact, so reruns stay byte-identical', () => {
+        const report = { counts: { inserted: 3 }, usdaRequests: { attempts: 7 } };
+        const snapshots: Buffer[] = [];
+        for (let write = 0; write < 3; write += 1) {
+            writeImportReport(target, report, RUN_DIGEST, recordingLogger);
+            snapshots.push(fs.readFileSync(target));
+        }
+
+        // The property that matters: STEADY STATE is byte-stable. Recording the
+        // target identity must not make an artefact differ between two runs
+        // that read the same catalog, because the release reconciliation
+        // compares the committed file against a fresh one.
+        expect(snapshots[1]?.equals(snapshots[2] ?? Buffer.alloc(0))).toBe(true);
+
+        // The identity block itself is identical from the FIRST write onward:
+        // it carries the digest and its basis, and deliberately no verdict and
+        // no clock (catalog.logic.ts catalogArtifactTargetIdentity explains
+        // why — the verdict is a property of the write, not of the target, and
+        // it is reported in the run log instead).
+        const identityOf = (snapshot: Buffer): unknown =>
+            (JSON.parse(snapshot.toString('utf-8')) as Record<string, unknown>)[CATALOG_ARTIFACT_TARGET_IDENTITY_KEY];
+        expect(identityOf(snapshots[0] ?? Buffer.alloc(0))).toEqual(identityOf(snapshots[1] ?? Buffer.alloc(0)));
+        expect(identityOf(snapshots[1] ?? Buffer.alloc(0))).toEqual(identityOf(snapshots[2] ?? Buffer.alloc(0)));
+
+        // A first write DOES differ from the writes after it, in exactly one
+        // pre-existing field of the merge note and nowhere else: it created the
+        // document rather than merging into one. Pinned rather than glossed
+        // over, so a future non-determinism cannot hide behind it.
+        const noteOf = (snapshot: Buffer): Record<string, unknown> =>
+            (JSON.parse(snapshot.toString('utf-8')) as Record<string, unknown>)[
+                IMPORT_REPORT_NOTE_KEY
+            ] as Record<string, unknown>;
+        expect(noteOf(snapshots[0] ?? Buffer.alloc(0)).mergedIntoExisting).toBe(false);
+        expect(noteOf(snapshots[1] ?? Buffer.alloc(0)).mergedIntoExisting).toBe(true);
+        const withoutNote = (snapshot: Buffer): Record<string, unknown> => {
+            const document = JSON.parse(snapshot.toString('utf-8')) as Record<string, unknown>;
+            delete document[IMPORT_REPORT_NOTE_KEY];
+            return document;
+        };
+        expect(withoutNote(snapshots[0] ?? Buffer.alloc(0))).toEqual(withoutNote(snapshots[1] ?? Buffer.alloc(0)));
+    });
+
+    it('stamps the preview destination too, so two previews can be told apart', () => {
+        // The preview is disposable, but "which database did this preview read"
+        // is the first question an operator comparing two of them has.
+        const preview = path.join(workspace, 'preview.json');
+        fs.writeFileSync(preview, JSON.stringify(withArtifactTargetIdentity({ reportKind: 'dry_run_preview' }, RUN_DIGEST)), 'utf-8');
+
+        const identity = (JSON.parse(fs.readFileSync(preview, 'utf-8')) as Record<string, unknown>)[
+            CATALOG_ARTIFACT_TARGET_IDENTITY_KEY
+        ] as Record<string, unknown>;
+
+        expect(identity[CATALOG_ARTIFACT_TARGET_DIGEST_FIELD]).toBe(RUN_DIGEST);
+        expect(String(identity.digestBasis)).toContain('same database');
     });
 });
 
@@ -5722,6 +6430,287 @@ describe('the redaction contract of the script logger', () => {
 
         it('still redacts a DSN stored under a credential-bearing name', () => {
             expect(scrubSecrets('password=postgresql://u:p@h/db')).toBe(`password=${REDACTED}`);
+        });
+    });
+
+    /**
+     * THE ONE EXEMPTION IN THE OPAQUE-RUN RULE.
+     *
+     * `/` is a base64 character, so a repository-relative data path is the same
+     * shape as a key body. The rule redacted the middle of one:
+     * `data/meal-planning/catalog/releases/v9005/manifest.json` contains the
+     * 40-character run `planning/catalog/releases/v9005/manifest` and printed as
+     * `data/meal-***.json` — inside the preflight gap message whose entire
+     * purpose is to name the manifest an operator must produce. The shipped `v1`
+     * release sits one character under the threshold, which is why the defect
+     * was invisible until a release id grew.
+     *
+     * These cases hold BOTH halves of that trade at once: the paths must come
+     * back whole, and every credential shape must still be destroyed. A failure
+     * in the first group is the diagnostic defect returning; a failure in the
+     * second is a leak, and is the reason each secret shape is pinned here
+     * rather than assumed to be covered by the rules above.
+     */
+    describe('scrubSecrets — the opaque-run rule and the paths it must not eat', () => {
+        it.each([
+            ['the manifest path whose release id crosses the threshold', 'data/meal-planning/catalog/releases/v9005/manifest.json'],
+            ['the shipped release, which sat just under it', 'data/meal-planning/catalog/releases/v1/manifest.json'],
+            ['a jsonl artefact in the same directory', 'data/meal-planning/catalog/releases/v9005/validation-records.jsonl'],
+            ['the directory itself, named with a trailing separator', 'data/meal-planning/catalog/releases/v90051234/'],
+            ['a deep artefact path well past 40 characters', 'data/meal-planning/catalog/releases/v9005/validation/records/part0001'],
+            ['a report path', 'data/meal-planning/reports/latest/import-report.json'],
+        ])('prints %s whole', (_label, value) => {
+            expect(scrubSecrets(value)).toBe(value);
+        });
+
+        it('prints the path inside the sentence that carries it, which is where it was lost', () => {
+            const sentence =
+                'data/meal-planning/catalog/releases/v9005/manifest.json must load and declare the coverage-plan version this build understands.';
+
+            expect(scrubSecrets(sentence)).toBe(sentence);
+        });
+
+        it.each([
+            ['a base64 service account, the credential this rule exists for', Buffer.from(JSON.stringify({ type: 'service_account', private_key: 'MIIEvQIBADANBg' })).toString('base64')],
+            ['a key body lifted out of its PEM markers', 'AAAAB3NzaC1yc2EAAAADAQABAAABgQDQ2b8kZ9s4mVpN7xQ1TmVtYWxwbGFubmluZw=='],
+            ['an opaque mixed-case token', 'sk0rZq8LmNpQ7vXt2WyE4RbA9cUfHjKdSgTn6MoP1iYl3ZbCxVeQwAsD5fGhJkLm'],
+            ['a full SHA-256 digest, which this rule has always hidden', 'a'.repeat(64)],
+            ['a long run with no separator at all', 'abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz'],
+            ['a slashed run with one uppercase segment', `aGVsbG8/d29ybGQ/${'abcdefghijklmnopqrstuvwxyz'.repeat(2)}`],
+            ['a slashed run carrying base64 padding', 'abcdefghijklmnop/qrstuvwxyzabcdefg/hijklmnopqrstuvwxyzab=='],
+            ['a slashed run carrying a base64 plus', 'abcdefghijklmnop/qrstuvwxyz+bcdefg/hijklmnopqrstuvwxyzab'],
+            ['a run with only one separator', `abcdefghijklmnopqrst/${'uvwxyzabcdefghij'.repeat(2)}`],
+            ['a run with a segment longer than any path this repository writes', `data/${'a'.repeat(33)}/releases/manifest`],
+        ])('still destroys %s', (_label, value) => {
+            expect(scrubSecrets(value)).not.toContain(value.slice(0, 40));
+            expect(scrubSecrets(value)).toContain(REDACTED);
+        });
+
+        it('is a fixed point on both outcomes, which is what the rule list requires of every entry', () => {
+            const path = 'data/meal-planning/catalog/releases/v9005/manifest.json';
+            const secret = 'AAAAB3NzaC1yc2EAAAADAQABAAABgQDQ2b8kZ9s4mVpN7xQ1TmVtYWxwbGFubmluZw==';
+
+            expect(scrubSecrets(scrubSecrets(path))).toBe(scrubSecrets(path));
+            expect(scrubSecrets(scrubSecrets(secret))).toBe(scrubSecrets(secret));
+        });
+
+        it('exempts a path without weakening the rules that run before it', () => {
+            // The exemption is decided per RUN, not per string, so a line that
+            // carries both a path and a credential keeps the first and loses the
+            // second.
+            const line = `loading data/meal-planning/catalog/releases/v9005/manifest.json from ${DSN_WITH_AT_IN_PASSWORD} with USDA_API_KEY=abc123`;
+            const scrubbed = scrubSecrets(line);
+
+            expect(scrubbed).toContain('data/meal-planning/catalog/releases/v9005/manifest.json');
+            expect(scrubbed).toContain(DSN_REDACTED);
+            expect(scrubbed).toContain(`USDA_API_KEY=${REDACTED}`);
+            expectNoCredentialFragment(scrubbed);
+        });
+    });
+});
+
+/**
+ * THE FAILURE TAXONOMY THE STAGES SHARE.
+ *
+ * Every stage in `scripts/` ends in the same `describeFailure` and the same
+ * top-level catch, and each of them mapped anything outside its own error
+ * classes to `unexpected_error`. A database that will not accept a connection
+ * is not an unexpected error: it is the most ordinary failure a stage has, it
+ * arrives BEFORE any Prisma client exists (the stage advisory lock is taken
+ * through checkpoint.ts's own `pg` session), and node-postgres names it
+ * `'error'` — so with its SQLSTATE dropped a refusal read
+ * `{"code":"unexpected_error","error":{"name":"error"}}` and told an operator
+ * nothing at all.
+ *
+ * These cases pin the two halves of the repair that live in logger.ts: the
+ * SQLSTATE now survives into the closed field set, and the classification is
+ * shared so five stages cannot disagree about the same code. What they must
+ * NOT show is a `message` — the closed field set is the disclosure boundary,
+ * and the sentence is forwarded only by `firstPartyMessage`, under the
+ * narrowing obligation tested below.
+ */
+describe('the failure taxonomy the script stages share', () => {
+    const withCode = (code: string, name = 'error'): Error => {
+        const error = new Error('boom');
+        error.name = name;
+        (error as unknown as { code: string }).code = code;
+
+        return error;
+    };
+
+    describe('safeError — the database codes it used to drop', () => {
+        it.each(['53300', '08006', '3D000', '28P01', '57P03', '42P01'])(
+            'reports SQLSTATE %s, which is digit-leading and used to fail the code pattern',
+            (sqlState) => {
+                expect(safeError(withCode(sqlState))).toEqual({ name: 'error', code: sqlState });
+            },
+        );
+
+        it('still reports a Prisma code and a Node errno, which always passed', () => {
+            expect(safeError(withCode('P2002', 'PrismaClientKnownRequestError'))).toEqual({
+                name: 'PrismaClientKnownRequestError',
+                code: 'P2002',
+            });
+            expect(safeError(withCode('ENOENT'))).toEqual({ name: 'error', code: 'ENOENT' });
+        });
+
+        it('reports no message, which is the whole point of the closed field set', () => {
+            const described = safeError(withCode('53300'));
+
+            expect(described).not.toHaveProperty('message');
+            expect(JSON.stringify(described)).not.toContain('boom');
+        });
+
+        it.each([
+            ['a code that is really a sentence', 'connection to server at "db" failed'],
+            ['a code that is really a path', '/var/run/postgresql/.s.PGSQL.5432'],
+            ['a four-character near-miss', '5330'],
+            ['a six-character near-miss', '533000'],
+            ['a lower-case five-character value', '53p03'],
+        ])('drops %s, because the widening is a shape and not a free pass', (_label, code) => {
+            expect(safeError(withCode(code))).toEqual({ name: 'error' });
+        });
+    });
+
+    describe('classifyInfrastructureFailure', () => {
+        it.each([
+            ['53300', 'database_unavailable', 'a role or server at its connection limit'],
+            ['53100', 'database_unavailable', 'a full disk'],
+            ['08006', 'database_unavailable', 'a connection that failed'],
+            ['08P01', 'database_unavailable', 'a protocol violation'],
+            ['57P03', 'database_unavailable', 'a server not yet accepting connections'],
+            ['57P04', 'database_unavailable', 'a database dropped under the run'],
+            ['3D000', 'database_missing', 'a database that does not exist'],
+            ['28P01', 'database_authentication_failed', 'a rejected password'],
+            ['28000', 'database_authentication_failed', 'a rejected authorization'],
+            ['42P01', 'database_error', 'an unmigrated target'],
+            ['42501', 'database_error', 'an under-granted role'],
+        ])('names %s as %s — %s', (code, expected) => {
+            expect(classifyInfrastructureFailure(withCode(code))?.code).toBe(expected);
+        });
+
+        it.each([
+            ['P1001', 'database_unavailable'],
+            ['P1002', 'database_unavailable'],
+            ['P1017', 'database_unavailable'],
+            ['P1003', 'database_missing'],
+            ['P1000', 'database_authentication_failed'],
+            ['P1010', 'database_authentication_failed'],
+        ])('gives Prisma %s the same name, so the answer does not depend on which client failed', (code, expected) => {
+            expect(classifyInfrastructureFailure(withCode(code, 'PrismaClientInitializationError'))?.code).toBe(
+                expected,
+            );
+        });
+
+        it.each(['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'ENOTFOUND', 'EHOSTUNREACH', 'EAI_AGAIN'])(
+            'names %s as unreachable, which is the same operator answer as SQLSTATE class 08',
+            (errno) => {
+                expect(classifyInfrastructureFailure(withCode(errno))?.code).toBe('database_unavailable');
+            },
+        );
+
+        it('carries a fixed remedy that names DATABASE_URL and no value of it', () => {
+            const classified = classifyInfrastructureFailure(withCode('3D000'));
+
+            expect(classified?.remedy).toContain('DATABASE_URL');
+            expect(classified?.remedy).toContain('does not exist');
+            // Nothing interpolated from the failure, so no driver or vendor text
+            // can reach a log line through this field.
+            expect(classified?.remedy).not.toContain('boom');
+            expect(classified?.remedy).toBe(classifyInfrastructureFailure(withCode('3D000'))?.remedy);
+        });
+
+        it('gives each name its own remedy, because the four fixes have nothing in common', () => {
+            const remedies = ['53300', '3D000', '28P01', '42P01'].map(
+                (code) => classifyInfrastructureFailure(withCode(code))?.remedy,
+            );
+
+            expect(new Set(remedies).size).toBe(4);
+        });
+
+        it('declines a Prisma query error, which is a stage defect wearing a database code', () => {
+            // P2002 is a unique-constraint violation. Filing it as
+            // infrastructure would put a data or logic bug under the one heading
+            // an operator reads as "not your code".
+            expect(classifyInfrastructureFailure(withCode('P2002', 'PrismaClientKnownRequestError'))).toBeNull();
+            expect(classifyInfrastructureFailure(withCode('P2025', 'PrismaClientKnownRequestError'))).toBeNull();
+        });
+
+        it.each([
+            ['a filesystem failure', withCode('ENOENT')],
+            ['a programming mistake', new TypeError('cannot read properties of undefined')],
+            ['an error with no code at all', new Error('boom')],
+            ['a thrown string', 'something went wrong'],
+            ['a thrown undefined', undefined],
+            ['a thrown null', null],
+        ])('declines %s, leaving it to the caller’s own arms', (_label, value) => {
+            expect(classifyInfrastructureFailure(value)).toBeNull();
+        });
+
+        it('is total on a hostile value, because it runs inside the handler that reports failures', () => {
+            // A getter that throws and a proxy whose traps throw are the two ways
+            // to make inspection fail. An exception raised while classifying a
+            // failure would replace the failure being reported.
+            const throwingGetter = {
+                get code(): string {
+                    throw new Error('getter ran');
+                },
+            };
+            const hostileProxy = new Proxy(
+                {},
+                {
+                    get(): never {
+                        throw new Error('trap ran');
+                    },
+                },
+            );
+
+            expect(classifyInfrastructureFailure(throwingGetter)).toBeNull();
+            expect(classifyInfrastructureFailure(hostileProxy)).toBeNull();
+        });
+    });
+
+    describe('firstPartyMessage', () => {
+        it('forwards a sentence this repository composed', () => {
+            const message = 'release v9005 declares 12 foods and foods.jsonl holds 11';
+
+            expect(firstPartyMessage(new Error(message))).toBe(message);
+        });
+
+        it('keeps the data path in it, which is the half an operator acts on', () => {
+            const message =
+                'data/meal-planning/catalog/releases/v9005/manifest.json must load and declare the coverage-plan version this build understands.';
+
+            expect(firstPartyMessage(new Error(message))).toBe(message);
+        });
+
+        it('still scrubs the message, so the narrowing obligation is not the only defence', () => {
+            const forwarded = firstPartyMessage(new Error(`connect to ${DSN_WITH_AT_IN_PASSWORD} failed`));
+
+            expect(forwarded).toBe(`connect to ${DSN_REDACTED} failed`);
+            expectNoCredentialFragment(forwarded ?? '');
+        });
+
+        it('bounds the sentence, so one line stays one line', () => {
+            const long = `${'refusal '.repeat(400)}end`;
+            const forwarded = firstPartyMessage(new Error(long));
+
+            expect(long.length).toBeGreaterThan(1000);
+            expect(forwarded).toHaveLength(1001);
+            expect(forwarded?.endsWith('…')).toBe(true);
+        });
+
+        it.each([
+            ['an empty message', new Error('')],
+            ['a thrown string', 'boom'],
+            ['a thrown undefined', undefined],
+            ['a value whose message getter throws', {
+                get message(): string {
+                    throw new Error('getter ran');
+                },
+            }],
+        ])('returns undefined for %s, so an absent member stays absent', (_label, value) => {
+            expect(firstPartyMessage(value)).toBeUndefined();
         });
     });
 });
@@ -8735,6 +9724,93 @@ describe('the checkpoint writes a cursor and its counts together', () => {
         // makes merging an attempt's ABSOLUTE totals into it a double-count.
         expect(merged).toMatchObject({ inserted: 5, updated: 1 });
         expect((await runRow(run.id)).cursor).toEqual({ at: 2 });
+    });
+
+    /**
+     * THE ONE SHAPE ADDITION CANNOT EXPRESS (CATIMP-additive-run-counters).
+     *
+     * A resume whose saved cursor belongs to a different plan restarts from the
+     * beginning, so the abandoned attempt's totals describe records this
+     * attempt is about to redo. Merged, they overstate every figure an operator
+     * reads off the row — QA measured `candidates` at twice the row count with
+     * `inserted` and `updated` each equal to it — and the previous plan's own
+     * `skipped*` keys linger beside the new plan's.
+     */
+    it('replaces the row’s counts when this attempt abandoned what the last one measured', async () => {
+        const run = await openScope(`${SCOPE}:replace`);
+        await saveCheckpoint(prisma, run.id, {
+            cursor: { at: 4 },
+            counts: { planned: 90, inserted: 40, updated: 40, skippedRuleOfTheOldPlan: 7 },
+        });
+
+        const restarted = await saveCheckpoint(prisma, run.id, {
+            cursor: { at: 0 },
+            counts: { planned: 12, inserted: 0, updated: 0 },
+            countsMode: 'replace',
+        });
+
+        // Equality, not a subset: the old plan's `skippedRuleOfTheOldPlan` is
+        // GONE rather than left at 7, because a row carrying keys from two work
+        // lists describes neither.
+        expect(restarted).toEqual({ planned: 12, inserted: 0, updated: 0 });
+        const row = await runRow(run.id);
+        expect(row.counts).toEqual({ planned: 12, inserted: 0, updated: 0 });
+        // One statement: the cursor the replacement was written with is the
+        // cursor on the row, so the counters and the position they describe
+        // cannot disagree.
+        expect(row.cursor).toEqual({ at: 0 });
+    });
+
+    it('accumulates again on the next checkpoint, because the mode is per call and not per run', async () => {
+        const run = await openScope(`${SCOPE}:replace-then-add`);
+        await saveCheckpoint(prisma, run.id, { cursor: { at: 9 }, counts: { inserted: 40 } });
+        await saveCheckpoint(prisma, run.id, {
+            cursor: { at: 0 },
+            counts: { planned: 12, inserted: 0 },
+            countsMode: 'replace',
+        });
+
+        const merged = await saveCheckpoint(prisma, run.id, { cursor: { at: 1 }, counts: { inserted: 3 } });
+
+        expect(merged).toEqual({ planned: 12, inserted: 3 });
+    });
+
+    it('adds when the mode is absent or stated as merge, so every existing caller is unchanged', async () => {
+        const run = await openScope(`${SCOPE}:merge-default`);
+
+        // The five other stages call this without a mode; `merge` stated
+        // explicitly must mean exactly what absent means.
+        await saveCheckpoint(prisma, run.id, { cursor: { at: 1 }, counts: { inserted: 2 } });
+        const stated = await saveCheckpoint(prisma, run.id, {
+            cursor: { at: 2 },
+            counts: { inserted: 2 },
+            countsMode: 'merge',
+        });
+
+        expect(stated).toEqual({ inserted: 4 });
+    });
+
+    it('applies the same value guards in both modes', () => {
+        // Replacement is `mergeCounts` with the stored map discarded, so the
+        // guards are not a second implementation that can drift from the first.
+        expect(resolveCounts({ inserted: 2 }, { inserted: 3 }, 'merge')).toEqual({ inserted: 5 });
+        expect(resolveCounts({ inserted: 2, stale: 9 }, { inserted: 3 }, 'replace')).toEqual({ inserted: 3 });
+        // A broken number is dropped rather than stored, in the mode that
+        // writes the caller's values verbatim as much as in the one that adds.
+        expect(
+            resolveCounts({ inserted: 2 }, { inserted: Number.NaN, updated: 1 } as Record<string, number>, 'replace'),
+        ).toEqual({ updated: 1 });
+        const prototypeKey = resolveCounts(
+            {},
+            JSON.parse('{"__proto__": 5, "inserted": 1}') as Record<string, number>,
+            'replace',
+        );
+        expect(Object.prototype.hasOwnProperty.call(prototypeKey, '__proto__')).toBe(false);
+        expect(prototypeKey).toEqual({ inserted: 1 });
+        // A stored shape that is not a counter map reads as "no counters yet"
+        // in either mode rather than throwing inside a checkpoint write.
+        expect(resolveCounts(null, { inserted: 1 }, 'merge')).toEqual({ inserted: 1 });
+        expect(resolveCounts('not a map', { inserted: 1 }, 'replace')).toEqual({ inserted: 1 });
     });
 
     it('takes a cursor-only checkpoint, for a caller with no counts to add', async () => {
@@ -12878,6 +13954,96 @@ describe('a resumed import reports the whole run', () => {
         expect(String(aggregation.basis)).toContain('understate');
     });
 
+    /**
+     * A FINGERPRINT MISMATCH RESTARTS THE COUNTERS WITH THE WORK
+     * (CATIMP-additive-run-counters).
+     *
+     * The run ledger merges additively, which is what makes a resumed run's
+     * row describe the whole run. A resume whose cursor names a DIFFERENT plan
+     * is the one case where that is wrong: the attempt restarts at batch 0, so
+     * the abandoned attempt's totals count records this attempt is about to
+     * plan again. Left in place they overstate every figure on the row — QA
+     * measured `candidates` at twice the row count with `inserted` and
+     * `updated` each equal to it — and the old plan's own keys linger beside
+     * the new plan's.
+     */
+    it('restarts the run row’s counters when the saved cursor belongs to another plan', async () => {
+        const abandoned = {
+            planned: 999,
+            inserted: 999,
+            updated: 999,
+            candidates: 999,
+            batchesProcessed: 9,
+            skippedRuleOfTheOldPlan: 7,
+        };
+        await prisma.catalog_import_runs.create({
+            data: {
+                kind: 'usda_import',
+                manifest_version: IMPORT_RUN_SCOPE,
+                status: 'running',
+                counts: abandoned,
+                log: [],
+                cursor: {
+                    fingerprint: 'a-fingerprint-from-another-plan',
+                    nextBatchIndex: 1,
+                    report: carried,
+                } as unknown as object,
+            },
+        });
+
+        const warnings: { event: string; fields?: Record<string, unknown> }[] = [];
+        const recordingLogger: ScriptLogger = {
+            ...silentLogger,
+            warn: (event: string, fields?: Record<string, unknown>) => {
+                warnings.push({ event, fields });
+            },
+            child: () => recordingLogger,
+        };
+
+        const harness = importHarness({
+            entries: subjects,
+            vendor: recordingVendor({ records: recordsFor(subjects) }),
+            options: { resume: true },
+            logger: recordingLogger,
+        });
+        const outcome = await runImport(harness.deps);
+
+        // The restart is announced, and BOTH sides of it: a counter that fell
+        // is as confusing as one that overstates, so the discarded totals are
+        // named beside the restarted ones.
+        const events = warnings.map((entry) => entry.event);
+        expect(events).toContain('cursor_plan_changed');
+        expect(events).toContain('run_counts_restarted');
+        const restarted = warnings.find((entry) => entry.event === 'run_counts_restarted');
+        expect(String(restarted?.fields?.discardedCounts)).toContain('999');
+        expect(String(restarted?.fields?.counts)).toContain(`"planned":${subjects.length}`);
+
+        // The row now states THIS attempt's work and nothing else: it
+        // re-processed every batch, so `inserted` is the subject count rather
+        // than 999 plus it, and the abandoned plan's own key is gone.
+        const row = await importRunRow();
+        const counts = (row?.counts ?? {}) as Record<string, number>;
+        expect(counts.planned).toBe(subjects.length);
+        expect(counts.inserted).toBe(subjects.length);
+        expect(counts.updated).toBe(0);
+        expect(counts.candidates).toBe(subjects.length);
+        expect(counts.batchesProcessed).toBe(2);
+        expect(counts.skippedRuleOfTheOldPlan).toBeUndefined();
+        expect(outcome.counts.inserted).toBe(subjects.length);
+
+        // And the durable run log says it, so an operator reading the row
+        // afterwards sees the reset rather than inferring a lost update.
+        const logged = await prisma.catalog_import_runs.findUnique({
+            where: { id: row?.id as string },
+            select: { log: true },
+        });
+        const entries = ((logged?.log ?? []) as Record<string, unknown>[]).filter(
+            (entry) => entry.event === 'run_counts_restarted',
+        );
+        expect(entries).toHaveLength(1);
+        expect((entries[0].counts as Record<string, number>).planned).toBe(subjects.length);
+    });
+
     it('writes the figures into the cursor it saves, so the next attempt can carry them', async () => {
         const harness = importHarness({ entries: subjects, vendor: recordingVendor({ records: recordsFor(subjects) }) });
         await runImport(harness.deps);
@@ -13771,6 +14937,86 @@ describe('what a failing run records and emits', () => {
 // ran next. Each case restores, but "each case restores" is a claim, and this
 // is the one place it can be checked rather than asserted in a comment.
 // ---------------------------------------------------------------------------
+/**
+ * THE ROW THE RULE LANDS ON (VALREP-rejected-outcome-mismatch).
+ *
+ * The precedence itself is pinned above with no database. This is the same
+ * decision seen where it actually matters — in `catalog_validation_records`,
+ * written through `persistPreparedFood` against PostgreSQL — because the
+ * committed evidence artefact is built from that column, and 33 of its
+ * withheld-rejected identities carried a `quarantined` outcome beside a
+ * `rejected` status and reject-tier evidence.
+ *
+ * Last in the file, and with its own truncation, so the write cannot disturb a
+ * section that measures row counts.
+ */
+describe('the persisted validation record states the outcome its status implies', () => {
+    const entry = IMPORT_SUBJECTS[0];
+    const policy: CatalogValidationPolicy = {
+        categories: coveragePlan.categories,
+        validationBounds: coveragePlan.validationBounds,
+    };
+    const persistedAt = new Date('2026-09-14T08:30:00.000Z');
+
+    beforeEach(truncateFeatureTables);
+
+    /** The curated record, optionally over the reject-tier energy ceiling. */
+    const record = (calories: number): PreparedCatalogFood => {
+        const prepared = prepareCatalogFood(
+            cleanDetail(entry),
+            { kind: 'curated', entry },
+            manifest,
+            persistedAt,
+            retrieval([entry.fdcId]),
+        );
+
+        return {
+            ...prepared,
+            // What an unclassified swept record carries, and the floor that
+            // used to decide the outcome on its own.
+            curatorReviewRequired: true,
+            candidate: { ...prepared.candidate, calories },
+        };
+    };
+
+    const persist = async (one: PreparedCatalogFood): Promise<{ outcome: string; status: string }> => {
+        const verdict = validateCatalogCandidate(one.candidate, policy);
+        await persistPreparedFood(
+            prisma as unknown as ImportDb,
+            one,
+            verdict,
+            importPublicationStatus(one, verdict),
+            persistedAt,
+        );
+
+        const food = await prisma.catalog_foods.findUnique({
+            where: { source_key: one.sourceKey },
+            select: { id: true, publication_status: true },
+        });
+        expect(food).not.toBeNull();
+        const stored = await prisma.catalog_validation_records.findUnique({
+            where: { catalog_food_id: (food as { id: string }).id },
+            select: { outcome: true, publication_status: true },
+        });
+
+        return {
+            outcome: String((stored as { outcome: string }).outcome),
+            status: String((food as { publication_status: string }).publication_status),
+        };
+    };
+
+    it('writes rejected on a row a reject-tier check disqualified, floor or no floor', async () => {
+        // 5,000 kcal/100 g is over the reject ceiling, so the row is stored
+        // `rejected` — and `catalog-validate` never revisits a rejected row,
+        // which is why a wrong outcome here would be permanent.
+        expect(await persist(record(5000))).toEqual({ outcome: 'rejected', status: 'rejected' });
+    });
+
+    it('writes quarantined on a row only the floor held, which is unchanged', async () => {
+        expect(await persist(record(CLEAN_CALORIES))).toEqual({ outcome: 'quarantined', status: 'candidate' });
+    });
+});
+
 describe('this section leaves the process as it found it', () => {
     // Captured while Jest is still collecting, so it is the reference the
     // process started with rather than whatever some case left installed. The

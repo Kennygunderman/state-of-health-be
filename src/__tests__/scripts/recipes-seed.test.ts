@@ -17,11 +17,27 @@
  *
  * HOW THE COVERAGE REPORT IS SPLIT BETWEEN THIS SUITE AND THE API ONE. The
  * table's own invariants are `deriveCoverageReport`'s, so they are pinned HERE,
- * as pure tests over three hand-written recipes with no database: the dimension
+ * as pure tests over hand-written recipes with no database: the dimension
  * lists, one cell per combination of them (640), the 140 guaranteed and 124
- * reduced cells with their §0.7.3 thresholds and their disjointness, the four
- * slot-composition strata and their floors, and the artefact's self-describing
- * members. What this suite cannot settle is whether the REAL 42-recipe corpus
+ * reduced cells §0.7.3 CLAIMS with their thresholds and their disjointness, the
+ * four slot-composition strata and their floors, and the artefact's
+ * self-describing members.
+ *
+ * AND THE FEASIBILITY GATE, which is the half a count cannot express. A cell is
+ * certified only when a day the planner would accept EXISTS for it at every
+ * sampled calorie target on every schedule its slot belongs to, and when enough
+ * distinct recipes are USABLE in such a day to fill a week; a claimed cell that
+ * fails is demoted to `eligibleNotPlannableCells` with the reason. Its own
+ * block below states each outcome over a fixture built for it: a plannable
+ * corpus that certifies, a corpus of four eligible-but-oversized recipes per
+ * slot that cannot compose a day at all, a corpus where a day exists but only
+ * one recipe per slot can appear in one, and an evaluation budget lowered far
+ * enough to prove that an exhausted search reports itself as exhausted rather
+ * than as a thin corpus. Those are properties of the derivation and are
+ * unreachable from counts, which is why counting alone once certified a vegan
+ * profile no vegan user could plan.
+ *
+ * What this suite cannot settle is whether the REAL 42-recipe corpus
  * against the REAL release satisfies those cells and reproduces the committed
  * `data/meal-planning/recipes/coverage-report.json` byte for byte — that is
  * `src/__tests__/api/seed-rerun.test.ts`'s subject, and it is an acceptance
@@ -101,13 +117,19 @@ import {
     CheckpointError,
 } from '../../../scripts/lib/checkpoint';
 import type { CatalogRunKind, CatalogStageName } from '../../../scripts/lib/checkpoint';
-import { createLogger, safeError } from '../../../scripts/lib/logger';
-import { loadCoveragePlan, recipesDir, writeJsonFile } from '../../../scripts/lib/manifest';
+import {
+    UNEXPECTED_FAILURE_REMEDY,
+    classifyInfrastructureFailure,
+    createLogger,
+    safeError,
+} from '../../../scripts/lib/logger';
+import { loadCoveragePlan, ManifestError, recipesDir, writeJsonFile } from '../../../scripts/lib/manifest';
 import type { CoveragePlan } from '../../../scripts/lib/manifest';
 import type { LogLevel, ScriptLogger } from '../../../scripts/lib/logger';
 import {
     buildIngredientVocabulary,
     CATALOG_READER_STAGE,
+    feasibilityWindow,
     CATALOG_READER_STAGE_MODE,
     describeFailure,
     deriveCoverageReport,
@@ -127,6 +149,7 @@ import {
 } from '../../../scripts/recipes-seed';
 import type {
     CoverageRecipe,
+    CoverageReport,
     RecipeSeedCursor,
     SeedDb,
     SeedDeps,
@@ -134,7 +157,9 @@ import type {
     SeedPreflightDeps,
 } from '../../../scripts/recipes-seed';
 import { prisma } from '../../prisma/client';
+import { evaluateDayTolerance } from '../../services/mealPlan.logic';
 import { deriveRecipeVersionFields } from '../../services/recipe.logic';
+import { deriveMacroTargets } from '../../services/targets.logic';
 import type { RecipeAllergenStatus, RecipePublicationIngredient } from '../../services/recipe.logic';
 import { RECIPE_BADGES, RECIPE_ICON_KEYS } from '../../types/recipe';
 import type { RecipeBadge, RecipeIconKey } from '../../types/recipe';
@@ -2079,14 +2104,11 @@ describe('what a refusal reports', () => {
     // §8: never the raw error object. `safeError` is the shape the stage reports
     // a failure in, and it carries a CLOSED set of machine-readable members —
     // the class name and the code it declares. Neither the message nor a stack
-    // nor a `cause` chain travels, because each of those is how a connection
-    // string or a fragment of the file that failed escapes into a log.
-    //
-    // The refusal's own detail is not lost by this: `recipes_rejected` above
-    // carries `problems`, a list this repository composed, and that is where an
-    // operator reads what was wrong with the corpus.
-    it('reduces the failure to a scrubbed name and its code, with no message or stack', () => {
-        expect(describeFailure(refusal)).toEqual({ code: 'recipes_invalid', error: safeError(refusal) });
+    // nor a `cause` chain travels through THAT field, because each of those is
+    // how a connection string or a fragment of a foreign document escapes into
+    // a log.
+    it('reduces the failure itself to a scrubbed name and its code, with no message or stack', () => {
+        expect(describeFailure(refusal).error).toEqual(safeError(refusal));
         expect(Object.keys(safeError(refusal)).sort()).toEqual(['code', 'name']);
         expect(safeError(refusal).name).toBe('RecipeSeedError');
         expect(safeError(refusal)).not.toHaveProperty('message');
@@ -2094,6 +2116,31 @@ describe('what a refusal reports', () => {
         for (const entry of captured) {
             expect(entry.line).not.toContain('"stack"');
         }
+    });
+
+    // …and the sentence the stage COMPOSED travels beside it, under a member
+    // named for its provenance.
+    //
+    // This is the half the closed field set above cannot carry and the half an
+    // operator acts on: §0.7.3 requires the seed to fail loudly "with the
+    // offending recipe and ingredient", and a `recipes_invalid` code names
+    // neither. `recipes_rejected` above carries the same defects as a list, but
+    // that line is only written on the path that reaches the validation pass —
+    // the fatal reporter in `main` is what an operator sees when a refusal ends
+    // the process, and it used to print the code alone.
+    it('carries its own rendered sentence and the defect count beside the code', () => {
+        const described = describeFailure(refusal);
+        const forwarded = String(described.detail?.firstPartyMessage);
+
+        expect(described.code).toBe('recipes_invalid');
+        expect(described.detail?.problemCount).toBe(refusal.problems.length);
+        expect(forwarded).toContain('nothing was published');
+        // Every defect, and each one still naming the file it is in: the list
+        // the class rendered into its message is the list the operator fixes.
+        for (const problem of refusal.problems) {
+            expect(forwarded).toContain(problem);
+        }
+        expect(forwarded).toContain('recipes/chicken-broccoli-plate.json');
     });
 
     // The run that refused wrote nothing at all, which is what makes the
@@ -3141,42 +3188,62 @@ describe('comparing a stored value with the value that was written', () => {
  * report currently emits, so it cannot notice a dimension that disappeared or a
  * threshold that moved — which is exactly what these tests are for.
  */
-describe('deriveCoverageReport', () => {
-    const recipe = (
-        slug: string,
-        mealSlots: readonly string[],
-        dietTags: readonly string[],
-        allergenTags: readonly string[],
-        totalMinutes: number,
-    ): CoverageRecipe => ({
-        slug,
-        mealSlots,
-        dietTags,
-        version: {
-            status: 'current',
-            nutrition_provenance: 'source_backed',
-            allergen_status: 'known',
-            total_minutes: totalMinutes,
-            meal_slots: mealSlots,
-            ingredients: [
-                {
-                    catalog_food_id: `${slug}-ingredient`,
-                    snapshot_name: `${slug} ingredient`,
-                    snapshot_provenance: 'source_backed',
-                    snapshot_allergen_tags: allergenTags,
-                    snapshot_diet_tags: dietTags,
-                    is_optional: false,
-                    food_group: 'tofu',
-                    allergen_status: 'known',
-                },
-            ],
-        },
-    });
+/**
+ * A per-serving macro set shaped 30/40/30 by ENERGY, which is exactly the split
+ * `targets.logic.ts::deriveMacroTargets` sets for every calorie target.
+ *
+ * That is what makes a fixture built from it plannable across the whole sampled
+ * band rather than at one lucky point: scaling a macro-proportional recipe by
+ * any multiplier keeps the day proportional, so a day whose CALORIES land inside
+ * the ±10 % window lands inside the protein, carb and fat bands too. 500 kcal a
+ * serving over three slots reaches 750–3,000 kcal at the offered multipliers,
+ * which spans the 1,200–3,000 band the report samples.
+ */
+const PROPORTIONAL_PER_SERVING = { calories: 500, protein: 38, carbs: 50, fat: 17 } as const;
 
+/** A serving no multiplier can fit into any sampled day: 0.5 x 6000 already overshoots 3,000 kcal. */
+const OVERSIZED_PER_SERVING = { calories: 6000, protein: 456, carbs: 600, fat: 204 } as const;
+
+const coverageRecipe = (
+    slug: string,
+    mealSlots: readonly string[],
+    dietTags: readonly string[],
+    allergenTags: readonly string[],
+    totalMinutes: number,
+    perServing: CoverageRecipe['perServing'] = PROPORTIONAL_PER_SERVING,
+): CoverageRecipe => ({
+    slug,
+    mealSlots,
+    dietTags,
+    versionNumber: 1,
+    budgetTier: 1,
+    perServing,
+    version: {
+        status: 'current',
+        nutrition_provenance: 'source_backed',
+        allergen_status: 'known',
+        total_minutes: totalMinutes,
+        meal_slots: mealSlots,
+        ingredients: [
+            {
+                catalog_food_id: `${slug}-ingredient`,
+                snapshot_name: `${slug} ingredient`,
+                snapshot_provenance: 'source_backed',
+                snapshot_allergen_tags: allergenTags,
+                snapshot_diet_tags: dietTags,
+                is_optional: false,
+                food_group: 'tofu',
+                allergen_status: 'known',
+            },
+        ],
+    },
+});
+
+describe('deriveCoverageReport', () => {
     const report = deriveCoverageReport([
-        recipe('vegan-quick', ['breakfast'], [...PLANT_DIET_TAGS], [], 10),
-        recipe('vegetarian-slow', ['breakfast', 'lunch'], ['pescatarian', 'vegetarian'], ['milk'], 50),
-        recipe('omnivore', ['dinner'], [], [], 30),
+        coverageRecipe('vegan-quick', ['breakfast'], [...PLANT_DIET_TAGS], [], 10),
+        coverageRecipe('vegetarian-slow', ['breakfast', 'lunch'], ['pescatarian', 'vegetarian'], ['milk'], 50),
+        coverageRecipe('omnivore', ['dinner'], [], [], 30),
     ]);
 
     it('states every dimension of the table and one cell per combination', () => {
@@ -3215,28 +3282,49 @@ describe('deriveCoverageReport', () => {
         expect(countAt('vegan', 'none', 'breakfast', 60)).toBe(1);
     });
 
-    it('marks the guaranteed and reduced cells §0.7.3 names, and nothing else', () => {
-        expect(report.guaranteedCells).toHaveLength(140);
-        expect(report.reducedCells).toHaveLength(124);
-        expect(report.guaranteedCells.every((cell) => cell.threshold === 4)).toBe(true);
-        expect(report.reducedCells.every((cell) => cell.threshold === 2)).toBe(true);
+    it('claims the cells §0.7.3 names at its thresholds, certifying none of them from three recipes', () => {
+        // The CLAIMED set is the union of the three lists: certification moves a
+        // cell between them and never drops one, so §0.7.3's 140 + 124 cells
+        // are all still accounted for.
+        const claimed = [...report.guaranteedCells, ...report.reducedCells, ...report.eligibleNotPlannableCells];
+        expect(claimed).toHaveLength(140 + 124);
+        expect(claimed).toHaveLength(264);
+        expect(report.feasibility.certification).toEqual({
+            guaranteedClaimed: 140,
+            guaranteedCertified: 0,
+            reducedClaimed: 124,
+            reducedCertified: 0,
+        });
 
+        // Three recipes reach no threshold, so nothing is certified and every
+        // claim is demoted — which is the point of the gate: a cell is in
+        // `guaranteedCells` because it was established, not because §0.7.3
+        // names it.
+        expect(report.guaranteedCells).toEqual([]);
+        expect(report.reducedCells).toEqual([]);
+        expect(report.eligibleNotPlannableCells.filter((cell) => cell.threshold === 4)).toHaveLength(140);
+        expect(report.eligibleNotPlannableCells.filter((cell) => cell.threshold === 2)).toHaveLength(124);
+
+        // No cell is claimed twice, which is what the guaranteed and reduced
+        // clauses' disjointness amounts to now that both are filtered.
         const key = (cell: { diet: string; allergen: string; slot: string; timeTier: number }): string =>
             `${cell.diet}|${cell.allergen}|${cell.slot}|${cell.timeTier}`;
-        const guaranteed = new Set(report.guaranteedCells.map(key));
-        expect(report.reducedCells.some((cell) => guaranteed.has(key(cell)))).toBe(false);
+        expect(new Set(claimed.map(key)).size).toBe(claimed.length);
 
-        expect(report.guaranteedCells[0]).toMatchObject({
+        // The claim order the two clauses state them in is preserved.
+        expect(report.eligibleNotPlannableCells[0]).toMatchObject({
             diet: 'none',
             allergen: 'none',
             slot: 'breakfast',
             timeTier: 45,
+            threshold: 4,
         });
-        expect(report.reducedCells[0]).toMatchObject({
+        expect(report.eligibleNotPlannableCells[140]).toMatchObject({
             diet: 'vegetarian',
             allergen: 'milk',
             slot: 'breakfast',
             timeTier: 45,
+            threshold: 2,
         });
     });
 
@@ -3259,7 +3347,7 @@ describe('deriveCoverageReport', () => {
     });
 
     it('carries the self-describing members the committed artefact is reviewed with', () => {
-        expect(report.schemaVersion).toBe(1);
+        expect(report.schemaVersion).toBe(2);
         expect(report.eligibilityRule.mirrors).toBe('src/services/recipe.logic.ts::isEligibleForPlanning');
         // The five axes the rule is decided on, in the order the artefact states
         // them. The rule block has since grown prose members beside `clauses`,
@@ -3285,6 +3373,496 @@ describe('deriveCoverageReport', () => {
         expect(report.boundary).toContain('supported at runtime but not guaranteed');
         expect(report.boundary).toContain('no_matching_meals');
         expect(report.boundary).toContain('editStep');
+
+        // The feasibility half is self-describing for the same reason: a
+        // reviewer must be able to read what a certified cell claims out of the
+        // committed file.
+        expect(report.feasibility.rule.mirrors).toContain('evaluateDayTolerance');
+        expect(report.feasibility.rule.usable).toContain('strictly stronger than eligible');
+        expect(report.feasibility.rule.certification).toContain('ONLY cells that pass');
+        expect(report.feasibility.rule.searchBound).toContain('is not a proof that the corpus cannot');
+        expect(report.feasibility.schedules).toEqual(['three', 'three_plus_snack']);
+        // ceil(7 days / 2 uses a week), which is `repeatRule`'s own figure.
+        expect(report.feasibility.weekFillMinUsableRecipesPerSlot).toBe(4);
+        expect(report.feasibility.weekFillMinUsableRecipesPerSlot).toBe(
+            report.repeatRule.minEligiblePerSlotForFullWeek,
+        );
+        expect(report.feasibility.evaluationCapPerProbe).toBeGreaterThan(0);
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * The feasibility gate — the half a count cannot express
+ * ------------------------------------------------------------------------- */
+
+/**
+ * WHY THIS BLOCK EXISTS. A cell can hold well over its threshold of eligible
+ * recipes and still be unplannable, and the shipped corpus proved it: the vegan
+ * cells held 4 eligible breakfasts, 6 lunches and 8 dinners — comfortably over
+ * the threshold of 4 — while no assignment of them reached the protein target
+ * at ANY calorie target in the sampled band, so every vegan user was answered
+ * `422 no_matching_meals` by a profile `coverage-report.json` called guaranteed.
+ * Counting is therefore not a sufficient certification, and these tests pin the
+ * four outcomes the gate must distinguish.
+ *
+ * Each fixture is built here rather than read from
+ * `data/meal-planning/recipes/`: the corpus is authored independently of this
+ * derivation and a test that asserted against its file count or its macros
+ * would fail whenever a recipe was added, which is neither a defect nor
+ * something this suite can settle.
+ */
+/**
+ * The search's pruning window against the verdict it must never contradict.
+ *
+ * THE ONE WAY THE GATE COULD LIE. `feasibilityWindow` restates the SHAPE of
+ * `evaluateDayTolerance`'s four bands — a ratio on calories, an asymmetric pair
+ * on protein, the larger of an absolute and a relative band on carbs and fat —
+ * from that module's own constants, so that a partial day outside the window can
+ * be abandoned without completing it. If the window were ever NARROWER than the
+ * verdict, the search would abandon days the planner would accept and the report
+ * would call a plannable cell unplannable, which is the same class of false
+ * claim as the counting-only certification this gate replaced.
+ *
+ * So the property asserted here is containment, at every sampled target and over
+ * a fine sweep of each macro: whatever `evaluateDayTolerance` ACCEPTS lies
+ * inside the window. It holds for any band shape, so it keeps holding if
+ * `mealPlan.logic.ts` changes one — and fails loudly if a change makes the two
+ * disagree.
+ */
+describe('the pruning window the day search abandons a partial day on', () => {
+    const SAMPLED_TARGETS: readonly number[] = [1200, 1500, 1800, 2100, 2400, 2700, 3000];
+    const MACROS: readonly ('calories' | 'protein' | 'carbs' | 'fat')[] = ['calories', 'protein', 'carbs', 'fat'];
+
+    it('never excludes a day the production verdict accepts', () => {
+        const contradictions: string[] = [];
+        let acceptedInside = 0;
+        let rejectedOutside = 0;
+
+        for (const calories of SAMPLED_TARGETS) {
+            const targets = deriveMacroTargets(calories);
+            const window = feasibilityWindow(targets);
+
+            for (const macro of MACROS) {
+                const target = targets[macro];
+                // Wide enough to leave every band, and stepped finely enough to
+                // land on both sides of each edge.
+                const step = target / 200;
+                for (let value = 0; value <= target * 2; value += step) {
+                    const totals = { ...targets, [macro]: value };
+                    const accepted = evaluateDayTolerance(totals, targets).withinTolerance;
+                    const inside = value >= window.low[macro] && value <= window.high[macro];
+
+                    if (accepted && !inside) {
+                        contradictions.push(
+                            `${macro} ${value.toFixed(3)} at a ${calories} kcal target is within tolerance but outside ` +
+                                `the pruning window [${window.low[macro].toFixed(3)}, ${window.high[macro].toFixed(3)}]`,
+                        );
+                    }
+                    if (accepted) {
+                        acceptedInside += 1;
+                    } else if (!inside) {
+                        rejectedOutside += 1;
+                    }
+                }
+            }
+        }
+
+        expect(contradictions).toEqual([]);
+        // Non-vacuity: the sweep really does cross both edges of every band, so
+        // the containment above is not passing on an empty or all-inside sweep.
+        expect(acceptedInside).toBeGreaterThan(0);
+        expect(rejectedOutside).toBeGreaterThan(0);
+    });
+
+    it('is wider than the verdict rather than equal to it, on every macro', () => {
+        const targets = deriveMacroTargets(2100);
+        const window = feasibilityWindow(targets);
+
+        for (const macro of MACROS) {
+            expect(window.low[macro]).toBeLessThan(targets[macro]);
+            expect(window.high[macro]).toBeGreaterThan(targets[macro]);
+            // Just outside the window is refused by the verdict too, so the
+            // window is not merely permissive.
+            expect(
+                evaluateDayTolerance({ ...targets, [macro]: window.low[macro] - 1 }, targets).breaches,
+            ).toContain(macro);
+            expect(
+                evaluateDayTolerance({ ...targets, [macro]: window.high[macro] + 1 }, targets).breaches,
+            ).toContain(macro);
+        }
+
+        // Protein's band is asymmetric on purpose — 15 g under, 25 g over — and
+        // the window carries that rather than a symmetric approximation of it.
+        expect(targets.protein - window.low.protein).toBeLessThan(window.high.protein - targets.protein);
+    });
+});
+
+describe('the coverage report\'s feasibility gate', () => {
+    const slotsInOrder: readonly string[] = ['breakfast', 'lunch', 'dinner', 'snack'];
+
+    /** Four recipes dedicated to each slot: enough for the week-fill floor of 4, with no slot borrowing another's. */
+    const corpus = (
+        perServing: CoverageRecipe['perServing'] = PROPORTIONAL_PER_SERVING,
+        overrides: Readonly<Record<string, CoverageRecipe['perServing']>> = {},
+    ): CoverageRecipe[] =>
+        slotsInOrder.flatMap((slot) =>
+            [1, 2, 3, 4].map((index) =>
+                coverageRecipe(
+                    `${slot}-${index}`,
+                    [slot],
+                    [],
+                    [],
+                    10,
+                    overrides[`${slot}-${index}`] ?? perServing,
+                ),
+            ),
+        );
+
+    const cellIn = (
+        cells: readonly { diet: string; allergen: string; slot: string; timeTier: number }[],
+        slot: string,
+        timeTier = 45,
+    ): { diet: string; allergen: string; slot: string; timeTier: number } | undefined =>
+        cells.find(
+            (cell) => cell.diet === 'none' && cell.allergen === 'none' && cell.slot === slot && cell.timeTier === timeTier,
+        );
+
+    const probeIn = (
+        report: CoverageReport,
+        schedule: string,
+        timeTier = 45,
+    ): CoverageReport['feasibility']['probes'][number] => {
+        const probe = report.feasibility.probes.find(
+            (candidate) =>
+                candidate.diet === 'none' &&
+                candidate.allergen === 'none' &&
+                candidate.timeTier === timeTier &&
+                candidate.schedule === schedule,
+        );
+
+        if (probe === undefined) {
+            throw new Error(`no none/none/${timeTier}min/${schedule} probe was derived`);
+        }
+
+        return probe;
+    };
+
+    describe('a corpus that can compose a day at every sampled target', () => {
+        const report = deriveCoverageReport(corpus());
+
+        it('records the sampled band, its macros and which of it was plannable', () => {
+            // The band is spelled out rather than read back from the report,
+            // deliberately: this is the gate that stops the sampled set being
+            // narrowed silently, and a self-referential assertion would gate
+            // nothing. It spans the WHOLE band `targets.logic.ts` can emit —
+            // the 1,200 kcal female floor to the 5,000 kcal `CALORIE_CEILING` —
+            // because a band that stops below what the product hands the
+            // planner certifies a promise for some users and never tests it for
+            // the rest.
+            expect(report.feasibility.sampledTargets.map((target) => target.calories)).toEqual([
+                1200, 1500, 1800, 2100, 2400, 2700, 3000, 3500, 4000, 4500, 5000,
+            ]);
+            // The macros are `deriveMacroTargets`', not this file's: 30/40/30
+            // of energy at 4/4/9 kcal a gram. Both ends are pinned, so neither
+            // the floor nor the ceiling can drift.
+            expect(report.feasibility.sampledTargets[0]).toEqual({
+                calories: 1200,
+                protein: 90,
+                carbs: 120,
+                fat: 40,
+            });
+            expect(report.feasibility.sampledTargets[6]).toEqual({
+                calories: 3000,
+                protein: 225,
+                carbs: 300,
+                fat: 100,
+            });
+            expect(report.feasibility.sampledTargets[10]).toEqual({
+                calories: 5000,
+                protein: 375,
+                carbs: 500,
+                fat: 167,
+            });
+
+            // THIS FIXTURE'S REACH, and why it is not the whole band. The
+            // corpus here is four small synthetic recipes per slot, so the most
+            // a day can reach is the portion cap times their sum — comfortably
+            // the lower band, part of the extended one, and honestly not the
+            // 5,000 kcal ceiling. The measured boundary sits inside the high
+            // band rather than at its first step, which is why the assertions
+            // below name the floor and the partition and leave the boundary to
+            // the probe. The property under test is that the probe SAYS SO per
+            // target rather
+            // than collapsing the cell to a yes or a no: every sampled target
+            // lands in exactly one of the two lists, the two together are the
+            // band in its own order, and the search completed in both cases.
+            const sampled = report.feasibility.sampledTargets.map((target) => target.calories);
+
+            // WHICH high targets it reaches is deliberately not asserted, and
+            // the reason is worth stating: it depends on the fixture's serving
+            // sizes AND on the schedule (a snack is a fourth meal, so the
+            // snack schedule reaches one target further), so pinning a list
+            // here would assert a property of the fixture's arithmetic rather
+            // than of the derivation. What must hold is the partition and the
+            // floor.
+            for (const schedule of ['three', 'three_plus_snack']) {
+                const probe = probeIn(report, schedule);
+
+                expect([...probe.plannableTargets, ...probe.unplannableTargets].sort((a, b) => a - b)).toEqual(
+                    sampled,
+                );
+                // Every target of the original band is reachable: this fixture
+                // is the healthy one, and a regression that lost the lower band
+                // would be a defect in the day search rather than a small
+                // corpus.
+                expect(probe.plannableTargets).toEqual(expect.arrayContaining([1200, 1500, 1800, 2100, 2400, 2700, 3000]));
+                // And whatever it cannot reach is in the extended high band
+                // only, never below it.
+                expect(probe.unplannableTargets.length).toBeGreaterThan(0);
+                expect(probe.unplannableTargets.every((target) => target > 3000)).toBe(true);
+                expect(probe.searchExhausted).toBe(false);
+                expect(probe.evaluations).toBeGreaterThan(0);
+            }
+        });
+
+        it('demotes only for the targets it cannot reach, and names the target in the reason', () => {
+            // A CELL IS CERTIFIED OR IT IS NOT, at every sampled target: one
+            // unreachable target demotes the cell, which is the whole point of
+            // gating on plannability instead of on an eligible count. This
+            // fixture's four small synthetic recipes per slot cannot compose a
+            // day at the top of the band (see the band comment above), so its
+            // cells demote — and the assertion is that they demote FOR THAT
+            // REASON, naming the target that failed, rather than for a shortage
+            // of recipes.
+            //
+            // The named target is the FIRST one that cell's own probe could not
+            // reach, so it varies by schedule and by cooking-time tier; the
+            // assertion accepts any target of the extended high band and
+            // rejects a detail that names one the fixture demonstrably reaches.
+            const highBandTargets = report.feasibility.sampledTargets
+                .map((sample) => sample.calories)
+                .filter((calories) => calories > 3000);
+
+            const demotions = report.eligibleNotPlannableCells.filter(
+                (cell) => cell.diet === 'none' && cell.allergen === 'none',
+            );
+
+            expect(demotions.length).toBeGreaterThan(0);
+            expect(highBandTargets.length).toBeGreaterThan(0);
+
+            for (const cell of demotions) {
+                expect(cell.reason).toBe('no_feasible_day');
+                expect(cell.detail).toContain('satisfies the tolerance');
+                expect(
+                    highBandTargets.some((calories) => cell.detail.includes(`${calories} kcal target`)),
+                ).toBe(true);
+                // Not a depth problem: every recipe of the slot IS usable, in
+                // the days the fixture can compose. A demotion that also
+                // reported a shortage would be describing a different corpus.
+                expect(cell.usable).toBe(cell.count);
+            }
+
+            // And the lower band it CAN compose is still measured per slot: the
+            // usable counts come from the day search, not from the eligible
+            // count, which is what made the vegan cells honest.
+            for (const schedule of ['three', 'three_plus_snack']) {
+                expect(probeIn(report, schedule).slots.every((slot) => slot.usable === 4)).toBe(true);
+            }
+        });
+
+        it('counts the usable recipes of a slot through the day search, per schedule', () => {
+            for (const schedule of ['three', 'three_plus_snack']) {
+                const probe = probeIn(report, schedule);
+                expect(probe.slots.map((slot) => slot.slot)).toEqual(
+                    schedule === 'three' ? ['breakfast', 'lunch', 'dinner'] : slotsInOrder,
+                );
+                expect(probe.slots.every((slot) => slot.usable === 4 && slot.eligible === 4)).toBe(true);
+            }
+        });
+
+        it('probes the snack slot on the schedule that has one, and only there', () => {
+            expect(
+                report.feasibility.probes.some(
+                    (probe) => probe.schedule === 'three' && probe.slots.some((slot) => slot.slot === 'snack'),
+                ),
+            ).toBe(false);
+            expect(probeIn(report, 'three_plus_snack').slots.map((slot) => slot.slot)).toContain('snack');
+        });
+
+        it('emits a byte-identical document on a rerun, and on the same recipes in another order', () => {
+            expect(JSON.stringify(deriveCoverageReport(corpus()))).toBe(JSON.stringify(report));
+            // Order independence is what makes the artefact reviewable as a
+            // diff: the corpus is read `orderBy: slug`, but nothing in the
+            // derivation may depend on that.
+            expect(JSON.stringify(deriveCoverageReport([...corpus()].reverse()))).toBe(JSON.stringify(report));
+        });
+    });
+
+    describe('a corpus whose eligible recipes cannot compose any day', () => {
+        // Four eligible recipes per slot — every counting clause satisfied —
+        // and half a serving of any of them already overshoots the largest
+        // sampled day.
+        const report = deriveCoverageReport(corpus(OVERSIZED_PER_SERVING));
+
+        it('counts the recipes as eligible', () => {
+            for (const slot of slotsInOrder) {
+                expect(
+                    report.eligibleCounts.find(
+                        (cell) =>
+                            cell.diet === 'none' && cell.allergen === 'none' && cell.slot === slot && cell.timeTier === 45,
+                    )?.count,
+                ).toBe(4);
+            }
+        });
+
+        it('certifies nothing, and demotes each cell naming the target it cannot reach', () => {
+            expect(report.guaranteedCells).toEqual([]);
+            expect(report.reducedCells).toEqual([]);
+
+            const demoted = cellIn(report.eligibleNotPlannableCells, 'breakfast') as
+                | (typeof report.eligibleNotPlannableCells)[number]
+                | undefined;
+            expect(demoted).toMatchObject({ threshold: 4, count: 4, usable: 0, reason: 'no_feasible_day' });
+            expect(demoted?.detail).toContain('1200 kcal target');
+            expect(demoted?.detail).toContain('satisfies the tolerance');
+        });
+
+        it('reports the search as complete, because this is a proven impossibility rather than an exhausted search', () => {
+            expect(report.feasibility.probes.every((probe) => !probe.searchExhausted)).toBe(true);
+            expect(probeIn(report, 'three').plannableTargets).toEqual([]);
+            // Every sampled target, however many the band holds — taken from
+            // the report so extending the band does not need this line edited,
+            // while the band itself is pinned by name in the test above.
+            expect(probeIn(report, 'three').unplannableTargets).toHaveLength(
+                report.feasibility.sampledTargets.length,
+            );
+        });
+    });
+
+    describe('a corpus where a day exists but only one recipe per slot can appear in one', () => {
+        // Three of each slot's four recipes are unusable at any multiplier, so
+        // every slot holds four ELIGIBLE recipes and one USABLE one — the
+        // arithmetic that makes seven days impossible under the repeat rule
+        // however healthy the count looks.
+        const oversizedExceptTheFirst = Object.fromEntries(
+            slotsInOrder.flatMap((slot) =>
+                [2, 3, 4].map((index) => [`${slot}-${index}`, OVERSIZED_PER_SERVING] as const),
+            ),
+        );
+        const report = deriveCoverageReport(corpus(PROPORTIONAL_PER_SERVING, oversizedExceptTheFirst));
+
+        it('still finds a day at every sampled target', () => {
+            expect(probeIn(report, 'three').unplannableTargets).toEqual([]);
+            expect(probeIn(report, 'three_plus_snack').unplannableTargets).toEqual([]);
+        });
+
+        it('counts one usable recipe per slot against four eligible', () => {
+            for (const probe of [probeIn(report, 'three'), probeIn(report, 'three_plus_snack')]) {
+                expect(probe.slots.every((slot) => slot.eligible === 4 && slot.usable === 1)).toBe(true);
+            }
+        });
+
+        it('refuses the guaranteed cells for want of usable recipes, naming the shortfall', () => {
+            expect(report.guaranteedCells).toEqual([]);
+
+            const demoted = cellIn(report.eligibleNotPlannableCells, 'dinner') as
+                | (typeof report.eligibleNotPlannableCells)[number]
+                | undefined;
+            expect(demoted).toMatchObject({
+                threshold: 4,
+                count: 4,
+                usable: 1,
+                reason: 'insufficient_usable_recipes',
+            });
+            expect(demoted?.detail).toBe(
+                '1 of 4 eligible dinner recipes can appear in a feasible three day, short of the 4 this cell is ' +
+                    'measured against',
+            );
+        });
+
+        it('still certifies the reduced cells, whose threshold of two §0.7.3 measures differently', () => {
+            // One usable recipe is below the reduced threshold of 2 as well, so
+            // nothing is certified here either — stated explicitly so the two
+            // thresholds are not silently conflated.
+            expect(report.reducedCells).toEqual([]);
+            expect(report.eligibleNotPlannableCells.filter((cell) => cell.threshold === 2).length).toBe(124);
+        });
+    });
+
+    describe('a probe that runs out of evaluations', () => {
+        // One completed-day evaluation is nowhere near enough to decide a cell,
+        // and a corpus this plannable proves the branch is about the BUDGET and
+        // not about the recipes: at the production cap the same fixture
+        // certifies.
+        const report = deriveCoverageReport(corpus(), { maxEvaluationsPerProbe: 1 });
+
+        it('records the cap it ran under', () => {
+            expect(report.feasibility.evaluationCapPerProbe).toBe(1);
+            expect(report.feasibility.probes.every((probe) => probe.evaluations <= 1)).toBe(true);
+        });
+
+        it('says the search was exhausted rather than reporting the cell unplannable', () => {
+            const probe = probeIn(report, 'three');
+            expect(probe.searchExhausted).toBe(true);
+            // Neither list claims the undecided targets: an exhausted probe
+            // reports what it established and no more.
+            expect(probe.plannableTargets.length + probe.unplannableTargets.length).toBeLessThan(7);
+        });
+
+        it('certifies nothing and demotes with `search_exhausted`, which is not a claim about the corpus', () => {
+            expect(report.guaranteedCells).toEqual([]);
+            expect(report.reducedCells).toEqual([]);
+            expect(
+                report.eligibleNotPlannableCells.every(
+                    (cell) => cell.reason === 'search_exhausted' || cell.count < cell.threshold,
+                ),
+            ).toBe(true);
+
+            const demoted = cellIn(report.eligibleNotPlannableCells, 'lunch') as
+                | (typeof report.eligibleNotPlannableCells)[number]
+                | undefined;
+            expect(demoted).toMatchObject({ reason: 'search_exhausted', count: 4 });
+            expect(demoted?.detail).toContain('spent its budget of 1 day evaluations');
+            expect(demoted?.detail).toContain('neither proven able nor unable');
+        });
+
+        it('refuses a cap that could decide nothing at all', () => {
+            expect(() => deriveCoverageReport(corpus(), { maxEvaluationsPerProbe: 0 })).toThrow(RecipeSeedError);
+            expect(() => deriveCoverageReport(corpus(), { maxEvaluationsPerProbe: 2.5 })).toThrow(
+                /whole number of at least 1/,
+            );
+        });
+    });
+
+    it('agrees with the counting half on how many recipes a slot holds', () => {
+        // Two independent paths to the same number — `isEligibleForPlanning`
+        // over the recipes for `eligibleCounts`, and
+        // `eligibleRecipeCountForSlot` over the built candidates for the probe
+        // — so a divergence between what the table counts and what the probe
+        // searches cannot pass unnoticed.
+        const report = deriveCoverageReport(corpus());
+        const disagreements: string[] = [];
+
+        for (const probe of report.feasibility.probes) {
+            for (const slot of probe.slots) {
+                const counted = report.eligibleCounts.find(
+                    (cell) =>
+                        cell.diet === probe.diet &&
+                        cell.allergen === probe.allergen &&
+                        cell.slot === slot.slot &&
+                        cell.timeTier === probe.timeTier,
+                )?.count;
+
+                if (counted !== slot.eligible) {
+                    disagreements.push(
+                        `${probe.diet}/${probe.allergen}/${slot.slot}/${probe.timeTier}min: table ${String(counted)}, probe ${slot.eligible}`,
+                    );
+                }
+            }
+        }
+
+        expect(disagreements).toEqual([]);
+        expect(report.feasibility.probes.length).toBeGreaterThan(0);
     });
 });
 
@@ -3435,25 +4013,262 @@ describe('the database policy the stage runs under', () => {
 describe('describeFailure', () => {
     it('reports the stage\'s own refusal under its code', () => {
         expect(describeFailure(new RecipeSeedError('unknown_slug', 'no such slug')).code).toBe('unknown_slug');
-        // The CODE carries the refusal, not the message: a `recipes_invalid`
-        // error's per-problem detail reaches an operator through the
-        // `recipes_rejected` log line's `problems` list, which this repository
-        // authored. The reported error is the class and the code only.
+        // The CODE carries the class of refusal and the reported `error` stays
+        // closed at the name and the code (§8: never the raw error object).
+        // The per-defect prose is this repository's own and travels beside it,
+        // under the member named for that provenance — see the block below.
         expect(describeFailure(new RecipeSeedError('recipes_invalid', 'bad', ['one', 'two']))).toEqual({
             code: 'recipes_invalid',
             error: { name: 'RecipeSeedError', code: 'recipes_invalid' },
+            detail: { problemCount: 2, firstPartyMessage: 'bad\n  - one\n  - two' },
         });
     });
 
     it('reports anything unrecognised as unexpected rather than swallowing it', () => {
-        // An unrecognised failure is the case where withholding the message
+        // An unrecognised failure is the case where withholding the MESSAGE
         // matters most: nothing here knows what threw, so its prose could be a
         // driver's connection error quoting the DSN or a parser quoting the
-        // document. The code says "this stage did not anticipate it", which is
-        // the actionable half.
+        // document. The code says "this stage did not anticipate it" and the
+        // shared remedy says what to do with that, which is the actionable
+        // half; the foreign sentence stays out.
         expect(describeFailure(new Error('boom'))).toEqual({
             code: 'unexpected_error',
             error: { name: 'Error' },
+            detail: { remedy: UNEXPECTED_FAILURE_REMEDY },
+        });
+    });
+
+    /**
+     * THE DATABASE ARM, and the finding that added it.
+     *
+     * A seed takes its writer lock and the catalog graph hold through a raw
+     * `pg` session (runUnderWriterHold, lib/checkpoint.ts) BEFORE Prisma has
+     * opened anything, so a database that will not serve the run fails there,
+     * with nothing in between to translate it: what arrives is a node-postgres
+     * `DatabaseError` whose `name` is the literal lower-case `'error'` and whose
+     * `code` is a five-character SQLSTATE. It matched none of this stage's
+     * classes, so the most ordinary failure an operator can cause — a host at
+     * `max_connections` — was reported as
+     * `{"code":"unexpected_error","error":{"name":"error"}}`: no class, no
+     * SQLSTATE, no remedy, and triage by guesswork. The taxonomy itself lives in
+     * scripts/lib/logger.ts so every stage answers a SQLSTATE the same way;
+     * what is asserted here is that this stage consults it, and where.
+     */
+    describe('a database that will not serve the run', () => {
+        const driverFailure = (code: string): Error => {
+            // The shape node-postgres really throws: `name` is `'error'`, and
+            // the SQLSTATE is on `code`. A real 53300 is driven through the
+            // command itself by the CLI evidence for this finding; what matters
+            // here is that the reporter answers it, and these two members are
+            // what decides that.
+            const error = new Error(`connection failure (${code})`);
+            error.name = 'error';
+            (error as unknown as { code: string }).code = code;
+
+            return error;
+        };
+
+        it('names a refused connection rather than reporting a surprise', () => {
+            const described = describeFailure(driverFailure('53300'));
+
+            expect(described.code).toBe('database_unavailable');
+            // The SQLSTATE survives beside the name, which is the one
+            // machine-readable fact the driver supplied.
+            expect(described.error).toEqual({ name: 'error', code: '53300' });
+            expect(String(described.detail?.remedy)).toContain('connection limit');
+        });
+
+        it.each([
+            ['3D000', 'database_missing', 'a database that does not exist'],
+            ['28P01', 'database_authentication_failed', 'a rejected password'],
+            ['42P01', 'database_error', 'a target that was never migrated'],
+            ['ECONNREFUSED', 'database_unavailable', 'a target that refused the socket'],
+        ])('reports %s as %s — %s', (code, expected) => {
+            const described = describeFailure(driverFailure(code));
+
+            expect(described.code).toBe(expected);
+            expect(described.error.code).toBe(code);
+            // Every one of the four carries a remedy that ends in an action.
+            // Three of them name DATABASE_URL as the thing to correct;
+            // `database_error` names the SQLSTATE table instead, because the
+            // connection string is not what is wrong there.
+            expect(String(described.detail?.remedy)).toContain('run the stage again');
+        });
+
+        it('names DATABASE_URL on the three failures an operator fixes there', () => {
+            for (const code of ['53300', '3D000', '28P01']) {
+                expect(String(describeFailure(driverFailure(code)).detail?.remedy)).toContain('DATABASE_URL');
+            }
+            // And sends a refused STATEMENT to the error-code table instead,
+            // which is where that answer lives.
+            expect(String(describeFailure(driverFailure('42P01')).detail?.remedy)).toContain(
+                'PostgreSQL error-code table',
+            );
+        });
+
+        // The clause the shared taxonomy cannot know, and the one place this
+        // stage must NOT copy `catalog-import-usda.ts`: an import continues
+        // from its checkpoint with `--resume`, and this stage has no such flag.
+        // What it has instead is idempotency by slug, so the same command is
+        // the whole recovery procedure — and the one thing that can delay it is
+        // the interrupted attempt's own ledger lease.
+        it('appends what re-running THIS stage actually does, and never an --resume it does not have', () => {
+            const remedy = String(describeFailure(driverFailure('08006')).detail?.remedy);
+
+            expect(remedy).toContain('needs no --resume');
+            expect(remedy).toContain('idempotent by slug');
+            expect(remedy).toContain('seed_in_progress');
+            expect(remedy).toContain(`${RECIPE_SEED_RUN_LEASE_MS / 1000} seconds`);
+        });
+
+        it('gives the same answer when Prisma is the client that failed', () => {
+            // Two clients reach this database on a seed — the lock sessions'
+            // raw `pg` and the publication client's Prisma — and an operator's
+            // fix does not depend on which one noticed.
+            const prismaFailure = new Error('cannot reach database server');
+            prismaFailure.name = 'PrismaClientInitializationError';
+            (prismaFailure as unknown as { code: string }).code = 'P1001';
+
+            expect(describeFailure(prismaFailure).code).toBe('database_unavailable');
+        });
+
+        it('does not file a Prisma query error as infrastructure', () => {
+            // P2002 is a unique-constraint violation: on this stage that is a
+            // corpus or a publication defect wearing a database code — two
+            // recipe files claiming one slug, or a promotion racing itself —
+            // and reporting it under the one heading an operator reads as "not
+            // your code" would send them to the wrong place.
+            const violation = new Error('unique constraint failed on recipes.slug');
+            violation.name = 'PrismaClientKnownRequestError';
+            (violation as unknown as { code: string }).code = 'P2002';
+
+            const described = describeFailure(violation);
+
+            expect(described.code).toBe('unexpected_error');
+            // The code is still reported, because `safeError` carries it: the
+            // operator is told P2002 and told that the stage did not classify
+            // it, which is the honest pair.
+            expect(described.error.code).toBe('P2002');
+            expect(described.detail?.remedy).toBe(UNEXPECTED_FAILURE_REMEDY);
+        });
+
+        it('reports no driver prose on any of them, so the widening cost nothing', () => {
+            // The remedy is fixed prose from this repository and the SQLSTATE is
+            // five characters the driver assigned. Neither is vendor text, and
+            // the driver's own sentence — which quotes the database name and,
+            // on a connection failure, the target it could not reach — is still
+            // absent.
+            const described = describeFailure(driverFailure('3D000'));
+
+            expect(described.error).not.toHaveProperty('message');
+            expect(JSON.stringify(described)).not.toContain('connection failure');
+            expect(Object.keys(described.detail ?? {})).toEqual(['remedy']);
+        });
+
+        it('classifies nothing that is not a database failure, so the arm cannot swallow the ladder', () => {
+            // Anti-vacuity from the other side: the classifier is what decides
+            // whether this arm runs at all, and it must return null for the
+            // classes above it. Typed as its own return type so the comparisons
+            // below are the real narrowing the production code performs.
+            const unclassified: ReturnType<typeof classifyInfrastructureFailure> =
+                classifyInfrastructureFailure(new RecipeSeedError('recipes_invalid', 'bad'));
+
+            expect(unclassified).toBeNull();
+            expect(classifyInfrastructureFailure(new Error('boom'))).toBeNull();
+            expect(classifyInfrastructureFailure(driverFailure('53300'))).not.toBeNull();
+        });
+    });
+
+    /**
+     * The arms that forward their OWN sentence, and the one that must not.
+     *
+     * `safeError` carries no `message` because that field is where a driver's
+     * connection string or a vendor's document reaches a log (CWE-532). That
+     * rule is about text this repository did not author. A seed refusal is the
+     * opposite case: it names the recipe file, the declared field that
+     * disagreed with the derivation and the ingredient `source_key` that could
+     * not be resolved — §0.7.3's "fails loudly with the offending recipe and
+     * ingredient" — so it travels under its own member, scrubbed and bounded,
+     * at the sites that have already narrowed to a first-party class.
+     * `DatabaseOriginError` is first-party too and is still withheld, because
+     * its sentence is the host and database the guard refused.
+     */
+    describe('the sentences a first-party failure is allowed to carry', () => {
+        it('names the file and the unresolvable ingredient a seed refusal was about', () => {
+            const described = describeFailure(
+                new RecipeSeedError('recipes_invalid', '1 problem in the selected recipe files; nothing was published', [
+                    'tofu-broccoli-bowl (recipes/tofu-broccoli-bowl.json): ingredient "test:sesame-oil" resolves to no catalog_foods row; load the catalog release that carries it',
+                ]),
+            );
+
+            expect(described.detail?.problemCount).toBe(1);
+            expect(String(described.detail?.firstPartyMessage)).toContain('recipes/tofu-broccoli-bowl.json');
+            expect(String(described.detail?.firstPartyMessage)).toContain('test:sesame-oil');
+        });
+
+        it('omits the count for a refusal that carries no defect list', () => {
+            // Absent rather than `0`: the omit-when-absent convention
+            // `safeError` follows, so a member that never existed does not read
+            // as one that was lost.
+            expect(describeFailure(new RecipeSeedError('unknown_slug', '--only named no file'))).toEqual({
+                code: 'unknown_slug',
+                error: { name: 'RecipeSeedError', code: 'unknown_slug' },
+                detail: { firstPartyMessage: '--only named no file' },
+            });
+        });
+
+        it('scrubs that sentence even though this repository wrote it', () => {
+            // The narrowing obligation is not the only defence: a first-party
+            // message can still interpolate a DSN, and `run_ledger_unavailable`
+            // is exactly the refusal whose author might reach for one.
+            const described = describeFailure(
+                new RecipeSeedError('run_ledger_unavailable', 'cannot record the run through postgresql://user:pa@ss@localhost:5433/db'),
+            );
+            const forwarded = String(described.detail?.firstPartyMessage);
+
+            expect(forwarded).toBe('cannot record the run through postgresql://***@localhost:5433/db');
+            // Aimed at the forwarded VALUE, because the credential's fragments
+            // are short: `ss` occurs in the key `firstPartyMessage` itself, so
+            // asserting over the rendered document would be an assertion about
+            // this member's NAME rather than about the password.
+            for (const fragment of ['pa@ss', 'pa', 'ss', 'user:', 'user']) {
+                expect(forwarded).not.toContain(fragment);
+            }
+            for (const fragment of ['pa@ss', 'user:', ':pa']) {
+                expect(JSON.stringify(described)).not.toContain(fragment);
+            }
+        });
+
+        it('carries a manifest refusal\'s sentence, which is the half an operator acts on', () => {
+            const described = describeFailure(
+                new ManifestError(
+                    'version_mismatch',
+                    'data/meal-planning/coverage-plan.v1.json declares coveragePlanVersion v2, expected v1',
+                ),
+            );
+
+            expect(described.code).toBe('version_mismatch');
+            expect(described.detail?.firstPartyMessage).toBe(
+                'data/meal-planning/coverage-plan.v1.json declares coveragePlanVersion v2, expected v1',
+            );
+        });
+
+        it('withholds a database-origin refusal\'s sentence, because it names the target', () => {
+            const described = describeFailure(
+                new DatabaseOriginError(
+                    'recipes-seed refuses database "state_of_health" on host "db.example.com"',
+                    'unrecognised_origin',
+                    classifyDatabaseOrigin('postgresql://svc:secret@db.example.com:5432/state_of_health'),
+                ),
+            );
+
+            expect(described.code).toBe('unrecognised_origin');
+            expect(described.detail).toBeUndefined();
+            // dbGuard reports this refusal itself, with the target reduced to a
+            // digest. Forwarding the sentence would publish the topology that
+            // line takes care to withhold.
+            expect(JSON.stringify(described)).not.toContain('db.example.com');
+            expect(JSON.stringify(described)).not.toContain('state_of_health');
         });
     });
 });

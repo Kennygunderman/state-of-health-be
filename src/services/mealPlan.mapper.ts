@@ -1051,6 +1051,29 @@ export const toMealPlanDayResponse = (
  * `days` are sorted by date, so "the seven days, in date order" is a property of
  * the DTO rather than of the caller's `ORDER BY`. The keys are `YYYY-MM-DD`, for
  * which code-unit order is chronological order.
+ *
+ * THIS COMPOSITION IS PAYLOAD-BOUND RATHER THAN QUERY-BOUND, measured here
+ * because this is the function whose output size sets it. `GET /plans/current`
+ * issues a CONSTANT twelve statements (twelve distinct texts) whether the
+ * hydrated weeks hold 7, 14 or 28 days, while the body grows linearly at about
+ * 1.7 KB per planned day — 12.3 KB, 24.0 KB, 47.6 KB. Measured PostgreSQL
+ * execution across those twelve statements is 0–1 ms of a 15–19 ms request
+ * (Prisma reports integer milliseconds, so the real figure sits under its
+ * resolution), which puts effectively the whole cost in this composition, JSON
+ * serialisation and transport rather than in planning or execution. Latency is
+ * fixed-cost-dominated at these sizes: 3.9x the bytes moves the request only
+ * from 14.8 ms to 18.7 ms.
+ *
+ * SO THE LEVER IS THE NUMBER OF DAYS HYDRATED, not a statement or an index —
+ * there is nothing here to tune, and the only two reductions available would be
+ * trimming per-day content or paging the days. NEITHER IS WARRANTED AT THE
+ * SHIPPED SHAPE, which is a bound and not a preference: §0.5.2 fixes a plan at
+ * seven days, so the shipped body is the 12.3 KB one and the 14- and 28-day
+ * figures above are stress fixtures recording headroom. The threshold at which
+ * this stops being true is a member whose day count rises into the tens, and
+ * that cannot happen without a schema change. Hydrating BOTH members of
+ * `/plans/current` in full is the one multiplier already in force, and it
+ * doubles a 12 KB body rather than a large one.
  */
 export const toMealPlanResponse = (
     plan: PlanRow,

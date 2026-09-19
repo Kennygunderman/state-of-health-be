@@ -140,8 +140,8 @@ import {
 } from './catalog.logic';
 import {
     CatalogFoodPortionRow,
-    CatalogFoodRow,
     CatalogReleaseRunRow,
+    CatalogSearchPageRow,
     CatalogStatusCounts,
     CatalogSuggestionRow,
     mapCatalogFood,
@@ -193,6 +193,42 @@ type SnapshotClient = Prisma.TransactionClient;
 const SNAPSHOT_OPTIONS = {
     isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead,
 } as const;
+
+/**
+ * Makes PostgreSQL plan the search statements against the ACTUAL parameter
+ * values for the duration of one transaction.
+ *
+ * WHY THIS IS NOT OPTIONAL. Every branch of the match set is index-served only
+ * when the planner can see the values: the two prefix branches derive their
+ * B-tree range bounds (`alias >= 'beef' AND alias < 'beeg'`) from the `LIKE`
+ * pattern, and the two full-text branches take their selectivity from the
+ * tsquery. Prisma sends these as parameterised prepared statements, and the
+ * statement text is IDENTICAL for every query the app runs — only the bind
+ * values differ — so one plan-cache entry serves them all. With the default
+ * `plan_cache_mode = auto`, PostgreSQL builds custom plans for the first five
+ * executions and then switches to a GENERIC plan, which cannot derive a range
+ * bound from an unknown parameter and so abandons the indexes entirely.
+ *
+ * Measured on the 10,928-food / 15,777-alias v1 release, p95 of
+ * `searchPublishedFoods(q, 1, 25)`: the first query of a connection ran in
+ * 64 ms and every query after it in 196-283 ms, because only the first was
+ * planned with values. Under `force_custom_plan` the same statements run in
+ * 2.9-79.5 ms across the whole query set. Re-planning costs ~1.3 ms of planning
+ * time per execution, which the index bounds repay many times over.
+ *
+ * WHY `SET LOCAL`. The setting reverts at COMMIT or ROLLBACK, so it cannot
+ * outlive this transaction on a pooled connection and no other feature's
+ * statements are ever planned under it. Scoping it here rather than on the
+ * connection string also keeps the decision beside the statements whose plans
+ * depend on it — a `DATABASE_URL` option would be invisible from this file and
+ * would silently change planning for every query in the service.
+ *
+ * This is a planning directive only: it changes no result, no ordering and no
+ * row count. `benchmark.test.ts` pins the effect it exists for.
+ */
+const forceCustomPlanForThisTransaction = async (db: SnapshotClient): Promise<void> => {
+    await db.$executeRaw`SET LOCAL plan_cache_mode = force_custom_plan`;
+};
 
 /* ---------------------------------------------------------------------------
  * What the catalog considers visible
@@ -465,9 +501,18 @@ export interface CatalogSearchResult {
  *     kept as the weaker {@link SEARCH_RELEVANCE.textOnly} path so a food
  *     matched only by a state or group word is still found and still ranked
  *     last among real matches.
- *  2. Every alias, scored on the fly. Aliases carry no tsvector column of their
- *     own, so their vector is computed per row; a LATERAL binds it once so the
- *     `@@` test and the `ts_rank` do not each recompute it. This branch is
+ *  2. Every alias, scored from its own stored vector. `catalog_food_aliases`
+ *     carries a STORED generated `search_vector` over
+ *     `to_tsvector('english', coalesce(alias, ''))`, added by
+ *     `20260911000000_catalog_alias_search_vector_and_read_stats` and indexed
+ *     with GIN, so both the `@@` test and the `ts_rank` read one materialised
+ *     column instead of recomputing the vector per row. This is not a
+ *     micro-optimisation: the previous shape projected `to_tsvector(...)`
+ *     through a LATERAL and tested the projection, which no index can answer,
+ *     so it tokenised all 15,777 aliases on every request whatever the query
+ *     matched. See {@link catalogMatchSet}'s comment for the measurement and
+ *     for why `TEXT_SEARCH_CONFIG` must stay equal to the configuration the
+ *     column was generated under. This branch is
  *     load-bearing rather than redundant: it is what lets a food be found by a
  *     word that appears in none of its own columns — "eggplant" reaching
  *     "Aubergine" — and nothing guarantees a food's `search_text` repeats its
@@ -566,11 +611,43 @@ export interface CatalogSearchResult {
  * scan and a sequential read of every published alias is a plan property, and a
  * timing would put host load into the evidence.
  *
- * The alias branches still read the whole published alias set for the two
- * full-text contributions, because the schema declares no GIN index over aliases
- * and a trigram index would need `CREATE EXTENSION pg_trgm`, which this schema
- * deliberately does not use. That cost is stated here rather than hidden, and it
- * is what `npm run search:benchmark` measures against the p95 threshold.
+ * ALL FOUR BRANCHES ARE NOW INDEX-SERVED, AND THE TWO ALIAS BRANCHES WERE NOT
+ * ALWAYS. Both reached `catalog_food_aliases` sequentially, for two unrelated
+ * reasons, and `20260911000000_catalog_alias_search_vector_and_read_stats` fixed
+ * each at its own cause:
+ *
+ *  * The alias FULL-TEXT contribution projected `to_tsvector('english',
+ *    a.alias)` through a LATERAL and tested the projection, which no index can
+ *    answer — so it recomputed the vector for every alias in the table on every
+ *    evaluation. Measured on the shipped release that branch was 45 ms of a
+ *    91 ms match set, and the cost was FIXED rather than proportional: a term
+ *    matching nothing paid the same 15,777 `to_tsvector` calls. It now tests
+ *    `a.search_vector` — a STORED generated column carrying the identical
+ *    expression — against `idx_catalog_food_aliases_search_vector`. The tsquery
+ *    still arrives as a nested-loop parameter out of the `search` CTE, which a
+ *    GIN index condition accepts; that is the asymmetry with the prefix branches
+ *    above, whose range bounds need a plan-time constant. `TEXT_SEARCH_CONFIG`
+ *    must stay equal to the configuration the column was generated under, or
+ *    the branch silently under-matches instead of failing.
+ *  * The alias PREFIX contribution had its index already, and still read
+ *    `catalog_foods` end to end — not for a column, but to test
+ *    `publication_status`. With ~1,100 matching aliases the planner costed 1,100
+ *    primary-key probes above a hash join and sequentially scanned all 10,928
+ *    published foods to build the probe side, twice per request. It now resolves
+ *    the owning food through a `JOIN LATERAL ... LIMIT 1`, which cannot be
+ *    flattened back into a join and so is a primary-key lookup per matching
+ *    alias by construction rather than by the planner's estimate of the day.
+ *    `EXISTS` would read more naturally and is not used, because it can still be
+ *    turned into a hash semi-join and would put the defect back.
+ *
+ * The alias full-text branch still joins `catalog_foods` normally, because it
+ * genuinely needs a column from it: `name_parts.words` divides the alias rank by
+ * the longer of the alias and display-name word counts.
+ *
+ * No trigram index is involved in any of this, and `CREATE EXTENSION pg_trgm` is
+ * still not used — a stored tsvector and the ASCII-fold expression indexes are
+ * built-in constructs. `npm run search:benchmark` measures the result against the
+ * p95 threshold.
  */
 const catalogMatchSet = (q: string): Prisma.Sql => {
     // Folded with `foldSearchAscii` and not with `toLowerCase()`, because the
@@ -634,27 +711,29 @@ const catalogMatchSet = (q: string): Prisma.Sql => {
                         THEN ${SEARCH_RELEVANCE.aliasHeadNoun}::real
                     ELSE ${SEARCH_RELEVANCE.aliasOther}::real
                 END
-                    * ts_rank(alias_vector.value, s.tsq)
+                    * ts_rank(a.search_vector, s.tsq)
                     / name_parts.words) AS rank
             FROM catalog_food_aliases a
             JOIN catalog_foods f ON f.id = a.catalog_food_id
             CROSS JOIN search s
             CROSS JOIN LATERAL (
-                SELECT to_tsvector(${TEXT_SEARCH_CONFIG}::regconfig, a.alias) AS value
-            ) alias_vector
-            CROSS JOIN LATERAL (
                 SELECT GREATEST(${wordCountOf(ALIAS)}, ${wordCountOf(DISPLAY_NAME)}) AS words
             ) name_parts
             WHERE f.publication_status = ${PUBLISHED}
-                AND alias_vector.value @@ s.tsq
+                AND a.search_vector @@ s.tsq
 
             UNION ALL
 
             SELECT a.catalog_food_id AS id, ${prefixCoverageScore(queryLength, ALIAS)} AS rank
             FROM catalog_food_aliases a
-            JOIN catalog_foods f ON f.id = a.catalog_food_id
-            WHERE f.publication_status = ${PUBLISHED}
-                AND ${asciiFoldOf(ALIAS)} LIKE ${prefixPattern}
+            JOIN LATERAL (
+                SELECT 1 AS published
+                FROM catalog_foods f
+                WHERE f.id = a.catalog_food_id
+                    AND f.publication_status = ${PUBLISHED}
+                LIMIT 1
+            ) published_food ON TRUE
+            WHERE ${asciiFoldOf(ALIAS)} LIKE ${prefixPattern}
         )
     `;
 };
@@ -704,7 +783,7 @@ const catalogMatchSet = (q: string): Prisma.Sql => {
  * `data/meal-planning/search-benchmark.v1.json` records it as the pinned choice.
  */
 const selectSearchPage = (db: SnapshotClient, matchSet: Prisma.Sql, limit: number, offset: number) =>
-    db.$queryRaw<CatalogFoodRow[]>`
+    db.$queryRaw<CatalogSearchPageRow[]>`
         ${matchSet},
         ranked AS (
             SELECT id, MAX(rank) AS rank
@@ -712,6 +791,7 @@ const selectSearchPage = (db: SnapshotClient, matchSet: Prisma.Sql, limit: numbe
             GROUP BY id
         )
         SELECT
+            COUNT(*) OVER () AS match_total,
             f.id,
             f.display_name,
             f.category,
@@ -736,18 +816,76 @@ const selectSearchPage = (db: SnapshotClient, matchSet: Prisma.Sql, limit: numbe
     `;
 
 /**
- * The size of the whole match set.
+ * The size of the whole match set, for the one case the page cannot report it.
  *
  * `COUNT(DISTINCT id)` over the same contributions the page is built from, so it
  * counts the DE-DUPLICATED set the client will actually be paged through and not
  * the pre-aggregation join rows. Run on the caller's snapshot client, so the
  * count describes the same catalog the page came from.
+ *
+ * THIS IS NOW A FALLBACK, NOT THE NORMAL PATH. `selectSearchPage` carries the
+ * same number as a `COUNT(*) OVER ()` window, so a request that returns any row
+ * already knows its total and this statement does not run. It survives because a
+ * window total travels ON the rows: a page past the end of the match set returns
+ * none, and reporting `total: 0` for a query with a thousand matches would be a
+ * wrong answer rather than a slower one. `searchPublishedFoods` therefore calls
+ * this only when the page came back empty at a NON-ZERO offset — page one of a
+ * genuinely empty match set needs no statement, because zero is the true total
+ * there.
+ *
+ * Re-running the match-set CTE is exactly what made this expensive as an
+ * unconditional second statement: measured on the shipped release it re-executed
+ * the whole four-branch Append for 36% of a worst-case request's SQL time, and
+ * 45% of a zero-result one's. That cost is now paid only by an out-of-range page,
+ * which no paging client issues — the mobile infinite query steps while
+ * `page < totalPages` — and which is correct when it is paid.
  */
 const countSearchMatches = (db: SnapshotClient, matchSet: Prisma.Sql) =>
     db.$queryRaw<{ count: bigint }[]>`
         ${matchSet}
         SELECT COUNT(DISTINCT id) AS count FROM contributions
     `;
+
+/**
+ * The size of the match set one answered page was cut from.
+ *
+ * Reads the window total off the page, because every row of a page carries the
+ * same `COUNT(*) OVER ()` value, and falls back to {@link countSearchMatches}
+ * for the single case a window cannot answer: a page past the end of the match
+ * set returns no rows and therefore no total.
+ *
+ * The offset is what separates the two empty cases, and they are genuinely
+ * different answers rather than one answer reached two ways. At offset zero an
+ * empty page means an empty match set, whose size is zero — a statement asking
+ * PostgreSQL to confirm that would return the same zero. At a non-zero offset an
+ * empty page means the caller asked for page fifty of a three-page result, and
+ * the total is whatever the match set holds; reporting zero would make
+ * `totalPages` zero for a query that matches a thousand foods.
+ *
+ * Runs on the caller's snapshot client, so a fallback count describes the same
+ * catalog the page was cut from rather than one a concurrent release load has
+ * since changed.
+ */
+const resolveMatchTotal = async (
+    db: SnapshotClient,
+    matchSet: Prisma.Sql,
+    rows: readonly CatalogSearchPageRow[],
+    offset: number,
+): Promise<number> => {
+    const windowTotal = rows[0]?.match_total;
+
+    if (windowTotal !== undefined) {
+        return Number(windowTotal);
+    }
+
+    if (offset === 0) {
+        return 0;
+    }
+
+    const totals = await countSearchMatches(db, matchSet);
+
+    return Number(totals[0]?.count ?? 0);
+};
 
 /**
  * The default portions of one page of foods, grouped by food.
@@ -819,13 +957,20 @@ const defaultPortionsByFood = async (
  * pass vacuously, which is why `rowWindowFor`'s own guard (`MAX_ROWS`) sits far
  * above the route's cap.
  *
- * THE THREE STATEMENTS READ ONE SNAPSHOT. Page, total and default portions are a
+ * EVERY STATEMENT READS ONE SNAPSHOT. Page, total and default portions are a
  * single answer: the total describes the set the page came from, and every
  * returned food must have the portion that food actually has. Read through
  * separate pool connections they can straddle a catalog load, so they run
  * sequentially inside one REPEATABLE READ transaction — see {@link
  * SnapshotClient} for what that prevents and {@link SNAPSHOT_OPTIONS} for why
  * that isolation level.
+ *
+ * THERE ARE NORMALLY TWO OF THEM, and there used to be three. The total now
+ * rides on the page as a `COUNT(*) OVER ()` window instead of re-running the
+ * whole match-set CTE in a statement of its own, which was costing 36% of a
+ * worst-case request. {@link resolveMatchTotal} adds the third statement back
+ * only for a page requested past the end of a non-empty match set, where a
+ * window total cannot exist because no row came back to carry it.
  */
 export const searchPublishedFoods = async (
     q: string,
@@ -840,8 +985,9 @@ export const searchPublishedFoods = async (
     const { limit: rowLimit, offset } = rowWindowFor(page, limit);
 
     return prisma.$transaction(async (db) => {
+        await forceCustomPlanForThisTransaction(db);
+
         const rows = await selectSearchPage(db, matchSet, rowLimit, offset);
-        const totals = await countSearchMatches(db, matchSet);
         const portions = await defaultPortionsByFood(
             db,
             rows.map((row) => row.id),
@@ -852,7 +998,7 @@ export const searchPublishedFoods = async (
             // survives: the portion lookup is keyed by id and must not reorder
             // the page.
             items: rows.map((row) => mapCatalogFood(row, portions.get(row.id) ?? [])),
-            total: Number(totals[0]?.count ?? 0),
+            total: await resolveMatchTotal(db, matchSet, rows, offset),
         };
     }, SNAPSHOT_OPTIONS);
 };

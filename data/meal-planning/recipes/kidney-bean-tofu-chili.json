@@ -1,0 +1,138 @@
+{
+  "slug": "kidney-bean-tofu-chili",
+  "name": "Kidney bean and tofu chili",
+  "description": "A thick weeknight chili of kidney beans, crumbled tofu and mushrooms in a spiced tomato base — three servings from one pot in under half an hour.",
+  "iconKey": "pot",
+  "instructions": [
+    "Heat the canola oil in a large pot over medium heat and cook the onion and bell pepper for 5 minutes, until soft.",
+    "Add the garlic, the chili powder and the ground cumin and cook for 1 minute, until fragrant.",
+    "Add the mushrooms and cook for 4 minutes, until they have given up their liquid.",
+    "Crumble in the tofu, add the chopped tomato and the salt, and simmer for 6 minutes, stirring now and then.",
+    "Stir in the kidney beans and simmer for 5 minutes more, until the chili is thick enough to hold a spoon upright."
+  ],
+  "yieldServings": 3,
+  "servingDescription": "1 bowl",
+  "prepMinutes": 10,
+  "cookMinutes": 20,
+  "mealSlots": [
+    "dinner"
+  ],
+  "dietTags": [
+    "gluten_free",
+    "pescatarian",
+    "vegan",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "soy"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 2,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "dairy_free",
+    "vegan"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:174285",
+      "quantity": 1,
+      "unit": "can",
+      "gramWeight": 266,
+      "displayText": "1 can, drained",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:172448",
+      "quantity": 450,
+      "unit": "g",
+      "gramWeight": 450,
+      "displayText": "450 g",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169251",
+      "quantity": 4,
+      "unit": "cup",
+      "gramWeight": 280,
+      "displayText": "4 cups, sliced",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170457",
+      "quantity": 2,
+      "unit": "each",
+      "gramWeight": 246,
+      "displayText": "2 tomatoes, chopped",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170000",
+      "quantity": 0.75,
+      "unit": "cup",
+      "gramWeight": 120,
+      "displayText": "¾ cup, chopped",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170108",
+      "quantity": 1,
+      "unit": "cup",
+      "gramWeight": 149,
+      "displayText": "1 cup, chopped",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:172336",
+      "quantity": 0.75,
+      "unit": "tbsp",
+      "gramWeight": 10,
+      "displayText": "¾ tbsp",
+      "sortOrder": 6,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169230",
+      "quantity": 3,
+      "unit": "clove",
+      "gramWeight": 9,
+      "displayText": "3 cloves",
+      "sortOrder": 7,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171319",
+      "quantity": 2,
+      "unit": "tsp",
+      "gramWeight": 5.4,
+      "displayText": "2 tsp",
+      "sortOrder": 8,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170923",
+      "quantity": 2,
+      "unit": "tsp",
+      "gramWeight": 4.2,
+      "displayText": "2 tsp",
+      "sortOrder": 9,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 0.75,
+      "unit": "tsp",
+      "gramWeight": 4.5,
+      "displayText": "¾ tsp",
+      "sortOrder": 10,
+      "isOptional": false
+    }
+  ]
+}

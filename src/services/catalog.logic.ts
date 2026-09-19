@@ -4421,3 +4421,223 @@ export const assessComponentCoverage = (
         derivedCount: derived.length,
     };
 };
+
+/* ---------------------------------------------------------------------------
+ * Evidence artefacts — which run's write may replace which run's evidence
+ * ------------------------------------------------------------------------- */
+
+/**
+ * The block every writer of a committed evidence artefact records its target's
+ * identity in, and the field inside it that carries the digest.
+ *
+ * WHY THIS EXISTS AT ALL. `data/meal-planning/reports/latest/import-report.json`
+ * and `validation-report.json` are co-written by `catalog:import`,
+ * `catalog:generate`, `catalog:validate` and `catalog:report`, each merging its
+ * own half over what it finds. Every one of those merges was unconditional, and
+ * the artefacts deliberately record `environment.valuesRecorded: "none —
+ * environment variable names only, never their values"` — so nothing in either
+ * file said WHICH database it described, and a run pointed at another one
+ * merged its figures into the same document undetectably. QA produced exactly
+ * that: a report run against database A, a validate run against B and a
+ * generation run against C left one committed artefact whose `requirement` came
+ * from A, whose `counts` came from B and whose generation block came from C,
+ * with nothing in the file able to say so.
+ *
+ * WHY A DIGEST AND NOT THE NAME. The host and the database name are
+ * infrastructure topology, and these artefacts are committed and copied into CI
+ * output, so recording them would publish an organisation's internal topology
+ * (CWE-532) — which is the same argument `scripts/lib/dbGuard.ts` makes for
+ * logging `targetDigest` instead of the target. The digest answers the one
+ * question an artefact needs answered — were two writes pointed at the same
+ * database — and cannot answer any other.
+ */
+export const CATALOG_ARTIFACT_TARGET_IDENTITY_KEY = 'targetIdentity';
+export const CATALOG_ARTIFACT_TARGET_DIGEST_FIELD = 'targetDigest';
+
+/**
+ * The digest value that means "the writing run could not name its target".
+ *
+ * Identical to what `scripts/lib/logger.ts`'s `opaqueDigest` returns for an
+ * empty input, because that is exactly where it comes from: a run whose
+ * `DATABASE_URL` fixes no host and no database name hashes an empty string.
+ * Such a value is NOT an identity, so it is read as no recorded identity at all
+ * rather than as a target that differs from every real one.
+ */
+export const CATALOG_ARTIFACT_UNIDENTIFIED_TARGET = 'none';
+
+/**
+ * What a write found when it compared its own target with the one the artefact
+ * on disk records.
+ *
+ *   * `first_write` — nothing is at that path, so there is no claim to contradict.
+ *   * `adopted`     — the artefact records no usable digest. Every artefact
+ *                     committed before this mechanism existed is in this state,
+ *                     so it is ADOPTED and not refused: refusing here would
+ *                     break the legitimate pipeline until somebody re-published
+ *                     every report, and no committed file may need editing to
+ *                     accommodate a code change.
+ *   * `agrees`      — the recorded digest is this run's.
+ *   * `differs`     — the recorded digest is some other database's. This is the
+ *                     case the mechanism exists for, and the only one that
+ *                     refuses.
+ */
+export type CatalogArtifactTargetVerdict = 'first_write' | 'adopted' | 'agrees' | 'differs';
+
+export interface CatalogArtifactTargetDecision {
+    readonly verdict: CatalogArtifactTargetVerdict;
+    /** The digest the artefact records, or `null` when it records none usable. */
+    readonly recordedDigest: string | null;
+    /** This run's own digest, which the write records. */
+    readonly runDigest: string;
+    /**
+     * Whether the write may proceed.
+     *
+     * Derived here rather than at each of the three call sites: "which verdicts
+     * permit a write" is one rule, and three stages re-deriving it from the
+     * verdict union is how one of them ends up permitting `differs`.
+     */
+    readonly mayWrite: boolean;
+}
+
+/**
+ * The digest an artefact records, or `null` when it records none this rule can
+ * use.
+ *
+ * Absent block, non-object block, absent field, non-string field, empty string
+ * and {@link CATALOG_ARTIFACT_UNIDENTIFIED_TARGET} are one answer: the document
+ * does not say which database it describes. Read as text from a parsed JSON
+ * document, so every one of those shapes is reachable from a file on disk and
+ * none of them may be asserted out of existence by a cast at the call site.
+ */
+const recordedArtifactTargetDigest = (existing: Readonly<Record<string, unknown>>): string | null => {
+    const block = existing[CATALOG_ARTIFACT_TARGET_IDENTITY_KEY];
+
+    if (block === null || typeof block !== 'object' || Array.isArray(block)) {
+        return null;
+    }
+
+    const recorded = (block as Record<string, unknown>)[CATALOG_ARTIFACT_TARGET_DIGEST_FIELD];
+
+    if (typeof recorded !== 'string' || recorded.length === 0 || recorded === CATALOG_ARTIFACT_UNIDENTIFIED_TARGET) {
+        return null;
+    }
+
+    return recorded;
+};
+
+/**
+ * Whether this run may merge into the artefact whose fields are `existing`.
+ *
+ * `existing` is `null` for a path that holds nothing — the ordinary first
+ * write — and otherwise the document's own top-level fields as they were read
+ * off disk.
+ *
+ * A run that cannot name its own target (`runDigest` is
+ * {@link CATALOG_ARTIFACT_UNIDENTIFIED_TARGET}) and finds a RECORDED identity
+ * gets `differs`, deliberately: an unidentified write must not replace evidence
+ * produced against a named database, and every stage entry point classifies its
+ * origin before it reaches a write, so this can only be a harness or a
+ * misconfiguration. The reverse — a named run over an unidentified artefact —
+ * is the adoption path above.
+ */
+export const decideCatalogArtifactTarget = (
+    existing: Readonly<Record<string, unknown>> | null,
+    runDigest: string,
+): CatalogArtifactTargetDecision => {
+    if (existing === null) {
+        return { verdict: 'first_write', recordedDigest: null, runDigest, mayWrite: true };
+    }
+
+    const recordedDigest = recordedArtifactTargetDigest(existing);
+
+    if (recordedDigest === null) {
+        return { verdict: 'adopted', recordedDigest: null, runDigest, mayWrite: true };
+    }
+
+    if (recordedDigest === runDigest) {
+        return { verdict: 'agrees', recordedDigest, runDigest, mayWrite: true };
+    }
+
+    return { verdict: 'differs', recordedDigest, runDigest, mayWrite: false };
+};
+
+/**
+ * A write refused because the artefact it would have merged into describes a
+ * different database.
+ *
+ * Its own class rather than a stage's general failure, because the remedy is
+ * neither a code change nor a data repair: the operator pointed a stage at one
+ * database and a report directory produced against another, and the answer is
+ * to publish to a different directory (`catalog:report --out`) or to re-publish
+ * the pair from the database this run addresses. Each stage maps it to its own
+ * reported code at its edge (Rule backend-architecture §8).
+ */
+export class CatalogArtifactTargetError extends Error {
+    public readonly code = 'artefact_target_mismatch';
+
+    constructor(
+        message: string,
+        public readonly context: {
+            /** The artefact's file name — never its absolute path, which is environment. */
+            readonly file: string;
+            readonly recordedDigest: string | null;
+            readonly runDigest: string;
+        },
+    ) {
+        super(message);
+        this.name = 'CatalogArtifactTargetError';
+    }
+}
+
+/**
+ * The decision, with the refusal raised rather than returned.
+ *
+ * Every caller of {@link decideCatalogArtifactTarget} that is about to WRITE
+ * wants the same two lines of code, and one of them is a throw — so it is
+ * written once here and the callers keep the decision for their log line. The
+ * message names the file and both digests and nothing else: a refusal a
+ * reviewer reads must not be the place the database name finally appears.
+ */
+export const assertCatalogArtifactTarget = (input: {
+    readonly file: string;
+    readonly existing: Readonly<Record<string, unknown>> | null;
+    readonly runDigest: string;
+}): CatalogArtifactTargetDecision => {
+    const decision = decideCatalogArtifactTarget(input.existing, input.runDigest);
+
+    if (!decision.mayWrite) {
+        throw new CatalogArtifactTargetError(
+            `${input.file} records ${CATALOG_ARTIFACT_TARGET_IDENTITY_KEY}.${CATALOG_ARTIFACT_TARGET_DIGEST_FIELD} ` +
+                `"${String(decision.recordedDigest)}" and this run addresses "${decision.runDigest}", so the ` +
+                'document describes a different database and nothing was written — the committed artefact is ' +
+                'intact. An evidence artefact is the record of one catalog, so merging this run into it would ' +
+                'produce a file whose sections describe two. Publish to a directory of this run\u2019s own ' +
+                '(catalog:report --out), or re-publish the pair from the database this run addresses.',
+            { file: input.file, recordedDigest: decision.recordedDigest, runDigest: input.runDigest },
+        );
+    }
+
+    return decision;
+};
+
+/**
+ * The block a write records, and the only fields in it.
+ *
+ * DELIBERATELY CARRIES NO VERDICT. The block is part of a byte-for-byte
+ * deterministic artefact — `catalog-report.ts` writes no wall-clock value so a
+ * rerun against unchanged data produces an identical file, and the suite pins
+ * that — and the verdict is not a property of the target: it is a property of
+ * the write, which was `first_write` into an empty directory and `agrees` on
+ * every run after it. Recording it here would make the first artefact differ
+ * from every later one for a reason that has nothing to do with the catalog.
+ * The verdict is reported in the run's log, where a per-write fact belongs.
+ */
+export const catalogArtifactTargetIdentity = (runDigest: string): Record<string, unknown> => ({
+    [CATALOG_ARTIFACT_TARGET_DIGEST_FIELD]: runDigest,
+    digestBasis:
+        'A one-way digest of the database this artefact describes (scripts/lib/logger.ts opaqueDigest: SHA-256 of ' +
+        'host/database, truncated). It answers whether two writes addressed the same database and discloses ' +
+        'neither the host nor the database name, which is why it can live in a committed file. A stage refuses to ' +
+        'merge into an artefact recording a different digest; an artefact recording none is adopted, so a document ' +
+        'published before this field existed still merges.',
+});

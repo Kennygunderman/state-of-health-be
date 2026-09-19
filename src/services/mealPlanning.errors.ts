@@ -315,6 +315,43 @@ export class SwapFailedError extends Error {
 }
 
 /* ---------------------------------------------------------------------------
+ * Planned logging
+ * ------------------------------------------------------------------------- */
+
+// The logged date falls outside the plan's own week. AAP §0.5.2 states that
+// constraint among the request validations — `date ∈ [plan.startDate,
+// plan.endDate]` — so it is a statement about the REQUEST and answers
+// `400 invalid_request` naming the field, exactly as a malformed date on the
+// same route already does. It used to share `PlanNotFoundError`'s 404, which
+// left one endpoint typing two halves of one input differently and a client
+// unable to tell "wrong date" from "wrong plan".
+//
+// THE ONE CONDITION IT REPORTS IS FIXED, so the class owns its `details` rather
+// than accepting them: unlike `ReadOnlyFieldError`, whose entries name the
+// CLIENT's own keys and must therefore travel from the parser, both members here
+// are server-chosen constants, and a caller able to pass its own list could emit
+// a code the client does not declare. The strings are written inline because
+// this file holds declarations only and takes no import that survives
+// compilation — `plannedMealLog.logic.ts` documents that this refusal, unlike
+// its parser's returned verdicts, is raised from here.
+//
+// It is only ever raised AFTER the plan has been read by `{id, user_id}`, so it
+// cannot become an existence oracle: a date verdict is reachable only for a plan
+// already proven to be the caller's. The diary-bucket refusals stay 404 for the
+// mirror-image reason — a 400 there would confirm that another user's bucket
+// exists (§8).
+export class OutsidePlanWeekError extends Error {
+    public readonly details: readonly InvalidRequestDetail[] = [
+        { field: 'date', code: 'outside_plan_week' },
+    ];
+
+    constructor() {
+        super('Logged date falls outside the plan week');
+        this.name = 'OutsidePlanWeekError';
+    }
+}
+
+/* ---------------------------------------------------------------------------
  * Resource visibility
  *
  * One class per resource, carrying nothing. "No such plan" and "not your plan"

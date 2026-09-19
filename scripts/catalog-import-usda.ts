@@ -48,9 +48,20 @@ import os from 'os';
 import path from 'path';
 
 import { classifyDatabaseOrigin, DatabaseOriginError, originLogFields } from './lib/dbGuard';
-import { createFatalLogger, createLogger, formatSafeError, isThrownInstanceOf, safeError, writeLineSync } from './lib/logger';
+import {
+    UNEXPECTED_FAILURE_REMEDY,
+    classifyInfrastructureFailure,
+    createFatalLogger,
+    createLogger,
+    firstPartyMessage,
+    formatSafeError,
+    isThrownInstanceOf,
+    safeError,
+    writeLineSync,
+} from './lib/logger';
 import type { LogFields, LogLevel, SafeErrorFields, ScriptLogger } from './lib/logger';
 import {
+    COVERAGE_PLAN_FILE,
     EXPECTED_USDA_MANIFEST_VERSION,
     ManifestError,
     USDA_MANIFEST_FILE,
@@ -98,7 +109,7 @@ import {
     getUsdaImportRateLimitPerHour,
 } from './lib/rateLimiter';
 import type { UsdaRateLimiter, UsdaRequestStats } from './lib/rateLimiter';
-import { CheckpointError, appendRunLog, checkpointErrorFields, finishRun, openOrResumeRun, saveCheckpoint, withCatalogStageLock } from './lib/checkpoint';
+import { COUNTS_MODE_REPLACE, CheckpointError, appendRunLog, checkpointErrorFields, finishRun, openOrResumeRun, saveCheckpoint, withCatalogStageLock } from './lib/checkpoint';
 import type { CatalogRunDb } from './lib/checkpoint';
 
 // The normaliser and the checks. Pure, so importing it costs nothing and opens
@@ -106,9 +117,13 @@ import type { CatalogRunDb } from './lib/checkpoint';
 // and the Prisma client, both of which construct state at module load, are
 // reached lazily from main().
 import {
+    CATALOG_ARTIFACT_TARGET_IDENTITY_KEY,
     CATALOG_CHECK_NAMES,
+    CatalogArtifactTargetError,
+    assertCatalogArtifactTarget,
     buildSearchText,
     buildSourceKey,
+    catalogArtifactTargetIdentity,
     catalogCheckTier,
     computeCoverageShortfall,
     dedupeSortedAliases,
@@ -205,7 +220,26 @@ export type CatalogImportErrorCode =
      * a curated entry silently dropped is a reviewed decision that never
      * reaches the catalog.
      */
-    | 'manifest_entry_unresolved';
+    | 'manifest_entry_unresolved'
+    /**
+     * `--category` named something the coverage plan does not declare.
+     *
+     * WHY THIS IS A REFUSAL AND NOT A NARROW RUN. The category filter is
+     * applied by membership (`inScope` in {@link buildImportPlan}), so a value
+     * the plan never declares matches no manifest entry and no swept record:
+     * the whole work list lands under `skippedCategoryFilter`, the run plans
+     * zero batches and the stage completes successfully having imported
+     * nothing. An operator's typo is indistinguishable from a finished import
+     * at the exit code, which is the one signal a script is entitled to be
+     * believed on.
+     *
+     * The two sibling stages already refuse the same mistake —
+     * `catalog-generate-ai.ts` with `unknown_category` and
+     * `catalog-report.ts` with `unknown_category_filter` — so this code is the
+     * report stage's, spelled identically for the operator whose filter is
+     * wrong in both places at once.
+     */
+    | 'unknown_category_filter';
 
 /**
  * The stage's own failure, and the only shape callers of this file are asked
@@ -2280,6 +2314,50 @@ export const persistPreparedFood = async (
 };
 
 /**
+ * `catalog_validation_records.outcome` for a record this stage is about to
+ * write, from the verdict and the status it is written under.
+ *
+ * THE TWO IMPORT-STAGE REFUSALS THAT SIT ABOVE THE CHECKS. An unclassified
+ * category (curator review) or incomplete retrieval evidence (the mandatory
+ * fields of AAP §0.3.2) holds a record however clean its numbers are. The
+ * evidence half is the shared floor's decision, read through the same helper
+ * {@link importPublicationStatus} uses, so the status and the outcome are one
+ * statement about one record.
+ *
+ * WHY THE FLOOR MAY ONLY DOWNGRADE (VALREP-rejected-outcome-mismatch). The
+ * floor used to decide the outcome unconditionally, and that contradicted the
+ * record it was written on: a row whose checks fail a REJECT-tier bound is
+ * persisted `publication_status: 'rejected'` (see `importPublicationStatus`),
+ * and forcing `quarantined` on top of it produced 33 records in the committed
+ * v1 evidence carrying `outcome: 'quarantined'` beside `publication_status:
+ * 'rejected'` and reject-tier check evidence — the exact self-contradiction
+ * this field exists to avoid. It could not self-heal either: `catalog-validate`
+ * re-judges `candidate`, `published` and `quarantined` rows only, so a rejected
+ * row is never revisited.
+ *
+ * So `rejected` is final — AAP §0.7.3 makes a reject-tier failure `rejected`
+ * and never publishable, and no import-stage hold softens that — while the
+ * floor turns an otherwise `accepted` verdict into `quarantined`, which is what
+ * "held, pending something only a person can supply" means in the column's
+ * `accepted | quarantined | rejected` vocabulary. With no floor the verdict
+ * stands as it is. `catalog-validate.ts`'s `nonPublishedOutcome` applies the
+ * same precedence to the rows it re-judges, so the two stages agree.
+ */
+export const importRecordOutcome = (
+    prepared: PreparedCatalogFood,
+    verdict: CatalogValidationVerdict,
+    publicationStatus: string,
+): string => {
+    if (publicationStatus === 'rejected') {
+        return 'rejected';
+    }
+
+    const floorHeld = prepared.curatorReviewRequired || !importEvidenceAssessment(prepared).complete;
+
+    return floorHeld ? 'quarantined' : verdict.outcome;
+};
+
+/**
  * The machine-readable validation record AAP 0.1.1 requires for every item:
  * what the food claims to be, how its nutrition was arrived at, what was
  * assumed, which checks ran with their observed values and bounds, and what
@@ -2336,21 +2414,7 @@ export const buildValidationRecordData = (
     // Null on purpose, and meaningfully so: no model was consulted about this
     // food. A model name here would imply a review that never happened.
     llm_review: null,
-    // Either import-stage refusal holds the record, whatever the checks said:
-    // an unclassified category (curator review) or incomplete retrieval
-    // evidence (mandatory fields, AAP §0.3.2). The reason is readable off the
-    // record itself — `identity_evidence[0].http_status_source` says which case
-    // a null status is — so the outcome never has to be explained from outside
-    // the row.
-    //
-    // The evidence half is the shared floor's decision, read through the same
-    // helper `importPublicationStatus` uses: the two fields are one statement
-    // about one record, and a row written `quarantined` with an `accepted`
-    // outcome (or the reverse) would contradict itself on disk.
-    outcome:
-        prepared.curatorReviewRequired || !importEvidenceAssessment(prepared).complete
-            ? 'quarantined'
-            : verdict.outcome,
+    outcome: importRecordOutcome(prepared, verdict, publicationStatus),
     reviewed_at: now,
     publication_status: publicationStatus,
     source_versions: {
@@ -2655,6 +2719,83 @@ export const assertManifestMatchesCoveragePlan = (
     });
 
     return agreement;
+};
+
+/**
+ * The `--category` values the coverage plan does not declare, de-duplicated and
+ * in the order the operator gave them.
+ *
+ * Pure and exported so the refusal below can be pinned without a coverage plan
+ * on disk, a database or a vendor: the whole decision is a membership test
+ * against `coveragePlan.categories[].category`, which is the same list
+ * `inScope` in {@link buildImportPlan} filters the work list by.
+ */
+export const undeclaredCategoryFilters = (
+    coveragePlan: CoveragePlan,
+    categories: readonly string[],
+): string[] => {
+    const declared = new Set<string>(coveragePlan.categories.map((row) => row.category));
+    const undeclared: string[] = [];
+
+    for (const category of categories) {
+        if (!declared.has(category) && !undeclared.includes(category)) {
+            undeclared.push(category);
+        }
+    }
+
+    return undeclared;
+};
+
+/**
+ * Refuses a `--category` filter naming something the coverage plan does not
+ * declare, BEFORE the limiter, the plan and the first vendor request.
+ *
+ * WHY A TYPO IS A REFUSAL AND NOT A NARROW RUN. The filter is applied by
+ * membership, so an undeclared value matches no manifest entry and no swept
+ * record: every entry lands under `skippedCategoryFilter`, the run plans zero
+ * batches and the stage completes — a successful-looking no-op an operator
+ * cannot tell from a finished import by the exit code. `catalog-generate-ai.ts`
+ * (`unknown_category`) and `catalog-report.ts` (`unknown_category_filter`)
+ * already refuse the same mistake, and one filter spelling is usually wrong in
+ * all three at once, so the three stages answer it the same way.
+ *
+ * The line is logged AND the error thrown, which is not a duplicate: the thrown
+ * error's rendered sentence never reaches a log — `safeError` withholds
+ * `message` because that is where a request URL bearing `api_key=` would appear
+ * — so the declared vocabulary an operator needs to correct the flag has to
+ * travel as fields, while the code and the exit status come from the throw
+ * (`describeFailure` reports `CatalogImportError.code` verbatim).
+ */
+export const assertCategoryFiltersDeclared = (
+    coveragePlan: CoveragePlan,
+    categories: readonly string[],
+    logger: ScriptLogger,
+): void => {
+    const undeclared = undeclaredCategoryFilters(coveragePlan, categories);
+
+    if (undeclared.length === 0) {
+        return;
+    }
+
+    const declared = coveragePlan.categories.map((row) => row.category as string).sort();
+
+    logger.error('unknown_category_filter', {
+        stage: STAGE,
+        coveragePlanVersion: coveragePlan.coveragePlanVersion,
+        undeclaredCategories: undeclared,
+        declaredCategories: declared,
+        remedy:
+            `pass --category with one of the ${declared.length} categories data/meal-planning/${COVERAGE_PLAN_FILE} ` +
+            'declares, or omit the flag to import the whole plan',
+    });
+
+    throw new CatalogImportError(
+        'unknown_category_filter',
+        `--category ${undeclared.join(', ')} ${undeclared.length === 1 ? 'is not a category' : 'are not categories'} ` +
+            `data/meal-planning/${COVERAGE_PLAN_FILE} declares. It declares: ${declared.join(', ')}. ` +
+            'The filter matches by membership, so an undeclared value would skip the whole work list and import ' +
+            'nothing while reporting success.',
+    );
 };
 
 // ---------------------------------------------------------------------------
@@ -3297,6 +3438,27 @@ export const importReportTarget = (destination: ImportReportDestination): string
     destination === 'canonical'
         ? reportPath(IMPORT_REPORT_FILE)
         : path.join(os.tmpdir(), `soh-catalog-import-dry-run-${process.pid}.json`);
+
+/**
+ * Stamps a report with the identity of the database it was made against.
+ *
+ * The block's content and the rule that reads it back both live in
+ * `src/services/catalog.logic.ts` (CATALOG_ARTIFACT_TARGET_IDENTITY_KEY,
+ * `catalogArtifactTargetIdentity`, `decideCatalogArtifactTarget`), so this
+ * stage, the generation stage and the report stage all stamp the same field
+ * with the same basis prose and cannot drift. Only this one-expression spread
+ * is local: the shared rule already sits in the module that owns it, and
+ * reaching into a peer build stage for the spread would couple the two for
+ * nothing.
+ *
+ * Applied to BOTH destinations. A preview is disposable, but "which database
+ * did this preview read" is the first question an operator comparing two
+ * previews has, and the field costs one line.
+ */
+export const withArtifactTargetIdentity = (report: unknown, targetDigest: string): Record<string, unknown> => ({
+    ...(report as Record<string, unknown>),
+    [CATALOG_ARTIFACT_TARGET_IDENTITY_KEY]: catalogArtifactTargetIdentity(targetDigest),
+});
 
 export interface ImportOutcome {
     /** `null` for a dry run, which deliberately opens no run — see runImport. */
@@ -3984,6 +4146,17 @@ export const IMPORT_REPORT_NOTE_KEY = 'importStageWrite';
  * over a stale report file would throw away work that is already committed to
  * the database. Neither is silent.
  *
+ * A DOCUMENT DESCRIBING ANOTHER DATABASE IS NEITHER REPLACED NOR MERGED INTO.
+ * It is refused, and nothing is written. This file is one of three stages that
+ * merge into `import-report.json`, and because `mergeStageReport` preserves the
+ * keys a write does not supply, an import run pointed at a second database used
+ * to fold its own counters into an artefact describing the first — producing a
+ * document whose halves came from two catalogs with nothing on its face saying
+ * so. `assertCatalogArtifactTarget` (src/services/catalog.logic.ts) compares the
+ * digest this run's origin resolved to against the one the document on disk
+ * records; an artefact recording none is ADOPTED with a warning, because every
+ * artefact published before the field existed records none.
+ *
  * HOW THE MERGE IS DONE, AND WHY NOT WITH A TOP-LEVEL SPREAD. Two kinds of key
  * live in this document. A stage-private key (`counts`, `usdaRequests`,
  * `aiGenerationCounts`) belongs to one stage and is replaced by it. A
@@ -4004,9 +4177,21 @@ export const IMPORT_REPORT_NOTE_KEY = 'importStageWrite';
  * `writeJsonFile`'s staged-then-renamed write, so an interrupted run leaves the
  * previous complete report rather than a truncated one.
  */
-export const writeImportReport = (target: string, report: unknown, log: ScriptLogger): void => {
+export const writeImportReport = (
+    target: string,
+    report: unknown,
+    targetDigest: string,
+    log: ScriptLogger,
+): void => {
     withArtifactPublicationLockSync(path.dirname(target), `${STAGE}:report`, () => {
-        let existing: Record<string, unknown> = {};
+        // `null` for a path that holds nothing THIS WRITE CAN USE — no file, or
+        // a document it could not parse into an object. It is the same
+        // distinction `buildValidationReportPublication` draws for the sibling
+        // artefact, and it matters to the target check below: a first write has
+        // no recorded identity to disagree with, whereas a document that HAS
+        // one and omits the field is an artefact published before the field
+        // existed. Reporting both as "adopted" would hide the difference.
+        let existing: Record<string, unknown> | null = null;
         if (fs.existsSync(target)) {
             try {
                 const parsed: unknown = JSON.parse(fs.readFileSync(target, 'utf-8'));
@@ -4032,7 +4217,40 @@ export const writeImportReport = (target: string, report: unknown, log: ScriptLo
             }
         }
 
-        const merged = mergeStageReport(existing, report as Record<string, unknown>, {
+        // WHICH DATABASE THE DOCUMENT ON DISK DESCRIBES, decided before anything
+        // is merged into it — and before the write, so a refusal leaves the
+        // artefact exactly as it was.
+        const targetDecision = assertCatalogArtifactTarget({
+            file: path.basename(target),
+            existing,
+            runDigest: targetDigest,
+        });
+
+        if (targetDecision.verdict === 'adopted') {
+            log.warn('artefact_target_adopted', {
+                stage: STAGE,
+                file: path.basename(target),
+                verdict: targetDecision.verdict,
+                recordedDigest: 'none',
+                targetDigest: targetDecision.runDigest,
+                basis:
+                    'The artefact records no database identity, so this run cannot tell whether it describes the ' +
+                    'database this run wrote to. It is adopted rather than refused \u2014 every artefact published ' +
+                    'before this field existed records none \u2014 and this write stamps its own digest, so the next ' +
+                    'write against a different database is refused instead of merged.',
+            });
+        } else {
+            log.info('artefact_target_checked', {
+                stage: STAGE,
+                file: path.basename(target),
+                verdict: targetDecision.verdict,
+                recordedDigest: targetDecision.recordedDigest ?? 'none',
+                targetDigest: targetDecision.runDigest,
+            });
+        }
+
+        const written = withArtifactTargetIdentity(report, targetDigest);
+        const merged = mergeStageReport(existing ?? {}, written, {
             noteKey: IMPORT_REPORT_NOTE_KEY,
             stage: STAGE,
         });
@@ -4441,6 +4659,48 @@ export const runImport = async (deps: RunImportDeps): Promise<ImportOutcome> => 
                 await appendRunLog(deps.runDb, claim.run.id, {
                     event: 'cursor_plan_changed',
                     planFingerprint: plan.fingerprint,
+                });
+
+                // AND THE ROW'S COUNTERS RESTART WITH THE WORK.
+                //
+                // The ledger merges additively, which is what makes a resumed
+                // run's totals correct — the second half of an interrupted
+                // import adds to what the first half recorded. It is exactly
+                // wrong here: this attempt has ABANDONED the abandoned
+                // attempt's work list, so those figures describe records it is
+                // about to plan again from batch 0. Left in place they are read
+                // as this run's totals and overstate every one of them —
+                // `candidates` at twice the row count, `inserted` and `updated`
+                // each at the row count — and the previous plan's own
+                // `skipped*`/`admitted*` keys linger beside this plan's.
+                //
+                // So the counts are REPLACED (never merged) with this plan's
+                // zero shape, in the same statement that repoints the cursor at
+                // batch 0 and under the same row lock every other checkpoint
+                // takes. `initialImportCounts` is the same helper the fresh-run
+                // write and the outcome use, so a restarted row carries exactly
+                // the shape a first attempt would have written.
+                const restarted = await saveCheckpoint<ImportCursor>(deps.runDb, claim.run.id, {
+                    cursor: { fingerprint: plan.fingerprint, nextBatchIndex: 0 },
+                    counts: initialImportCounts(plan),
+                    countsMode: COUNTS_MODE_REPLACE,
+                });
+
+                // Both halves, because a counter that FELL is as confusing as
+                // one that overstates: the discarded totals are named beside
+                // the restarted ones so an operator reading the row can see the
+                // reset happened rather than infer a lost update.
+                logger.warn('run_counts_restarted', {
+                    stage: STAGE,
+                    runId: claim.run.id,
+                    discardedCounts: JSON.stringify(claim.run.counts ?? {}),
+                    counts: JSON.stringify(restarted),
+                    basis: 'the saved cursor belongs to a different plan, so this attempt restarts at batch 0 and the abandoned attempt\'s totals would have counted records it is about to plan again',
+                });
+                await appendRunLog(deps.runDb, claim.run.id, {
+                    event: 'run_counts_restarted',
+                    planFingerprint: plan.fingerprint,
+                    counts: restarted,
                 });
             }
         }
@@ -5048,20 +5308,62 @@ const gapFields = (gaps: readonly PrerequisiteGap[]): LogFields => ({
 // machine code and status, and deliberately no `message`: this value reaches the
 // durable run log and the operator console, where foreign prose can carry a
 // connection URL, a key or a fragment of the document that failed (CWE-532).
+/**
+ * The message of an error THIS REPOSITORY composed, as a log field.
+ *
+ * Only called from a branch that has already narrowed the value to a
+ * first-party class — that narrowing is what makes reading a message legitimate
+ * at all, and `firstPartyMessage` documents the obligation. The field is named
+ * for its provenance, matching `scripts/seed-dev.ts`, so a reader of a line or
+ * of `catalog_import_runs.log` can tell at a glance that the sentence was
+ * written here and not quoted from a vendor or a driver.
+ */
+const firstPartyMessageField = (error: unknown): LogFields => {
+    const message = firstPartyMessage(error);
+
+    return message === undefined ? {} : { firstPartyMessage: message };
+};
+
+/**
+ * What the classifier's remedy leaves out for THIS stage: an import that
+ * stopped mid-run has a checkpoint, and re-running it from the beginning is
+ * hours of vendor requests an operator does not need to spend.
+ */
+const RESUME_CLAUSE = ' A run interrupted this way continues from its checkpoint when re-run with --resume.';
+
 export const describeFailure = (error: unknown): { code: string; error: SafeErrorFields; detail?: LogFields } => {
     // First, because it is this stage's OWN error and the one every vendor
     // failure now arrives as. It already names the batch that stopped, so its
     // code is reported straight rather than re-derived from what it wrapped.
     if (isThrownInstanceOf(error, CatalogImportError)) {
-        return { code: error.code, error: safeError(error), detail: importErrorFields(error) };
+        return {
+            code: error.code,
+            error: safeError(error),
+            detail: { ...importErrorFields(error), ...firstPartyMessageField(error) },
+        };
     }
     if (isThrownInstanceOf(error, DatabaseOriginError)) {
+        // Deliberately WITHOUT its message, unlike the first-party arms around
+        // it: a `DatabaseOriginError` explains itself by naming the host and
+        // database it refused, and dbGuard reports that refusal itself with the
+        // target reduced to a digest. Forwarding the sentence here would publish
+        // the topology the guard's own line takes care to withhold.
         return { code: error.code, error: safeError(error) };
     }
     if (isThrownInstanceOf(error, ManifestError)) {
-        return { code: error.code, error: safeError(error) };
+        // First-party, and the arm that most needs its sentence: a manifest
+        // refusal names the file, the field and the two values that disagree,
+        // and none of that survives in a code.
+        return { code: error.code, error: safeError(error), detail: firstPartyMessageField(error) };
     }
     if (isThrownInstanceOf(error, ModelBudgetError)) {
+        return { code: error.code, error: safeError(error) };
+    }
+    // A committed artefact this run must not merge into, because it describes a
+    // different database. Its own code rather than `unexpected_error`: the
+    // remedy is an operator decision about which database this run should have
+    // addressed, not a defect report.
+    if (isThrownInstanceOf(error, CatalogArtifactTargetError)) {
         return { code: error.code, error: safeError(error) };
     }
     // The one branch that reports TYPED CONTEXT beside the code. A stage-lock
@@ -5077,7 +5379,28 @@ export const describeFailure = (error: unknown): { code: string; error: SafeErro
     if (isUsdaError(error)) {
         return { code: 'usda_request_failed', error: safeError(error) };
     }
-    return { code: 'unexpected_error', error: safeError(error) };
+    // THE DATABASE, which used to be reported as a surprise.
+    //
+    // This stage takes a per-user advisory lock through checkpoint.ts's own
+    // `pg` session before it writes anything, so a database that will not
+    // accept a connection fails HERE — before Prisma exists to translate it —
+    // as a node-postgres `DatabaseError` whose `name` is the literal `'error'`.
+    // It matched none of the classes above and was reported as
+    // `{"code":"unexpected_error","error":{"name":"error"}}`: no class, no
+    // SQLSTATE, no remedy, for the most ordinary failure a stage has. The
+    // taxonomy is in logger.ts so that every stage answers the same way, and
+    // `safeError` now carries the SQLSTATE beside this code.
+    const infrastructure = classifyInfrastructureFailure(error);
+    if (infrastructure !== null) {
+        return {
+            code: infrastructure.code,
+            error: safeError(error),
+            detail: { remedy: `${infrastructure.remedy}${RESUME_CLAUSE}` },
+        };
+    }
+    // Genuinely unclassified, and it says so with something to do about it
+    // rather than with an empty hand.
+    return { code: 'unexpected_error', error: safeError(error), detail: { remedy: UNEXPECTED_FAILURE_REMEDY } };
 };
 
 const main = async (): Promise<number> => {
@@ -5141,6 +5464,15 @@ const main = async (): Promise<number> => {
 
     const manifest = loadUsdaManifest();
     const coveragePlan = loadCoveragePlan();
+
+    // THE OPERATOR'S FILTER IS CHECKED AGAINST THE PLAN THAT DEFINES IT, here:
+    // the coverage plan is loaded and nothing has been paced, requested,
+    // claimed or locked yet, so a mistyped flag costs no vendor request and no
+    // run state — the same point `--manifest` and the manifest/plan contract
+    // are refused at. A dry run is included deliberately: it is the invocation
+    // an operator uses to check what a filter would do.
+    assertCategoryFiltersDeclared(coveragePlan, parsed.options.categories, logger);
+
     const requestsPerHour = getUsdaImportRateLimitPerHour(process.env);
 
     // THE MANIFEST'S RATE MUST SIT UNDER THE CODE'S CEILING. The document
@@ -5265,8 +5597,13 @@ const main = async (): Promise<number> => {
         },
         writeReport: (report, destination) => {
             const target = importReportTarget(destination);
+            // Read once, from the origin classified at the top of main(), so
+            // the identity this write records cannot differ from the one the
+            // database guard admitted (Rule backend-architecture §9).
+            const targetDigest = String(originLogFields(origin).targetDigest);
+
             if (destination === 'canonical') {
-                writeImportReport(target, report, logger);
+                writeImportReport(target, report, targetDigest, logger);
                 return;
             }
 
@@ -5274,8 +5611,10 @@ const main = async (): Promise<number> => {
             // with the evidence artefact: it is this invocation's own file,
             // written whole (atomically, like every artefact this pipeline
             // writes) and named in the line below so the operator who asked for
-            // it can read it.
-            writeJsonFile(target, report);
+            // it can read it. The canonical path is named too, and named as
+            // UNTOUCHED, because "the dry run wrote nothing here" is the fact a
+            // reviewer checking the repository is dirty needs stated.
+            writeJsonFile(target, withArtifactTargetIdentity(report, targetDigest));
             logger.info('dry_run_preview_written', {
                 stage: STAGE,
                 file: target,

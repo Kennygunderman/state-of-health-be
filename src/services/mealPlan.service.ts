@@ -127,6 +127,7 @@ import {
     MealTimeEntry,
     PlanStatus,
     RegeneratePlanPayload,
+    TargetsResponse,
 } from '../types/mealPlanning';
 import { mealPlanningFault } from '../utils/featureFlags';
 import { isGroceryRenderingFault } from './grocery.logic';
@@ -511,35 +512,6 @@ const loadPlanSummary = async (
 
 
 /**
- * The targets a plan response reports, and whether they have moved since it was
- * built.
- *
- * The result is the user's CURRENT confirmed targets — the same values Account,
- * Progress and the diary show — read through `targets.service.ts::getTargets` so
- * there is one canonical target read in the product. The comparison against the
- * plan's own snapshot is NOT made here: `mealPlan.mapper.ts` derives
- * `targetsStale` from these values and `targets_snapshot`, so the inequality has
- * one definition beside the two fields it explains.
- *
- * WHICH of the two it reports is `mealPlan.logic.ts::resolveReportedTargets`'s
- * rule — the same rule `swap.service.ts` applies, so the day card and the
- * candidate scoring cannot aim at different numbers. This function is the READ
- * around it: one `getTargets` call, and nothing else.
- *
- * A `legacy` source is deliberately NOT treated as incomplete — those four
- * values are what the user's other surfaces show today, so reporting them here
- * (and flagging the difference) is the honest answer, and refusing them is a
- * decision `requireConfirmedTargets` makes on the WRITE path, where a new week
- * is at stake.
- */
-const resolvePlanTargets = async (
-    db: Prisma.TransactionClient,
-    userId: string,
-    generationTargets: MealPlanMacroTotals,
-): Promise<MealPlanMacroTotals> =>
-    resolveReportedTargets(await getTargets(userId, db), generationTargets);
-
-/**
  * A whole plan as the wire shape, or `null` when it is not the caller's.
  *
  * `null` and never a discriminating error: "no such plan" and "not your plan"
@@ -552,8 +524,39 @@ const resolvePlanTargets = async (
  * `hasIncompatibilities` and `targetsStale`, so no field is spelled out here.
  *
  * The two values the mapper is HANDED are the two it could not derive: the
- * user's current confirmed targets (a `targets.service.ts` read) and the summary
+ * user's current confirmed targets (`confirmedTargets`, below) and the summary
  * counts (two of the three live in other tables).
+ *
+ * `confirmedTargets` IS A PARAMETER RATHER THAN A READ OF ITS OWN, and that is
+ * the one decision in this function worth recording:
+ *
+ *  * WHAT IT IS. `targets.service.ts::getTargets`'s verdict — the user's CURRENT
+ *    confirmed targets, the same values Account, Progress and the diary show,
+ *    read through the one canonical target read in the product. A `legacy`
+ *    source is deliberately NOT treated as incomplete: those four values are
+ *    what the user's other surfaces show today, so reporting them here (and
+ *    flagging the difference) is the honest answer, and refusing them is a
+ *    decision `requireConfirmedTargets` makes on the WRITE path, where a new
+ *    week is at stake.
+ *  * WHY THE CALLER READS IT. The read is keyed by USER and nothing else, while
+ *    everything else this function loads is keyed by plan. `getCurrentMealPlan`
+ *    hydrates up to TWO plans inside ONE `RepeatableRead` snapshot
+ *    ({@link readInPlanSnapshot}), so a read taken per plan issued the identical
+ *    `users ⋈ meal_plan_preferences` join twice where the second execution was
+ *    guaranteed to return the first one's answer — a statement that costs a full
+ *    round trip whenever PostgreSQL is not co-located. Taking it once per
+ *    REQUEST removes redundant work and changes no answer: §0.5.2 defines
+ *    `MealPlanResponse.targets` as a per-USER fact, only `targets_snapshot` is
+ *    per-plan, and the snapshot guarantees both plans would have seen one value
+ *    anyway.
+ *  * WHICH OF THE TWO REACHES THE WIRE is still
+ *    `mealPlan.logic.ts::resolveReportedTargets`'s rule — the same rule
+ *    `swap.service.ts` applies, so the day card and the candidate scoring cannot
+ *    aim at different numbers — and the per-PLAN half of that pair stays
+ *    per-plan: `targets_snapshot` is read from this plan's own row, one line
+ *    below. The comparison of the two is made in neither place:
+ *    `mealPlan.mapper.ts` derives `targetsStale` from them, so the inequality
+ *    has one definition beside the two fields it explains.
  *
  * Days are queried in `date` order and their meals in `sort_order`; the mapper
  * re-establishes both orderings from the rows themselves, so the response's
@@ -563,6 +566,7 @@ const loadMealPlanResponse = async (
     db: Prisma.TransactionClient,
     userId: string,
     planId: string,
+    confirmedTargets: TargetsResponse,
 ): Promise<MealPlanResponse | null> => {
     const plan = await db.meal_plans.findFirst({ where: { id: planId, user_id: userId }, select: PLAN_COLUMNS });
 
@@ -583,7 +587,7 @@ const loadMealPlanResponse = async (
     );
 
     return toMealPlanResponse(plan, days, {
-        targets: await resolvePlanTargets(db, userId, readTargetsSnapshot(plan.targets_snapshot, plan.id)),
+        targets: resolveReportedTargets(confirmedTargets, readTargetsSnapshot(plan.targets_snapshot, plan.id)),
         summary: await loadPlanSummary(db, userId, planId),
         loggedByMealId: logged,
     });
@@ -676,11 +680,30 @@ const loadPlanLifecycleStates = async (
  * Read-only and SHORT by construction: `work` issues a bounded handful of
  * indexed lookups and nothing else — no vendor call, no model call, no planning
  * search — which is the constraint {@link withMealPlanningTransaction} documents
- * for every transaction in this feature. The day read makes four; the
- * current-plan read makes two plus seven for each of the at most two weeks it
- * hydrates. It takes no advisory lock and no row lock either (the targets read
- * inside it is `targets.service.ts`'s `read_only` form), so it blocks no writer
- * for as long as it is open.
+ * for every transaction in this feature. The day read makes four. The
+ * current-plan read makes two — the caller's zone and the lifecycle states the
+ * two members are chosen from — then NOTHING further when neither member
+ * exists, and otherwise ONE canonical targets read for the request plus six for
+ * each of the at most two weeks it hydrates (the plan row, its days with their
+ * meals, the diary entries linked to those meals, and the summary's three
+ * counts). The targets read is hoisted to the request precisely because it is
+ * keyed by user and not by plan: taken per hydration it ran twice inside this
+ * one snapshot for the same answer (see {@link loadMealPlanResponse}'s
+ * `confirmedTargets`).
+ *
+ * THOSE ARE READS AND NOT WIRE STATEMENTS, which is worth stating because
+ * statement count is the term that multiplies once PostgreSQL stops being
+ * co-located: Prisma resolves each relation `include` in a statement of its own,
+ * so a two-week answer measured 23 statements against 15 reads — `BEGIN`, the
+ * isolation level and `COMMIT`, the lifecycle read's successor join, and two per
+ * week for the meals and their recipe versions. Removing the duplicate targets
+ * join took that from 24 to 23, and the empty state stayed at 5 (the two reads
+ * plus the transaction's own three), which is the number this helper's early
+ * return exists to hold.
+ *
+ * It takes no advisory lock and no row lock either (that targets read is
+ * `targets.service.ts`'s `read_only` form), so it blocks no writer for as long
+ * as it is open.
  *
  * One helper rather than the options object spelled out at each call site, so
  * the isolation level cannot drift between the two reads that depend on it, and
@@ -719,6 +742,22 @@ const readInPlanSnapshot = <TResult>(
  * their bodies describe the same instant; that helper explains why the isolation
  * level has to be `RepeatableRead` and what the coherent answer does not
  * promise.
+ *
+ * THE CANONICAL TARGETS READ IS RESOLVED ONCE FOR THE WHOLE RESPONSE, not once
+ * per member. It is the only input both hydrations share — keyed by user, where
+ * everything else they read is keyed by plan — so inside one `RepeatableRead`
+ * snapshot a per-member read issued the identical
+ * `users ⋈ meal_plan_preferences` join twice, the second execution guaranteed to
+ * return the first one's answer. {@link loadMealPlanResponse} records why moving
+ * it here changes no answer; the per-PLAN half of the pair it feeds
+ * (`targets_snapshot`) stays per-plan.
+ *
+ * AND IT IS TAKEN ONLY WHEN THERE IS A WEEK TO DESCRIBE. The empty state — a
+ * user with no plan at all, which is an ordinary answer and not an error —
+ * hydrates nothing, so it must cost nothing beyond the two statements that
+ * reached the verdict. An unconditional read would have ADDED a statement to
+ * exactly the request that needs none, which is why the early return below
+ * exists rather than a `getTargets` call above the members.
  */
 export const getCurrentMealPlan = async (
     userId: string,
@@ -729,9 +768,16 @@ export const getCurrentMealPlan = async (
         const today = dayKeyInTimeZone(now, row?.time_zone ?? null);
         const { current, upcoming } = resolveCurrentAndUpcoming(await loadPlanLifecycleStates(tx, userId), today);
 
+        if (current === null && upcoming === null) {
+            return { current: null, upcoming: null };
+        }
+
+        const confirmedTargets = await getTargets(userId, tx);
+
         return {
-            current: current === null ? null : await loadMealPlanResponse(tx, userId, current.id),
-            upcoming: upcoming === null ? null : await loadMealPlanResponse(tx, userId, upcoming.id),
+            current: current === null ? null : await loadMealPlanResponse(tx, userId, current.id, confirmedTargets),
+            upcoming:
+                upcoming === null ? null : await loadMealPlanResponse(tx, userId, upcoming.id, confirmedTargets),
         };
     });
 
@@ -1695,8 +1741,20 @@ export const generatePlan = async (
                 // it is what the status write compares against.
                 await markSetupCompleted(lockedTx, userId, candidate.preferencesRevision);
 
+                // One plan, so one canonical targets read — the same single read
+                // this path has always made, now taken at the call site because
+                // the hydration takes the value rather than fetching it (see
+                // `loadMealPlanResponse`). There is no duplication to remove
+                // here; what matters is that the published body reports the
+                // user's targets as they stand INSIDE the lock, beside the
+                // snapshot the week was searched against.
+                const confirmedTargets = await getTargets(userId, lockedTx);
+
                 return {
-                    body: requirePublishedPlan(await loadMealPlanResponse(lockedTx, userId, planId), planId),
+                    body: requirePublishedPlan(
+                        await loadMealPlanResponse(lockedTx, userId, planId, confirmedTargets),
+                        planId,
+                    ),
                     planRevisionAfter: FIRST_PLAN_REVISION,
                     mealPlanId: planId,
                 };
@@ -1847,8 +1905,16 @@ export const regeneratePlan = async (
                 // from a publication that already set it.
                 await writeGroceriesForNewPlan(lockedTx, userId, newPlanId, planId, now);
 
+                // One plan, one canonical targets read, for the reason the first
+                // generation states: the replacement's body reports the targets
+                // as they stand inside the lock.
+                const confirmedTargets = await getTargets(userId, lockedTx);
+
                 return {
-                    body: requirePublishedPlan(await loadMealPlanResponse(lockedTx, userId, newPlanId), newPlanId),
+                    body: requirePublishedPlan(
+                        await loadMealPlanResponse(lockedTx, userId, newPlanId, confirmedTargets),
+                        newPlanId,
+                    ),
                     planRevisionAfter: FIRST_PLAN_REVISION,
                     mealPlanId: newPlanId,
                 };

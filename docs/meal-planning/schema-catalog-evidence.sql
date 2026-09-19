@@ -201,13 +201,18 @@ SELECT line FROM normalised ORDER BY section, line COLLATE "C";
 -- >>> END pg-catalog-query
 
 -- >>> BEGIN pg-catalog-expected
--- One generated column: the STORED search_vector expression.
+-- Two generated columns: the STORED search_vector expressions, one over
+-- catalog_foods.search_text and one over catalog_food_aliases.alias. The alias
+-- column is what makes the alias full-text branch index-served; without it that
+-- branch re-evaluates to_tsvector over every alias row on every search.
+generated_column catalog_food_aliases.search_vector tsvector stored to_tsvector('english'::regconfig, COALESCE(alias, ''::text))
 generated_column catalog_foods.search_vector tsvector stored to_tsvector('english'::regconfig, COALESCE(search_text, ''::text))
--- Nine hand-managed indexes: the three ASCII-fold expression indexes the
+-- Ten hand-managed indexes: the three ASCII-fold expression indexes the
 -- prefix branches read (the two over catalog_foods partial on
--- publication_status), the GIN index over search_vector, and the five other
--- partial-index predicates.
+-- publication_status), the TWO GIN indexes over search_vector - one per
+-- generated column - and the five other partial-index predicates.
 index catalog_food_aliases.idx_catalog_food_aliases_fold_alias am=btree unique=false keys=(translate(alias, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'::text, 'abcdefghijklmnopqrstuvwxyz'::text)) opclasses=(text_pattern_ops) predicate=-
+index catalog_food_aliases.idx_catalog_food_aliases_search_vector am=gin unique=false keys=(search_vector) opclasses=(tsvector_ops) predicate=-
 index catalog_food_portions.unique_default_catalog_food_portion am=btree unique=true keys=(catalog_food_id) opclasses=(uuid_ops) predicate=is_default
 index catalog_foods.idx_catalog_foods_fold_canonical_name am=btree unique=false keys=(translate(canonical_name, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'::text, 'abcdefghijklmnopqrstuvwxyz'::text)) opclasses=(text_pattern_ops) predicate=publication_status = 'published'::text
 index catalog_foods.idx_catalog_foods_fold_display_name am=btree unique=false keys=(translate(display_name, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'::text, 'abcdefghijklmnopqrstuvwxyz'::text)) opclasses=(text_pattern_ops) predicate=publication_status = 'published'::text

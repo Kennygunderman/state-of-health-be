@@ -1,0 +1,119 @@
+{
+  "slug": "large-egg-white-rice-bowl",
+  "name": "Large egg white and rice bowl",
+  "description": "A generous bowl of cooked white rice seared with broccoli, mushrooms and red bell pepper, with a large egg white scramble stirred through at the end.",
+  "iconKey": "bowl",
+  "instructions": [
+    "Warm the olive oil in a wide skillet over high heat and cook the broccoli, the mushrooms and the bell pepper until they colour at the edges, about 4 minutes.",
+    "Add the cooked white rice, season with the salt and the black pepper and press it flat for 2 minutes so it heats through.",
+    "Beat the egg white with the egg, pour them over the rice and stir until only just set, about 3 minutes.",
+    "Divide between two bowls."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 bowl",
+  "prepMinutes": 5,
+  "cookMinutes": 9,
+  "mealSlots": [
+    "lunch",
+    "dinner"
+  ],
+  "dietTags": [
+    "gluten_free",
+    "pescatarian",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "eggs"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "dairy_free",
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:172183",
+      "quantity": 20,
+      "unit": "each",
+      "gramWeight": 660,
+      "displayText": "20 large",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171287",
+      "quantity": 4,
+      "unit": "each",
+      "gramWeight": 200,
+      "displayText": "4 large",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169757",
+      "quantity": 2.75,
+      "unit": "cup",
+      "gramWeight": 434.5,
+      "displayText": "2¾ cups",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170379",
+      "quantity": 3,
+      "unit": "cup",
+      "gramWeight": 264,
+      "displayText": "3 cups, chopped",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169251",
+      "quantity": 5,
+      "unit": "cup",
+      "gramWeight": 350,
+      "displayText": "5 cups, sliced",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170108",
+      "quantity": 1,
+      "unit": "cup",
+      "gramWeight": 149,
+      "displayText": "1 cup, chopped",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 2,
+      "unit": "tbsp",
+      "gramWeight": 27,
+      "displayText": "2 tbsp",
+      "sortOrder": 6,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 1,
+      "unit": "tsp",
+      "gramWeight": 6,
+      "displayText": "1 tsp",
+      "sortOrder": 7,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170931",
+      "quantity": 1,
+      "unit": "tsp",
+      "gramWeight": 2.3,
+      "displayText": "1 tsp",
+      "sortOrder": 8,
+      "isOptional": false
+    }
+  ]
+}

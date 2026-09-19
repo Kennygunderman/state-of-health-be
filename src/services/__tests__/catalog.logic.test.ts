@@ -48,6 +48,9 @@ import { join } from 'path';
 import {
     CATALOG_ALLERGEN_STATUSES,
     CATALOG_ALLERGEN_TAGS,
+    CATALOG_ARTIFACT_TARGET_DIGEST_FIELD,
+    CATALOG_ARTIFACT_TARGET_IDENTITY_KEY,
+    CATALOG_ARTIFACT_UNIDENTIFIED_TARGET,
     CATALOG_CHECK_NAMES,
     CATALOG_DIET_TAG_EXCLUSIONS,
     CATALOG_DIET_TAGS,
@@ -75,12 +78,16 @@ import {
     CatalogNutrientInput,
     CatalogNutritionBasisRule,
     CatalogNutritionSource,
+    CatalogArtifactTargetError,
     CatalogPolicyError,
     CatalogSourceKeyInput,
     CatalogValidationContext,
     CatalogValidationPolicy,
     StoredVersionedFacts,
+    assertCatalogArtifactTarget,
     assertUsableValidationPolicy,
+    catalogArtifactTargetIdentity,
+    decideCatalogArtifactTarget,
     CORE_NUTRIENT_FIELDS,
     DEFAULT_BRAND_WORDS,
     DEFAULT_CATALOG_NUTRITION_BASIS_RULE,
@@ -7395,5 +7402,162 @@ describe('catalog.mapper.ts — the catalog row -> DTO boundary', () => {
                 fat: 2,
             });
         });
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * EVIDENCE ARTEFACTS — which run's write may replace which run's evidence.
+ *
+ * THE DEFECT THIS RULE CLOSES (CATREP-artefact-overwrite). The two committed
+ * report artefacts are co-written by four stages, each merging its own half
+ * over what it finds, and they deliberately record no environment VALUES — so
+ * nothing in either file said which database it described. QA pointed a report
+ * run at database A, a validate run at B and a generation run at C and got one
+ * committed artefact whose `requirement` came from A, whose `counts` came from
+ * B and whose generation block came from C, with nothing able to detect it.
+ *
+ * The rule is here rather than in a stage because all three writers apply it
+ * and a rule three stages each re-derived is how one of them ends up permitting
+ * the case the other two refuse. Every branch is pinned, including the two that
+ * decide whether the legitimate pipeline keeps working: a document recording no
+ * digest is ADOPTED (every committed artefact is in that state today, and one
+ * that had to be hand-edited to accommodate this change would be a worse
+ * defect), and a run that cannot name its own target does not get to replace
+ * evidence produced against a named one.
+ * ------------------------------------------------------------------------- */
+
+describe('decideCatalogArtifactTarget', () => {
+    const DIGEST = '1661b5560863';
+    const OTHER = 'ffeeddccbbaa';
+
+    const recording = (digest: unknown): Record<string, unknown> => ({
+        [CATALOG_ARTIFACT_TARGET_IDENTITY_KEY]: { [CATALOG_ARTIFACT_TARGET_DIGEST_FIELD]: digest },
+    });
+
+    it('permits the first write, where there is no claim to contradict', () => {
+        expect(decideCatalogArtifactTarget(null, DIGEST)).toEqual({
+            verdict: 'first_write',
+            recordedDigest: null,
+            runDigest: DIGEST,
+            mayWrite: true,
+        });
+    });
+
+    it('permits a write whose digest the document already records', () => {
+        expect(decideCatalogArtifactTarget(recording(DIGEST), DIGEST)).toEqual({
+            verdict: 'agrees',
+            recordedDigest: DIGEST,
+            runDigest: DIGEST,
+            mayWrite: true,
+        });
+    });
+
+    it('refuses a write into a document recording another database', () => {
+        expect(decideCatalogArtifactTarget(recording(OTHER), DIGEST)).toEqual({
+            verdict: 'differs',
+            recordedDigest: OTHER,
+            runDigest: DIGEST,
+            mayWrite: false,
+        });
+    });
+
+    it.each([
+        ['no identity block at all', { counts: 1 }],
+        ['a block that is not an object', { [CATALOG_ARTIFACT_TARGET_IDENTITY_KEY]: 'v1' }],
+        ['a block that is an array', { [CATALOG_ARTIFACT_TARGET_IDENTITY_KEY]: [] }],
+        ['a null block', { [CATALOG_ARTIFACT_TARGET_IDENTITY_KEY]: null }],
+        ['a block with no digest field', { [CATALOG_ARTIFACT_TARGET_IDENTITY_KEY]: { digestBasis: 'prose' } }],
+        ['a digest that is not a string', recording(17)],
+        ['an empty digest', recording('')],
+        ['the unidentified-target sentinel', recording(CATALOG_ARTIFACT_UNIDENTIFIED_TARGET)],
+    ])('adopts a document carrying %s, rather than refusing it', (_shape, existing) => {
+        // Refusing here would break the pipeline until every committed artefact
+        // had been re-published, which is the one outcome this rule may not
+        // produce.
+        expect(decideCatalogArtifactTarget(existing, DIGEST)).toEqual({
+            verdict: 'adopted',
+            recordedDigest: null,
+            runDigest: DIGEST,
+            mayWrite: true,
+        });
+    });
+
+    it('refuses an unidentified run over an identified artefact, and adopts the reverse', () => {
+        // The safe direction in both halves: evidence produced against a named
+        // database is not replaced by a write that cannot say what it measured,
+        // while a named write over an unnamed document is the adoption path.
+        expect(decideCatalogArtifactTarget(recording(DIGEST), CATALOG_ARTIFACT_UNIDENTIFIED_TARGET)).toMatchObject({
+            verdict: 'differs',
+            mayWrite: false,
+        });
+        expect(
+            decideCatalogArtifactTarget(
+                recording(CATALOG_ARTIFACT_UNIDENTIFIED_TARGET),
+                CATALOG_ARTIFACT_UNIDENTIFIED_TARGET,
+            ),
+        ).toMatchObject({ verdict: 'adopted', mayWrite: true });
+    });
+});
+
+describe('assertCatalogArtifactTarget', () => {
+    const DIGEST = '1661b5560863';
+    const OTHER = 'ffeeddccbbaa';
+
+    it('returns the decision for every verdict that permits a write', () => {
+        for (const existing of [null, { counts: 1 }, { targetIdentity: { targetDigest: DIGEST } }]) {
+            expect(
+                assertCatalogArtifactTarget({ file: 'import-report.json', existing, runDigest: DIGEST }).mayWrite,
+            ).toBe(true);
+        }
+    });
+
+    it('throws a typed refusal naming the file and both digests, and no database', () => {
+        let thrown: unknown = null;
+        try {
+            assertCatalogArtifactTarget({
+                file: 'validation-report.json',
+                existing: { targetIdentity: { targetDigest: OTHER } },
+                runDigest: DIGEST,
+            });
+        } catch (error) {
+            thrown = error;
+        }
+
+        expect(thrown).toBeInstanceOf(CatalogArtifactTargetError);
+        const refusal = thrown as CatalogArtifactTargetError;
+        expect(refusal.code).toBe('artefact_target_mismatch');
+        expect(refusal.name).toBe('CatalogArtifactTargetError');
+        expect(refusal.context).toEqual({
+            file: 'validation-report.json',
+            recordedDigest: OTHER,
+            runDigest: DIGEST,
+        });
+        // What an operator acts on is in the message; the target is not.
+        expect(refusal.message).toContain('validation-report.json');
+        expect(refusal.message).toContain(OTHER);
+        expect(refusal.message).toContain(DIGEST);
+        expect(refusal.message).toContain('catalog:report --out');
+        expect(refusal.message).toContain('the committed artefact is intact');
+    });
+});
+
+describe('catalogArtifactTargetIdentity', () => {
+    it('records the digest and the basis a reader needs, and nothing that varies per write', () => {
+        const block = catalogArtifactTargetIdentity('1661b5560863');
+
+        expect(block[CATALOG_ARTIFACT_TARGET_DIGEST_FIELD]).toBe('1661b5560863');
+        expect(String(block.digestBasis)).toContain('one-way');
+        // A VERDICT HERE WOULD BREAK DETERMINISM, which the report artefacts
+        // depend on: the first write into an empty directory is `first_write`
+        // and every later one `agrees`, so recording it would make the first
+        // artefact differ from the rest for a reason unrelated to the catalog.
+        expect(Object.keys(block).sort()).toEqual(['digestBasis', CATALOG_ARTIFACT_TARGET_DIGEST_FIELD].sort());
+        expect(catalogArtifactTargetIdentity('1661b5560863')).toEqual(block);
+    });
+
+    it('is what the decision then reads back as agreement', () => {
+        const existing = { [CATALOG_ARTIFACT_TARGET_IDENTITY_KEY]: catalogArtifactTargetIdentity('abc123abc123') };
+
+        expect(decideCatalogArtifactTarget(existing, 'abc123abc123')).toMatchObject({ verdict: 'agrees' });
     });
 });

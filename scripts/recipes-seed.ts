@@ -16,6 +16,19 @@
 // data/meal-planning/recipes/coverage-report.json (Agent Action Plan §0.7.1
 // Group 4, §0.7.3).
 //
+// A CERTIFIED COVERAGE CELL IS A PLANNABLE ONE, NOT MERELY A POPULATED ONE.
+// That report's guaranteed and reduced lists are gated on TOLERANCE
+// SATISFIABILITY as well as on eligible counts: a cell is certified only when a
+// day the planner would accept exists at every sampled calorie target on every
+// schedule its slot belongs to, and when enough distinct recipes are usable in
+// such a day to fill a week under the repeat rule. A cell §0.7.3 claims that
+// fails either test is DEMOTED to `eligibleNotPlannableCells` with the reason
+// that refused it. Counting alone certified the vegan cells of an earlier
+// corpus — four eligible breakfasts, six lunches, eight dinners — while no
+// vegan day anywhere in the calorie band could reach its protein target, so
+// every vegan user was refused by a profile the artefact called guaranteed. See
+// THE FEASIBILITY GATE beside the derivation.
+//
 // TWO PASSES, AND THE ORDER MATTERS. Every selected file is parsed, resolved
 // and validated BEFORE the first write, and any single failure refuses the whole
 // run. A partially seeded corpus is worse than an unseeded one: the planner's
@@ -191,13 +204,43 @@ import type {
     CatalogStageName,
 } from './lib/checkpoint';
 import { classifyDatabaseOrigin, DatabaseOriginError, originLogFields } from './lib/dbGuard';
-import { createFatalLogger, createLogger, formatSafeError, isThrownInstanceOf, safeError, writeLineSync } from './lib/logger';
+import {
+    UNEXPECTED_FAILURE_REMEDY,
+    classifyInfrastructureFailure,
+    createFatalLogger,
+    createLogger,
+    firstPartyMessage,
+    formatSafeError,
+    isThrownInstanceOf,
+    safeError,
+    writeLineSync,
+} from './lib/logger';
 import type { LogFields, LogLevel, SafeErrorFields, ScriptLogger } from './lib/logger';
 import { loadCoveragePlan, ManifestError, recipesDir, writeJsonFile } from './lib/manifest';
 import type { CoveragePlan } from './lib/manifest';
 // The pure derivation layer. Every rule this stage applies to an ingredient set
 // comes from here, and this file adds none of its own (see the header).
 import { normalizeCanonicalName } from '../src/services/catalog.logic';
+// The PLANNING rules, for the feasibility half of the coverage report (see THE
+// FEASIBILITY GATE). Every tolerance band, portion multiplier, repetition limit
+// and macro split the gate turns on is imported from here rather than restated:
+// a second copy of any of them inside this script is exactly the drift the
+// report exists to detect.
+import {
+    buildPlanCandidates,
+    CALORIE_TOLERANCE_RATIO,
+    candidatesForSlot,
+    evaluateDayTolerance,
+    MACRO_TOLERANCE_ABSOLUTE_G,
+    MACRO_TOLERANCE_RATIO,
+    MAX_RECIPE_USES_PER_WEEK,
+    PLAN_DAY_COUNT,
+    PROTEIN_TOLERANCE_OVER_G,
+    PROTEIN_TOLERANCE_UNDER_G,
+    scheduleSlots,
+    TOLERANCE_EPSILON,
+} from '../src/services/mealPlan.logic';
+import type { PlanCandidate, PlanRecipeCandidate } from '../src/services/mealPlan.logic';
 import {
     deriveDietTags,
     findStaleIngredients,
@@ -216,8 +259,10 @@ import type {
     RecipeNutritionBasis,
     RecipePublicationIngredient,
 } from '../src/services/recipe.logic';
+import { deriveMacroTargets } from '../src/services/targets.logic';
+import type { MealPlanMacroTotals, MealSchedule } from '../src/types/mealPlanning';
 import { MEAL_SLOTS } from '../src/types/recipe';
-import type { MealSlot } from '../src/types/recipe';
+import type { MealSlot, RecipePerServingNutrition } from '../src/types/recipe';
 import { UnitConversionError } from '../src/utils/units';
 
 const STAGE = 'recipes-seed';
@@ -2407,7 +2452,7 @@ export const publishRecipe = async (
  * ------------------------------------------------------------------------- */
 
 /** The schema version of the emitted document, bumped when its shape changes. */
-const COVERAGE_REPORT_SCHEMA_VERSION = 1;
+const COVERAGE_REPORT_SCHEMA_VERSION = 2;
 
 /** `none` is the mutually exclusive "no allergy" answer, not a tag any food carries. */
 const NO_ALLERGEN = 'none';
@@ -2439,11 +2484,116 @@ const COVERAGE_TIME_TIERS: readonly number[] = [15, 30, 45, 60];
 /** The loosest tier: the one the slot-composition strata are measured at. */
 const LOOSEST_TIME_TIER = COVERAGE_TIME_TIERS[COVERAGE_TIME_TIERS.length - 1];
 
+/**
+ * The distinct recipes ONE SLOT needs to fill a seven-day week, derived from
+ * the production repeat rule rather than restated: a recipe may be used at most
+ * {@link MAX_RECIPE_USES_PER_WEEK} times, so {@link PLAN_DAY_COUNT} days need
+ * at least ceil(7 / 2) = 4 of them. Fewer is arithmetically unplannable however
+ * many recipes are eligible, which is precisely the failure §0.7.3's counting
+ * clause could not see.
+ */
+const WEEK_FILL_MIN_RECIPES_PER_SLOT = Math.ceil(PLAN_DAY_COUNT / MAX_RECIPE_USES_PER_WEEK);
+
 /** A guaranteed cell holds at least this many recipes — what the repeat rule needs for a week. */
-const GUARANTEED_THRESHOLD = 4;
+const GUARANTEED_THRESHOLD = WEEK_FILL_MIN_RECIPES_PER_SLOT;
 
 /** A reduced cell holds at least this many, which is explicitly NOT enough for a week. */
 const REDUCED_THRESHOLD = 2;
+
+/**
+ * The two meal schedules a day can be composed for, in the order the report
+ * probes them.
+ *
+ * A DAY is what the tolerance is judged on, and a day is a whole schedule's
+ * worth of slots — so feasibility is a property of the schedule and not of one
+ * slot. Both are probed because the user picks either: a cell certified on
+ * three meals while the same profile cannot be planned with a snack would be a
+ * guarantee that half the users it names do not get.
+ */
+const COVERAGE_SCHEDULES: readonly MealSchedule[] = ['three', 'three_plus_snack'];
+
+/**
+ * The day calorie targets the feasibility probe samples, ascending.
+ *
+ * A POLICY CHOICE, and this is what it represents: THE WHOLE BAND
+ * `targets.logic.ts` CAN EMIT, floor to ceiling. Its estimate route floors a day
+ * at `CALORIE_FLOOR_BY_SEX` — 1,200 kcal female, 1,500 male — and admits
+ * everything up to `CALORIE_CEILING`, 5,000. The band is sampled rather than
+ * swept because the derivation runs on every seed: eleven points reach both
+ * floors, the middle and the ceiling, and a cell that fails at any of them is
+ * not a cell the seed can promise.
+ *
+ * THE TOP OF THE BAND IS NOT OPTIONAL, and the earlier seven-point set that
+ * stopped at 3,000 is the mistake to not make again. It rested on the premise
+ * that the estimate "tops out around 3,000 for a large, very active adult
+ * gaining weight", which is simply not what the equation does: run
+ * `computeTargetEstimate` for a 24-year-old 191 cm 104 kg very active male
+ * gaining 1.5 lb a week and it returns 4,405 kcal — a legitimate user of this
+ * app, and one every cell was certified without ever being asked about. A
+ * sampled band that stops below what the product can hand the planner certifies
+ * a promise for some users and silently declines to test it for the rest.
+ *
+ * Steps are 300 kcal to 3,000 and 500 kcal above it. The coarser upper steps are
+ * deliberate rather than lazy: the probe cost grows with the window (a higher
+ * target admits more portions of more recipes), the bands widen with the target
+ * — carbs and fat are `max(15 g, 15 %)`, so a proportional test does the work —
+ * and every added point is paid for on every seed. Eleven points cost about
+ * half again what seven did.
+ *
+ * Fixed and ascending so a rerun samples exactly the same band in exactly the
+ * same order — a sampled set derived from anything mutable would make the
+ * artefact non-reproducible. The MACRO SPLIT at each point is deliberately not
+ * stated here: `deriveMacroTargets` owns it (30/40/30 of energy) and the probe
+ * calls it, so the protein floor a day is judged against is the one the product
+ * would really set.
+ */
+const FEASIBILITY_CALORIE_TARGETS: readonly number[] = [
+    1200, 1500, 1800, 2100, 2400, 2700, 3000, 3500, 4000, 4500, 5000,
+];
+
+/**
+ * Candidate PLACEMENTS one cell probe may spend, across every search it runs —
+ * one plannability search per sampled target, then one per distinct recipe per
+ * slot for the recipes no earlier feasible day has already exhibited.
+ *
+ * A placement, not a completed day, for the same reason `mealPlan.logic.ts`
+ * counts its own budget that way: the walk spends nearly all of its time on
+ * prefixes the macro bands cut before they reach a fourth meal, so a cap on
+ * completed days would leave the real work unbounded. Measured over the whole
+ * cell space, completed days are under a thousandth of the placements.
+ *
+ * The bound exists because the search space is the product of the slot pools,
+ * so it grows steeply with the corpus. Measured end to end on this machine,
+ * with the whole 168-probe derivation run to completion:
+ *
+ *   |  recipes | derivation | placements | worst probe |
+ *   |       42 |      3.0 s |      23.9M |       1.27M |
+ *   |       84 |     13.3 s |     248.1M |       17.3M |
+ *   |      126 |     48.5 s |    1046.3M |       82.6M |
+ *
+ * 50 million is therefore roughly three times the worst probe of a corpus twice
+ * the size of the one this was written against — no realistic corpus trips it —
+ * while still bounding the pathological case, where 168 probes each spending
+ * the cap is minutes rather than unbounded.
+ *
+ * A PROBE THAT TRIPS IT REPORTS `searchExhausted` AND CERTIFIES NOTHING. An
+ * exhausted search and a proven impossibility are different facts: the first
+ * says the derivation does not know, the second says the corpus cannot. Neither
+ * certifies a cell, but only the second is a statement about the recipes, and
+ * conflating them would let a slow probe read as a thin corpus.
+ */
+const MAX_FEASIBILITY_EVALUATIONS_PER_PROBE = 50_000_000;
+
+/**
+ * The shuffle seed handed to `buildPlanCandidates`.
+ *
+ * Immaterial to every number this report emits and fixed all the same. That
+ * seed only permutes candidates that SCORE equally, which is a property of the
+ * generator's move order; the probe never reads `shuffleRank` and orders each
+ * slot pool itself (ascending calories, then portable identity). Fixed rather
+ * than arbitrary so the call is reproducible on its face.
+ */
+const FEASIBILITY_CANDIDATE_SHUFFLE_SEED = 1;
 
 /** The tier from which a profile counts as guaranteed with no allergen excluded. */
 const GUARANTEED_MIN_TIME_TIER = 45;
@@ -2456,7 +2606,7 @@ const REDUCED_DIETS: readonly RecipeDietPreference[] = ['vegetarian', 'vegan'];
 
 /** §0.7.3's repeat rule: at most two uses a week, never on consecutive days. */
 const REPEAT_RULE = {
-    maxUsesPerWeek: 2,
+    maxUsesPerWeek: MAX_RECIPE_USES_PER_WEEK,
     consecutiveDaysAllowed: false,
     minEligiblePerSlotForFullWeek: GUARANTEED_THRESHOLD,
     note:
@@ -2487,6 +2637,29 @@ const ELIGIBILITY_RULE = {
         'Dislikes are per-user and remove recipes at request time, so they are not an axis of this table; dislike-driven shortfalls surface in the planner\'s catalog_coverage check.',
     timeTiersCumulative:
         'Tiers are cumulative ceilings, so counts are monotonically non-decreasing across 15, 30, 45 and 60 for every diet, allergen and slot triple.',
+} as const;
+
+/**
+ * THE FEASIBILITY GATE, carried in the artefact for the same reason the
+ * eligibility rule is: a reader of the committed file must be able to see what
+ * a certified cell claims without this source.
+ */
+const FEASIBILITY_RULE = {
+    mirrors: 'src/services/mealPlan.logic.ts::evaluateDayTolerance + buildPlanCandidates/candidatesForSlot',
+    why:
+        'Counting eligible recipes cannot tell a plannable cell from an unplannable one. A cell may hold well over the threshold of eligible recipes while NO assignment of one of them per slot lands a day inside the production tolerance - the vegan cells of an earlier corpus held 4 eligible breakfasts, 6 lunches and 8 dinners and yet no vegan day existed at ANY sampled calorie target, the best day inside the smallest calorie window reaching 77 g of protein against a 90 g target, so every vegan user was answered 422 no_matching_meals by a report that called their profile guaranteed. Certification therefore requires a tolerance-satisfying day to EXIST and enough recipes to be USABLE in one, on top of the eligible count.',
+    day:
+        'A day is one eligible recipe at one allowed portion multiplier per slot of the schedule. Its four totals are summed at full precision and judged by evaluateDayTolerance - the planner\'s own bands, imported rather than restated. The pools, the multiplier grid per slot and the scaling all come from buildPlanCandidates and candidatesForSlot, so a day this report calls feasible is a day the generator could place.',
+    usable:
+        'A recipe is USABLE for a slot when it appears in at least one feasible day for that slot, which is strictly stronger than eligible: an eligible recipe whose every portion breaches the day bands can never be planned. usable is the minimum over the plannable sampled targets, so it is what holds across the band rather than at its most generous point.',
+    week:
+        'Seven days need at least ceil(PLAN_DAY_COUNT / MAX_RECIPE_USES_PER_WEEK) = 4 distinct USABLE recipes per slot, because a recipe may be used at most twice a week. A guaranteed cell is measured against that floor; a reduced cell against its own threshold of 2, which §0.7.3 already states is not sufficient for a week.',
+    certification:
+        'guaranteedCells and reducedCells contain ONLY cells that pass: at least `threshold` eligible recipes, a feasible day at EVERY sampled calorie target on EVERY schedule that contains the slot, and at least `threshold` usable recipes for the slot on each of them. A cell §0.7.3 claims that fails any part is demoted to eligibleNotPlannableCells with the reason, so a reader and the seed suite can trust the two certified lists without re-deriving them.',
+    schedules:
+        'Both schedules are probed for a main slot because the user picks either; the snack slot exists only in three_plus_snack and is judged there alone.',
+    searchBound:
+        'Each probe walks its day search depth-first over candidates ordered by ascending calories, pruning any partial day whose greatest remaining amount of a macro cannot reach that macro\'s lower band or whose least remaining amount already exceeds its upper band - all four macros, not calories alone - and entering each slot at the first candidate large enough to close the day rather than stepping over the rest. The walk stops at the first feasible day, and every day it finds counts towards the usable set of every slot at once, so a recipe already exhibited in one needs no search of its own. A probe may spend a bounded number of candidate placements; one that exhausts its budget reports searchExhausted and certifies nothing, because a search that ran out is not a proof that the corpus cannot.',
 } as const;
 
 const SLOT_COMPOSITION_NOTES = {
@@ -2533,6 +2706,104 @@ export interface CoverageCell {
 
 export interface CoverageThresholdCell extends CoverageCell {
     readonly threshold: number;
+    /**
+     * Distinct recipes that can actually APPEAR in a feasible day for this
+     * slot, minimised over every schedule containing it and every plannable
+     * sampled target. Always <= `count`, and the number certification turns on.
+     */
+    readonly usable: number;
+}
+
+/** Why a cell §0.7.3 claims is not certified. */
+export type CoverageDemotionReason = 'no_feasible_day' | 'insufficient_usable_recipes' | 'search_exhausted';
+
+/**
+ * A claimed cell the feasibility gate refused, with the fact that refused it.
+ *
+ * `threshold` is the one it would have been certified at, so the demoted list
+ * reads as the complement of `guaranteedCells` and `reducedCells` rather than as
+ * a separate vocabulary.
+ */
+export interface CoverageUncertifiedCell extends CoverageThresholdCell {
+    readonly reason: CoverageDemotionReason;
+    /** The first failing fact, named: which schedule, which target, which count. */
+    readonly detail: string;
+}
+
+/** One sampled day target, with the macros `deriveMacroTargets` sets for it. */
+export interface CoverageSampledTarget {
+    readonly calories: number;
+    readonly protein: number;
+    readonly carbs: number;
+    readonly fat: number;
+}
+
+/** What one slot of a probed schedule holds: eligible recipes, and usable ones. */
+export interface CoverageProbeSlot {
+    readonly slot: string;
+    readonly eligible: number;
+    /** Minimum over the plannable sampled targets; 0 when none of them is plannable. */
+    readonly usable: number;
+}
+
+/**
+ * One (diet, allergen, time tier, schedule) feasibility probe.
+ *
+ * Keyed on the schedule rather than the slot because a day is a whole
+ * schedule's worth of slots, so several cells of the table share one probe —
+ * which is also what keeps the derivation affordable.
+ */
+export interface CoverageFeasibilityProbe {
+    readonly diet: string;
+    readonly allergen: string;
+    readonly timeTier: number;
+    readonly schedule: string;
+    /** The sampled calorie targets a tolerance-satisfying day was FOUND at, ascending. */
+    readonly plannableTargets: readonly number[];
+    /** The sampled calorie targets no day was found at, ascending. */
+    readonly unplannableTargets: readonly number[];
+    /**
+     * true when the probe spent its evaluation budget. A target in
+     * `unplannableTargets` of an exhausted probe was NOT proven unplannable.
+     */
+    readonly searchExhausted: boolean;
+    /** Candidate placements spent, so a slow probe is visible in the diff. */
+    readonly evaluations: number;
+    readonly slots: readonly CoverageProbeSlot[];
+}
+
+/** How many of §0.7.3's claimed cells survived the gate. */
+export interface CoverageCertificationSummary {
+    readonly guaranteedClaimed: number;
+    readonly guaranteedCertified: number;
+    readonly reducedClaimed: number;
+    readonly reducedCertified: number;
+}
+
+/**
+ * The one knob on the derivation, and it exists for ONE reason.
+ *
+ * Production passes nothing and gets {@link MAX_FEASIBILITY_EVALUATIONS_PER_PROBE}.
+ * A suite needs to be able to prove the exhaustion branch — that a probe out of
+ * budget reports `searchExhausted` and certifies nothing, instead of reporting a
+ * plannable cell as unplannable — and the only honest way to reach that branch
+ * without a corpus large enough to make the suite unusable is to lower the
+ * budget. The artefact records the cap it ran under, so a report derived at a
+ * lowered one says so on its face.
+ */
+export interface CoverageDerivationOptions {
+    readonly maxEvaluationsPerProbe?: number;
+}
+
+export interface CoverageFeasibility {
+    readonly rule: typeof FEASIBILITY_RULE;
+    readonly schedules: readonly string[];
+    readonly sampledTargets: readonly CoverageSampledTarget[];
+    /** ceil(PLAN_DAY_COUNT / MAX_RECIPE_USES_PER_WEEK) — the week-fill floor. */
+    readonly weekFillMinUsableRecipesPerSlot: number;
+    readonly evaluationCapPerProbe: number;
+    readonly certification: CoverageCertificationSummary;
+    readonly probes: readonly CoverageFeasibilityProbe[];
 }
 
 export interface CoverageStratum {
@@ -2567,8 +2838,15 @@ export interface CoverageReport {
     readonly slotComposition: Readonly<Record<string, SlotComposition>>;
     readonly slotCompositionNotes: typeof SLOT_COMPOSITION_NOTES;
     readonly eligibleCounts: readonly CoverageCell[];
+    readonly feasibility: CoverageFeasibility;
     readonly guaranteedCells: readonly CoverageThresholdCell[];
     readonly reducedCells: readonly CoverageThresholdCell[];
+    /**
+     * The cells §0.7.3 claims that the feasibility gate refused. EMPTY is what
+     * a corpus satisfying §0.7.3 looks like; a non-empty list names every
+     * profile the seed promises and cannot serve.
+     */
+    readonly eligibleNotPlannableCells: readonly CoverageUncertifiedCell[];
     readonly boundary: string;
 }
 
@@ -2578,6 +2856,22 @@ export interface CoverageRecipe {
     readonly mealSlots: readonly string[];
     /** The DERIVED diet tags, which is what the stratum split reads. */
     readonly dietTags: readonly string[];
+    /**
+     * `recipe_versions.version` — the other half of the portable identity the
+     * feasibility probe orders candidates by. Never a database id: the report
+     * identifies a recipe by slug, which is stable across independent loads.
+     */
+    readonly versionNumber: number;
+    /** `recipe_versions.budget_tier`, 1 (cheapest) to 3, as the planner reads it. */
+    readonly budgetTier: number;
+    /**
+     * `recipe_versions.per_serving_*` at full precision.
+     *
+     * The COUNTING half of the report never needed nutrition; the feasibility
+     * half cannot work without it, because what a day sums is these four
+     * numbers scaled by the slot's portion multiplier.
+     */
+    readonly perServing: RecipePerServingNutrition;
     readonly version: PlanningRecipeVersion;
 }
 
@@ -2627,6 +2921,571 @@ const stratumOf = (recipe: CoverageRecipe): keyof typeof MAIN_SLOT_FLOORS => {
     return 'furtherOmnivore';
 };
 
+/* ---------------------------------------------------------------------------
+ * The feasibility half — can a cell the table certifies actually be planned?
+ *
+ * Everything below answers ONE question per cell: does a day the planner would
+ * accept exist, and are enough recipes usable in one to fill a week. It asks it
+ * through the production rules and adds none of its own, for the reason the
+ * eligibility half is derived rather than declared — a second copy of a
+ * tolerance band, a multiplier grid or the repeat limit is the drift this
+ * artefact exists to catch.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * One coverage recipe in the shape the planning rules take.
+ *
+ * `recipe_id` and `recipe_version_id` carry the PORTABLE identity — the slug,
+ * and the slug with its version number — rather than database ids, for two
+ * reasons. The report identifies a recipe by slug everywhere else, because that
+ * is what is stable across independent catalog loads; and the probe counts a
+ * slot's recipes by distinct slug, which is a distinct-RECIPE count exactly as
+ * it is against the real rows.
+ */
+const toPlanningCandidate = (recipe: CoverageRecipe): PlanRecipeCandidate => ({
+    ...recipe.version,
+    recipe_version_id: `${recipe.slug}@${recipe.versionNumber}`,
+    recipe_id: recipe.slug,
+    slug: recipe.slug,
+    version: recipe.versionNumber,
+    budget_tier: recipe.budgetTier,
+    per_serving: recipe.perServing,
+});
+
+/** One slot's draw for one probe, ordered so the pruned walk is deterministic. */
+interface FeasibilitySlotPool {
+    readonly slot: MealSlot;
+    /** Distinct recipes eligible for the slot — the counting half's number, over the same candidates. */
+    readonly eligible: number;
+    /** Ascending by calories, then by portable identity and multiplier. */
+    readonly candidates: readonly PlanCandidate[];
+    /**
+     * `candidates[i].nutrition.calories`, extracted so the walk can binary-search
+     * its entry point rather than walking past every candidate too small to
+     * close the day (see {@link firstCandidateAtLeast}).
+     */
+    readonly calories: readonly number[];
+    /** The distinct recipe slugs in the pool, ascending. */
+    readonly slugs: readonly string[];
+}
+
+/**
+ * The index of the first candidate with at least this many calories.
+ *
+ * The walk's entry point into an ascending pool. Without it every level starts
+ * at the pool's smallest candidate and steps over each one too small to reach
+ * the day's lower calorie bound, which on a corpus of a hundred-odd recipes is
+ * most of the pool at most levels and was, measured, the bulk of the whole
+ * derivation's cost. Returns `candidates.length` when none qualifies, which
+ * ends the level without a placement.
+ *
+ * The threshold handed in is the lower calorie band rearranged, and rearranging
+ * it in floating point can move it by an ULP — around 1e-13 at day-sized
+ * numbers. That cannot hide a feasible day, because the band it is rearranged
+ * from already carries {@link TOLERANCE_EPSILON} of slack in the same
+ * direction, four orders of magnitude larger.
+ */
+const firstCandidateAtLeast = (calories: readonly number[], atLeast: number): number => {
+    let low = 0;
+    let high = calories.length;
+
+    while (low < high) {
+        const middle = (low + high) >>> 1;
+        if (calories[middle] < atLeast) {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+
+    return low;
+};
+
+const compareSlug = (left: string, right: string): number => (left < right ? -1 : left > right ? 1 : 0);
+
+/**
+ * Ascending calories first, which is what makes the walk's upper-bound cut a
+ * `break` rather than a `continue`; then the portable identity and the
+ * multiplier, so two candidates of identical calories still have ONE order.
+ * Without that last tie-break the pool order would depend on the input order
+ * and a rerun could emit a different `evaluations` figure for the same corpus.
+ */
+const byCaloriesThenIdentity = (left: PlanCandidate, right: PlanCandidate): number =>
+    left.nutrition.calories - right.nutrition.calories ||
+    compareSlug(left.recipe.slug, right.recipe.slug) ||
+    left.recipe.version - right.recipe.version ||
+    left.portionMultiplier - right.portionMultiplier;
+
+/**
+ * The four bands a day must land in, widened by {@link TOLERANCE_EPSILON} on
+ * both sides.
+ *
+ * DERIVED FROM THE PRODUCTION CONSTANTS AND DELIBERATELY WEAKER THAN THE
+ * VERDICT. Every band here is at least as wide as the one
+ * {@link evaluateDayTolerance} applies, so a prefix this window rules out is one
+ * the verdict would have rejected too — a prune can therefore only save work
+ * and can never hide a feasible day. Exported so
+ * `src/__tests__/scripts/recipes-seed.test.ts` can pin it against
+ * `evaluateDayTolerance` itself: the one way this could go wrong is the band
+ * SHAPE changing in `mealPlan.logic.ts` while these two lines stay as they are,
+ * and that test is what would fail the moment it did.
+ */
+export interface FeasibilityWindow {
+    readonly low: MealPlanMacroTotals;
+    readonly high: MealPlanMacroTotals;
+}
+
+export const feasibilityWindow = (targets: MealPlanMacroTotals): FeasibilityWindow => {
+    const carbsBand = Math.max(MACRO_TOLERANCE_ABSOLUTE_G, MACRO_TOLERANCE_RATIO * targets.carbs);
+    const fatBand = Math.max(MACRO_TOLERANCE_ABSOLUTE_G, MACRO_TOLERANCE_RATIO * targets.fat);
+
+    return {
+        low: {
+            calories: targets.calories * (1 - CALORIE_TOLERANCE_RATIO) - TOLERANCE_EPSILON,
+            protein: targets.protein - PROTEIN_TOLERANCE_UNDER_G - TOLERANCE_EPSILON,
+            carbs: targets.carbs - carbsBand - TOLERANCE_EPSILON,
+            fat: targets.fat - fatBand - TOLERANCE_EPSILON,
+        },
+        high: {
+            calories: targets.calories * (1 + CALORIE_TOLERANCE_RATIO) + TOLERANCE_EPSILON,
+            protein: targets.protein + PROTEIN_TOLERANCE_OVER_G + TOLERANCE_EPSILON,
+            carbs: targets.carbs + carbsBand + TOLERANCE_EPSILON,
+            fat: targets.fat + fatBand + TOLERANCE_EPSILON,
+        },
+    };
+};
+
+/**
+ * Suffix bounds over the slot pools: the least and greatest of each of the four
+ * macros still reachable from slot `index` onwards.
+ *
+ * These are what turn an intractable product into a search, and all FOUR macros
+ * are bounded rather than calories and protein alone. Bounding two of them
+ * leaves the walk exploring every prefix that is calorie-plausible but already
+ * carb- or fat-doomed, which on a corpus of eighty-odd recipes is the bulk of
+ * the tree: measured over the whole cell space, bounding all four cut the
+ * derivation from ninety seconds to a few and stopped the evaluation cap being
+ * reached at all.
+ *
+ * An EMPTY pool yields `Infinity` / `-Infinity` deliberately: every prune then
+ * fires, which is the correct answer for a schedule one of whose slots has
+ * nothing to draw from.
+ */
+interface FeasibilityBounds {
+    readonly low: readonly MealPlanMacroTotals[];
+    readonly high: readonly MealPlanMacroTotals[];
+}
+
+const suffixBounds = (pools: readonly FeasibilitySlotPool[]): FeasibilityBounds => {
+    const zero = (): MealPlanMacroTotals => ({ calories: 0, protein: 0, carbs: 0, fat: 0 });
+    const low: MealPlanMacroTotals[] = Array.from({ length: pools.length + 1 }, zero);
+    const high: MealPlanMacroTotals[] = Array.from({ length: pools.length + 1 }, zero);
+
+    for (let index = pools.length - 1; index >= 0; index -= 1) {
+        const least: MealPlanMacroTotals = {
+            calories: Number.POSITIVE_INFINITY,
+            protein: Number.POSITIVE_INFINITY,
+            carbs: Number.POSITIVE_INFINITY,
+            fat: Number.POSITIVE_INFINITY,
+        };
+        const greatest: MealPlanMacroTotals = {
+            calories: Number.NEGATIVE_INFINITY,
+            protein: Number.NEGATIVE_INFINITY,
+            carbs: Number.NEGATIVE_INFINITY,
+            fat: Number.NEGATIVE_INFINITY,
+        };
+
+        for (const candidate of pools[index].candidates) {
+            least.calories = Math.min(least.calories, candidate.nutrition.calories);
+            least.protein = Math.min(least.protein, candidate.nutrition.protein);
+            least.carbs = Math.min(least.carbs, candidate.nutrition.carbs);
+            least.fat = Math.min(least.fat, candidate.nutrition.fat);
+            greatest.calories = Math.max(greatest.calories, candidate.nutrition.calories);
+            greatest.protein = Math.max(greatest.protein, candidate.nutrition.protein);
+            greatest.carbs = Math.max(greatest.carbs, candidate.nutrition.carbs);
+            greatest.fat = Math.max(greatest.fat, candidate.nutrition.fat);
+        }
+
+        low[index] = {
+            calories: least.calories + low[index + 1].calories,
+            protein: least.protein + low[index + 1].protein,
+            carbs: least.carbs + low[index + 1].carbs,
+            fat: least.fat + low[index + 1].fat,
+        };
+        high[index] = {
+            calories: greatest.calories + high[index + 1].calories,
+            protein: greatest.protein + high[index + 1].protein,
+            carbs: greatest.carbs + high[index + 1].carbs,
+            fat: greatest.fat + high[index + 1].fat,
+        };
+    }
+
+    return { low, high };
+};
+
+/** The completed-day evaluations one probe may spend, and what it has spent. */
+interface FeasibilityBudget {
+    remaining: number;
+    spent: number;
+    exhausted: boolean;
+}
+
+/**
+ * The first assignment of one candidate per slot that satisfies the day
+ * tolerance, optionally with one slot pinned to one recipe — or `null` when
+ * none exists.
+ *
+ * Depth-first, first feasible, and pruned on two facts per macro, each of which
+ * can only cut assignments {@link evaluateDayTolerance} would reject anyway:
+ *
+ *  - a prefix whose GREATEST remaining amount of some macro cannot reach that
+ *    macro's lower band can never close — skip it and try a larger candidate;
+ *  - a prefix whose LEAST remaining amount already exceeds the upper band can
+ *    never close either, and for CALORIES that also settles every candidate
+ *    after it, because the pool is ascending in calories — so the calorie cut
+ *    stops the slot where the other three skip one candidate.
+ *
+ * The bands come from {@link feasibilityWindow}, which is deliberately wider
+ * than the verdict's, so the prune is strictly weaker than the verdict and
+ * cannot cut a day the verdict accepts. The VERDICT itself is always
+ * `evaluateDayTolerance` on the full four totals: nothing here decides that a
+ * day passes.
+ *
+ * IT RETURNS THE DAY RATHER THAN A BOOLEAN, and that is what makes the usable
+ * count affordable. Every feasible day found names one recipe per slot, so a
+ * search run to answer "can THIS breakfast appear in a day" simultaneously
+ * proves the lunch and the dinner it used can too — and those slots then need
+ * no search of their own for those recipes. On a corpus where most recipes are
+ * usable that collapses the per-recipe searches by roughly the number of slots.
+ *
+ * `required` is what makes a recipe's USABILITY answerable in the first place —
+ * pinning a slot to one recipe asks "can this recipe appear in any feasible
+ * day", which counting eligible recipes cannot answer.
+ */
+const searchFeasibleDay = (
+    pools: readonly FeasibilitySlotPool[],
+    bounds: FeasibilityBounds,
+    targets: MealPlanMacroTotals,
+    budget: FeasibilityBudget,
+    required?: { readonly slotIndex: number; readonly slug: string },
+): readonly PlanCandidate[] | null => {
+    if (budget.exhausted) {
+        return null;
+    }
+
+    const { low, high } = feasibilityWindow(targets);
+    const chosen: PlanCandidate[] = [];
+    let day: readonly PlanCandidate[] | null = null;
+
+    const walk = (index: number, running: MealPlanMacroTotals): void => {
+        if (day !== null || budget.exhausted) {
+            return;
+        }
+
+        if (index === pools.length) {
+            if (evaluateDayTolerance(running, targets).withinTolerance) {
+                day = [...chosen];
+            }
+
+            return;
+        }
+
+        const pool = pools[index];
+        const reachableLow = bounds.low[index + 1];
+        const reachableHigh = bounds.high[index + 1];
+        // Everything below this is too small to reach the day's lower calorie
+        // bound even with the largest remainder, so the level starts here
+        // rather than stepping over it.
+        const from = firstCandidateAtLeast(pool.calories, low.calories - running.calories - reachableHigh.calories);
+
+        for (let position = from; position < pool.candidates.length; position += 1) {
+            const candidate = pool.candidates[position];
+            if (required !== undefined && index === required.slotIndex && candidate.recipe.slug !== required.slug) {
+                continue;
+            }
+
+            // CHARGED HERE, per placement considered, which is what
+            // `mealPlan.logic.ts` means by an evaluation too. Charging per
+            // completed day instead would leave the real cost unbounded: the
+            // walk spends nearly all of its time on prefixes the bands cut,
+            // and a corpus can have any number of those per day it completes.
+            if (budget.remaining <= 0) {
+                budget.exhausted = true;
+
+                return;
+            }
+            budget.remaining -= 1;
+            budget.spent += 1;
+
+            const next: MealPlanMacroTotals = {
+                calories: running.calories + candidate.nutrition.calories,
+                protein: running.protein + candidate.nutrition.protein,
+                carbs: running.carbs + candidate.nutrition.carbs,
+                fat: running.fat + candidate.nutrition.fat,
+            };
+
+            // The one cut that settles the rest of the slot, and the reason the
+            // pool is ordered by calories at all.
+            if (next.calories + reachableLow.calories > high.calories) {
+                break;
+            }
+            if (
+                next.protein + reachableHigh.protein < low.protein ||
+                next.protein + reachableLow.protein > high.protein ||
+                next.carbs + reachableHigh.carbs < low.carbs ||
+                next.carbs + reachableLow.carbs > high.carbs ||
+                next.fat + reachableHigh.fat < low.fat ||
+                next.fat + reachableLow.fat > high.fat
+            ) {
+                continue;
+            }
+
+            chosen.push(candidate);
+            walk(index + 1, next);
+            chosen.pop();
+
+            if (day !== null || budget.exhausted) {
+                return;
+            }
+        }
+    };
+
+    walk(0, { calories: 0, protein: 0, carbs: 0, fat: 0 });
+
+    return day;
+};
+
+/**
+ * The distinct recipes of each slot that can appear in a feasible day at this
+ * target, or `null` when the budget ran out before the question was settled.
+ *
+ * EXACT, not a sample: a recipe is counted only once a day containing it has
+ * been exhibited, and it is ruled out only once its own pinned search has run
+ * to completion. The incidental marking above is purely an ordering: it changes
+ * which searches are needed, never the answer they add up to.
+ */
+const usableRecipesBySlot = (
+    pools: readonly FeasibilitySlotPool[],
+    bounds: FeasibilityBounds,
+    targets: MealPlanMacroTotals,
+    budget: FeasibilityBudget,
+    firstDay: readonly PlanCandidate[],
+): readonly number[] | null => {
+    const usable = pools.map(() => new Set<string>());
+    const mark = (day: readonly PlanCandidate[]): void => {
+        day.forEach((candidate, slotIndex) => {
+            usable[slotIndex].add(candidate.recipe.slug);
+        });
+    };
+
+    mark(firstDay);
+
+    for (let slotIndex = 0; slotIndex < pools.length; slotIndex += 1) {
+        for (const slug of pools[slotIndex].slugs) {
+            if (usable[slotIndex].has(slug)) {
+                continue;
+            }
+
+            const day = searchFeasibleDay(pools, bounds, targets, budget, { slotIndex, slug });
+            if (budget.exhausted) {
+                return null;
+            }
+            if (day !== null) {
+                mark(day);
+            }
+        }
+    }
+
+    return usable.map((slugs) => slugs.size);
+};
+
+/** The schedules whose slot list contains this slot — both, or `three_plus_snack` alone. */
+const schedulesForSlot = (slot: MealSlot): readonly MealSchedule[] =>
+    COVERAGE_SCHEDULES.filter((schedule) => scheduleSlots(schedule).includes(slot));
+
+const probeKey = (diet: string, allergen: string, timeTier: number, schedule: string): string =>
+    `${diet}|${allergen}|${timeTier}|${schedule}`;
+
+/**
+ * One (diet, allergen, tier, schedule) probe: which sampled targets are
+ * plannable, and how many recipes per slot are usable in a feasible day.
+ *
+ * The budget is per PROBE and shared by every search it runs, so the bound is
+ * on the work one row of the table costs rather than on one search — a probe
+ * that answers its plannability question cheaply and then spends everything
+ * counting usable recipes is exactly as bounded as one that does the reverse.
+ * Spending order matters and is deliberate: plannability for the target first
+ * (cheap, and the answer certification needs most), then the per-recipe counts.
+ * A budget that runs out mid-count DISCARDS that target's partial counts rather
+ * than minimising a half-finished number into the report.
+ */
+const probeFeasibility = (
+    candidates: readonly PlanCandidate[],
+    preferences: PlanningPreferences,
+    diet: string,
+    allergen: string,
+    timeTier: number,
+    schedule: MealSchedule,
+    evaluationCap: number,
+): CoverageFeasibilityProbe => {
+    const pools: FeasibilitySlotPool[] = scheduleSlots(schedule).map((slot) => {
+        const forSlot = [...candidatesForSlot(candidates, preferences, slot)].sort(byCaloriesThenIdentity);
+        const slugs = [...new Set(forSlot.map((candidate) => candidate.recipe.slug))].sort(compareSlug);
+
+        return {
+            slot,
+            // The distinct recipes of the pool ARE what
+            // `eligibleRecipeCountForSlot` counts, over the same candidates
+            // from the same helper — so the count is taken from the pool rather
+            // than by calling it, which would re-run `isEligibleForPlanning`
+            // over every candidate a second time and is the single most
+            // expensive thing this derivation could do twice. The test
+            // `agrees with the counting half on how many recipes a slot holds`
+            // pins this figure against `eligibleCounts`, which reaches it by a
+            // different route.
+            eligible: slugs.length,
+            candidates: forSlot,
+            calories: forSlot.map((candidate) => candidate.nutrition.calories),
+            slugs,
+        };
+    });
+
+    const bounds = suffixBounds(pools);
+    const budget: FeasibilityBudget = { remaining: evaluationCap, spent: 0, exhausted: false };
+
+    const plannableTargets: number[] = [];
+    const unplannableTargets: number[] = [];
+    const usable = pools.map(() => Number.POSITIVE_INFINITY);
+
+    for (const calories of FEASIBILITY_CALORIE_TARGETS) {
+        const targets = deriveMacroTargets(calories);
+        const firstDay = searchFeasibleDay(pools, bounds, targets, budget);
+
+        if (budget.exhausted) {
+            break;
+        }
+        if (firstDay === null) {
+            unplannableTargets.push(calories);
+            continue;
+        }
+
+        const counts = usableRecipesBySlot(pools, bounds, targets, budget, firstDay);
+        if (counts === null) {
+            break;
+        }
+
+        plannableTargets.push(calories);
+        counts.forEach((count, slotIndex) => {
+            usable[slotIndex] = Math.min(usable[slotIndex], count);
+        });
+    }
+
+    return {
+        diet,
+        allergen,
+        timeTier,
+        schedule,
+        plannableTargets,
+        unplannableTargets,
+        searchExhausted: budget.exhausted,
+        evaluations: budget.spent,
+        slots: pools.map((pool, slotIndex) => ({
+            slot: pool.slot,
+            eligible: pool.eligible,
+            // Infinity survives only when no target was plannable, and nothing
+            // is usable in a day that does not exist.
+            usable: Number.isFinite(usable[slotIndex]) ? usable[slotIndex] : 0,
+        })),
+    };
+};
+
+/** One cell §0.7.3 claims, before the gate has decided whether it holds. */
+interface CoverageClaim {
+    /** Which of §0.7.3's two promises this cell is made under. */
+    readonly tier: 'guaranteed' | 'reduced';
+    readonly diet: RecipeDietPreference;
+    readonly allergen: string;
+    readonly slot: MealSlot;
+    readonly timeTier: number;
+    readonly threshold: number;
+}
+
+/**
+ * The gate's verdict on one claimed cell, over every schedule the slot lives in.
+ *
+ * REFUSED IN PRECEDENCE ORDER, because the three refusals are different facts
+ * and the strongest claim the report can make is the one it actually
+ * established: an exhausted search first (the derivation does not know), then a
+ * target with no feasible day (the corpus cannot serve the band), then too few
+ * usable recipes (the corpus can serve a day but not a week).
+ */
+interface CoverageVerdict {
+    readonly usable: number;
+    readonly reason: CoverageDemotionReason | null;
+    readonly detail: string;
+}
+
+const certifyClaim = (
+    claim: CoverageClaim,
+    probes: ReadonlyMap<string, CoverageFeasibilityProbe>,
+    eligibleCount: number,
+    evaluationCap: number,
+): CoverageVerdict => {
+    const relevant = schedulesForSlot(claim.slot).map((schedule) => {
+        const probe = probes.get(probeKey(claim.diet, claim.allergen, claim.timeTier, schedule));
+        if (probe === undefined) {
+            // Unreachable by construction — the probe set is derived FROM the
+            // claims — and thrown rather than defaulted because a missing probe
+            // would otherwise certify a cell nothing measured.
+            throw new RecipeSeedError(
+                'publication_failed',
+                `no feasibility probe for ${claim.diet}/${claim.allergen}/${claim.timeTier}min/${schedule}, ` +
+                    `so the ${claim.slot} cell cannot be certified`,
+            );
+        }
+
+        return { schedule, probe, slot: probe.slots.find((entry) => entry.slot === claim.slot) };
+    });
+
+    const usable = Math.min(...relevant.map(({ slot }) => slot?.usable ?? 0));
+
+    const exhausted = relevant.find(({ probe }) => probe.searchExhausted);
+    if (exhausted !== undefined) {
+        return {
+            usable,
+            reason: 'search_exhausted',
+            detail:
+                `the ${exhausted.schedule} probe spent its budget of ${evaluationCap} ` +
+                'day evaluations before the cell was decided, so the corpus was neither proven able nor unable to serve it',
+        };
+    }
+
+    const unplannable = relevant.find(({ probe }) => probe.unplannableTargets.length > 0);
+    if (unplannable !== undefined) {
+        return {
+            usable,
+            reason: 'no_feasible_day',
+            detail:
+                `no ${unplannable.schedule} day satisfies the tolerance at a ` +
+                `${unplannable.probe.unplannableTargets[0]} kcal target, one of the ` +
+                `${FEASIBILITY_CALORIE_TARGETS.length} sampled targets`,
+        };
+    }
+
+    const short = relevant.find(({ slot }) => (slot?.usable ?? 0) < claim.threshold);
+    if (short !== undefined) {
+        return {
+            usable,
+            reason: 'insufficient_usable_recipes',
+            detail:
+                `${short.slot?.usable ?? 0} of ${eligibleCount} eligible ${claim.slot} recipes can appear in a ` +
+                `feasible ${short.schedule} day, short of the ${claim.threshold} this cell is measured against`,
+        };
+    }
+
+    return { usable, reason: null, detail: '' };
+};
+
 /**
  * The §0.7.3 coverage table, derived from the seeded recipes.
  *
@@ -2636,7 +3495,18 @@ const stratumOf = (recipe: CoverageRecipe): keyof typeof MAIN_SLOT_FLOORS => {
  * the loops below rather than by any map iteration, which is what makes a rerun
  * byte-identical.
  */
-export const deriveCoverageReport = (recipes: readonly CoverageRecipe[]): CoverageReport => {
+export const deriveCoverageReport = (
+    recipes: readonly CoverageRecipe[],
+    options: CoverageDerivationOptions = {},
+): CoverageReport => {
+    const evaluationCap = options.maxEvaluationsPerProbe ?? MAX_FEASIBILITY_EVALUATIONS_PER_PROBE;
+    if (!Number.isInteger(evaluationCap) || evaluationCap < 1) {
+        throw new RecipeSeedError(
+            'publication_failed',
+            `maxEvaluationsPerProbe must be a whole number of at least 1 for the feasibility gate to decide anything, received ${render(options.maxEvaluationsPerProbe)}`,
+        );
+    }
+
     const eligibleCounts: CoverageCell[] = [];
     for (const diet of COVERAGE_DIETS) {
         for (const allergen of COVERAGE_ALLERGENS) {
@@ -2657,31 +3527,24 @@ export const deriveCoverageReport = (recipes: readonly CoverageRecipe[]): Covera
     const countOf = new Map(
         eligibleCounts.map((cell) => [`${cell.diet}|${cell.allergen}|${cell.slot}|${cell.timeTier}`, cell.count]),
     );
-    const cellAt = (
-        diet: string,
-        allergen: string,
-        slot: string,
-        timeTier: number,
-        threshold: number,
-    ): CoverageThresholdCell => ({
-        diet,
-        allergen,
-        slot,
-        timeTier,
-        threshold,
-        count: countOf.get(`${diet}|${allergen}|${slot}|${timeTier}`) ?? 0,
-    });
 
     // GUARANTEED (>= 4 eligible, which is what the repeat rule needs for a
     // seven-day week): every diet with no allergen at 45 minutes or looser, for
     // every slot; and the `none` diet with any single allergen at any tier, for
     // every main slot.
-    const guaranteedCells: CoverageThresholdCell[] = [];
+    const guaranteedClaims: CoverageClaim[] = [];
     for (const diet of COVERAGE_DIETS) {
         for (const slot of COVERAGE_SLOTS) {
             for (const timeTier of COVERAGE_TIME_TIERS) {
                 if (timeTier >= GUARANTEED_MIN_TIME_TIER) {
-                    guaranteedCells.push(cellAt(diet, NO_ALLERGEN, slot, timeTier, GUARANTEED_THRESHOLD));
+                    guaranteedClaims.push({
+                        tier: 'guaranteed',
+                        diet,
+                        allergen: NO_ALLERGEN,
+                        slot,
+                        timeTier,
+                        threshold: GUARANTEED_THRESHOLD,
+                    });
                 }
             }
         }
@@ -2692,7 +3555,14 @@ export const deriveCoverageReport = (recipes: readonly CoverageRecipe[]): Covera
         }
         for (const slot of COVERAGE_MAIN_SLOTS) {
             for (const timeTier of COVERAGE_TIME_TIERS) {
-                guaranteedCells.push(cellAt('none', allergen, slot, timeTier, GUARANTEED_THRESHOLD));
+                guaranteedClaims.push({
+                    tier: 'guaranteed',
+                    diet: 'none',
+                    allergen,
+                    slot,
+                    timeTier,
+                    threshold: GUARANTEED_THRESHOLD,
+                });
             }
         }
     }
@@ -2703,7 +3573,7 @@ export const deriveCoverageReport = (recipes: readonly CoverageRecipe[]): Covera
     // 30-minute tier, for every slot. Disjoint from the guaranteed set by
     // construction — the first clause excludes the `none` diet and the second
     // sits below the guaranteed tier.
-    const reducedCells: CoverageThresholdCell[] = [];
+    const reducedClaims: CoverageClaim[] = [];
     for (const diet of COVERAGE_DIETS) {
         if (!REDUCED_DIETS.includes(diet)) {
             continue;
@@ -2715,7 +3585,14 @@ export const deriveCoverageReport = (recipes: readonly CoverageRecipe[]): Covera
             for (const slot of COVERAGE_MAIN_SLOTS) {
                 for (const timeTier of COVERAGE_TIME_TIERS) {
                     if (timeTier >= GUARANTEED_MIN_TIME_TIER) {
-                        reducedCells.push(cellAt(diet, allergen, slot, timeTier, REDUCED_THRESHOLD));
+                        reducedClaims.push({
+                            tier: 'reduced',
+                            diet,
+                            allergen,
+                            slot,
+                            timeTier,
+                            threshold: REDUCED_THRESHOLD,
+                        });
                     }
                 }
             }
@@ -2723,7 +3600,116 @@ export const deriveCoverageReport = (recipes: readonly CoverageRecipe[]): Covera
     }
     for (const diet of COVERAGE_DIETS) {
         for (const slot of COVERAGE_SLOTS) {
-            reducedCells.push(cellAt(diet, NO_ALLERGEN, slot, REDUCED_TIME_TIER, REDUCED_THRESHOLD));
+            reducedClaims.push({
+                tier: 'reduced',
+                diet,
+                allergen: NO_ALLERGEN,
+                slot,
+                timeTier: REDUCED_TIME_TIER,
+                threshold: REDUCED_THRESHOLD,
+            });
+        }
+    }
+
+    // THE FEASIBILITY PROBES, derived FROM the claims and not from the whole
+    // dimension product: the gate exists to decide the cells §0.7.3 promises,
+    // so those are what is measured, and measuring the rest would multiply the
+    // cost of every seed for numbers nothing reads. Several cells share one
+    // probe — every slot of one (diet, allergen, tier, schedule) triple is
+    // answered by the same day search — which is what keeps the whole
+    // derivation to the order of a hundred and sixty searches rather than a
+    // thousand. Ordered by the dimensions themselves rather than by claim
+    // discovery, so the emitted list is stable under a reordering of the
+    // clauses above.
+    const planningCandidates = recipes.map(toPlanningCandidate);
+    const probeOrder: { diet: RecipeDietPreference; allergen: string; timeTier: number; schedule: MealSchedule }[] = [];
+    const wanted = new Set<string>();
+    for (const claim of [...guaranteedClaims, ...reducedClaims]) {
+        for (const schedule of schedulesForSlot(claim.slot)) {
+            wanted.add(probeKey(claim.diet, claim.allergen, claim.timeTier, schedule));
+        }
+    }
+    for (const diet of COVERAGE_DIETS) {
+        for (const allergen of COVERAGE_ALLERGENS) {
+            for (const timeTier of COVERAGE_TIME_TIERS) {
+                for (const schedule of COVERAGE_SCHEDULES) {
+                    if (wanted.has(probeKey(diet, allergen, timeTier, schedule))) {
+                        probeOrder.push({ diet, allergen, timeTier, schedule });
+                    }
+                }
+            }
+        }
+    }
+
+    const probes: CoverageFeasibilityProbe[] = [];
+    const probesByKey = new Map<string, CoverageFeasibilityProbe>();
+    // `buildPlanCandidates` is the expensive step and is shared by both
+    // schedules of one (diet, allergen, tier) triple, so it is built once per
+    // triple rather than once per probe. A ONE-ENTRY cache is enough precisely
+    // because `probeOrder` loops the schedule innermost, so a triple's probes
+    // are always consecutive; it is keyed all the same, so a reordering of
+    // those loops would cost a rebuild rather than silently reuse the wrong
+    // pool.
+    let builtKey = '';
+    let built: readonly PlanCandidate[] = [];
+    for (const { diet, allergen, timeTier, schedule } of probeOrder) {
+        const preferences = coveragePreferences(diet, allergen, timeTier);
+        const key = `${diet}|${allergen}|${timeTier}`;
+        if (key !== builtKey) {
+            built = buildPlanCandidates(planningCandidates, preferences, FEASIBILITY_CANDIDATE_SHUFFLE_SEED);
+            builtKey = key;
+        }
+
+        const probe = probeFeasibility(built, preferences, diet, allergen, timeTier, schedule, evaluationCap);
+        probes.push(probe);
+        probesByKey.set(probeKey(diet, allergen, timeTier, schedule), probe);
+    }
+
+    // CERTIFICATION. `guaranteedCells` and `reducedCells` hold only what passed
+    // the gate; every claim that failed is demoted to
+    // `eligibleNotPlannableCells` with the fact that refused it, so the two
+    // certified lists can be trusted without re-deriving them and nothing
+    // §0.7.3 claims disappears silently.
+    const guaranteedCells: CoverageThresholdCell[] = [];
+    const reducedCells: CoverageThresholdCell[] = [];
+    const eligibleNotPlannableCells: CoverageUncertifiedCell[] = [];
+
+    for (const claim of [...guaranteedClaims, ...reducedClaims]) {
+        const count = countOf.get(`${claim.diet}|${claim.allergen}|${claim.slot}|${claim.timeTier}`) ?? 0;
+        const verdict = certifyClaim(claim, probesByKey, count, evaluationCap);
+        const cell: CoverageThresholdCell = {
+            diet: claim.diet,
+            allergen: claim.allergen,
+            slot: claim.slot,
+            timeTier: claim.timeTier,
+            threshold: claim.threshold,
+            count,
+            usable: verdict.usable,
+        };
+
+        if (count < claim.threshold) {
+            // The counting clause is still a clause: a cell too thin to reach
+            // its threshold is refused here, and the feasibility verdict
+            // explains why it is also unplannable when it is.
+            eligibleNotPlannableCells.push({
+                ...cell,
+                reason: verdict.reason ?? 'insufficient_usable_recipes',
+                detail:
+                    `${count} eligible ${claim.slot} recipes, short of the threshold of ${claim.threshold}` +
+                    (verdict.detail === '' ? '' : `; ${verdict.detail}`),
+            });
+            continue;
+        }
+
+        if (verdict.reason !== null) {
+            eligibleNotPlannableCells.push({ ...cell, reason: verdict.reason, detail: verdict.detail });
+            continue;
+        }
+
+        if (claim.tier === 'guaranteed') {
+            guaranteedCells.push(cell);
+        } else {
+            reducedCells.push(cell);
         }
     }
 
@@ -2771,8 +3757,23 @@ export const deriveCoverageReport = (recipes: readonly CoverageRecipe[]): Covera
         slotComposition,
         slotCompositionNotes: SLOT_COMPOSITION_NOTES,
         eligibleCounts,
+        feasibility: {
+            rule: FEASIBILITY_RULE,
+            schedules: COVERAGE_SCHEDULES,
+            sampledTargets: FEASIBILITY_CALORIE_TARGETS.map((calories) => deriveMacroTargets(calories)),
+            weekFillMinUsableRecipesPerSlot: WEEK_FILL_MIN_RECIPES_PER_SLOT,
+            evaluationCapPerProbe: evaluationCap,
+            certification: {
+                guaranteedClaimed: guaranteedClaims.length,
+                guaranteedCertified: guaranteedCells.length,
+                reducedClaimed: reducedClaims.length,
+                reducedCertified: reducedCells.length,
+            },
+            probes,
+        },
         guaranteedCells,
         reducedCells,
+        eligibleNotPlannableCells,
         boundary: BOUNDARY_STATEMENT,
     };
 };
@@ -2823,6 +3824,19 @@ export const toCoverageRecipe = (row: JoinedRecipeRow): CoverageRecipe => {
         // exactly as the eligibility rule derives them: the column is a record
         // of that derivation and the two must never be able to disagree.
         dietTags: deriveDietTags(ingredients),
+        versionNumber: version.version,
+        budgetTier: version.budget_tier,
+        // Read from the STORED per-serving columns rather than recomputed from
+        // the ingredient set: the validation pass has already proved the two
+        // agree for every file it published (`validateRecipeFile`), and the
+        // planner plans from these columns, so the feasibility probe has to
+        // judge the same four numbers a real plan would sum.
+        perServing: {
+            calories: version.per_serving_calories,
+            protein: version.per_serving_protein_g,
+            carbs: version.per_serving_carbs_g,
+            fat: version.per_serving_fat_g,
+        },
         version: {
             status: version.status === CURRENT_VERSION_STATUS ? 'current' : 'retired',
             nutrition_provenance:
@@ -4375,6 +5389,53 @@ const gapFields = (gaps: readonly PrerequisiteGap[]): LogFields => {
     return fields;
 };
 
+/**
+ * The message of an error THIS REPOSITORY composed, as a log field.
+ *
+ * Only called from a branch that has already narrowed the value to a
+ * first-party class — that narrowing is what makes reading a message legitimate
+ * at all, and `firstPartyMessage` documents the obligation it discharges. The
+ * field is named for its PROVENANCE, matching `scripts/seed-dev.ts` and
+ * `scripts/catalog-import-usda.ts`, so a reader of a line can tell at a glance
+ * that the sentence was written here and not quoted from a driver, a vendor or
+ * the document that failed.
+ */
+const firstPartyMessageField = (error: unknown): LogFields => {
+    const message = firstPartyMessage(error);
+
+    return message === undefined ? {} : { firstPartyMessage: message };
+};
+
+/**
+ * How many defects a corpus refusal found, when it found any.
+ *
+ * The `problems` list itself is deliberately NOT repeated here. The class
+ * renders the whole list into its own message (see RecipeSeedError), the stage
+ * has already written it as the `problems` array of its `recipes_rejected`
+ * line, and `firstPartyMessage` caps the forwarded sentence — so the count is
+ * the member that survives a truncated list and tells an operator how many
+ * further defects the corpus holds.
+ */
+const recipeSeedErrorFields = (error: RecipeSeedError): LogFields =>
+    error.problems.length === 0 ? {} : { problemCount: error.problems.length };
+
+/**
+ * What the classifier's remedy leaves out for THIS stage — and it is
+ * deliberately not `catalog-import-usda.ts`'s `--resume` clause, which would be
+ * false here.
+ *
+ * This stage has no `--resume` and needs none: it publishes one transaction per
+ * recipe and is idempotent by `slug`, so re-running the same command reconciles
+ * whatever the interrupted attempt committed and an already-current recipe is a
+ * read (see the header, and claimRecipeSeedRun's third outcome). The one thing
+ * that can delay that re-run is the interrupted attempt's own ledger row, so
+ * the wait is named rather than left for an operator to meet as a second
+ * refusal.
+ */
+const RERUN_CLAUSE =
+    ' A run interrupted this way needs no --resume: the stage publishes one transaction per recipe and is idempotent by slug, so re-running the same command reconciles whatever the interrupted attempt committed and rewrites nothing that is already current.' +
+    ` If that attempt had already claimed its run row, the re-run is refused as seed_in_progress until the row's lease lapses, ${RECIPE_SEED_RUN_LEASE_MS / 1000} seconds after its last committed recipe.`;
+
 // Every error class this file can observe gets its own reported code; anything
 // unrecognised is reported through safeError under `unexpected_error` rather
 // than swallowed or printed raw.
@@ -4382,15 +5443,38 @@ const gapFields = (gaps: readonly PrerequisiteGap[]): LogFields => {
 // machine code and status, and deliberately no `message`: this value reaches the
 // durable run log and the operator console, where foreign prose can carry a
 // connection URL, a key or a fragment of the document that failed (CWE-532).
+// What an operator acts on travels beside it in `detail` instead, where each
+// member's provenance is stated by the field that carries it: this
+// repository's own sentence under `firstPartyMessage`, typed facts under their
+// own names, and fixed in-repo prose under `remedy`.
 export const describeFailure = (error: unknown): { code: string; error: SafeErrorFields; detail?: LogFields } => {
     if (isThrownInstanceOf(error, RecipeSeedError)) {
-        return { code: error.code, error: safeError(error) };
+        // First-party, and the arm that most needs its sentence: a seed refusal
+        // names the recipe file, the declared field that disagreed with the
+        // derivation and the ingredient `source_key` that could not be resolved
+        // — §0.7.3's "fails loudly with the offending recipe and ingredient" —
+        // and none of that survives in a code. The prose is this file's own,
+        // composed against `problems` from data it validated, so forwarding it
+        // echoes no driver, vendor or model text.
+        return {
+            code: error.code,
+            error: safeError(error),
+            detail: { ...recipeSeedErrorFields(error), ...firstPartyMessageField(error) },
+        };
     }
     if (isThrownInstanceOf(error, DatabaseOriginError)) {
+        // Deliberately WITHOUT its message, unlike the first-party arms around
+        // it: a `DatabaseOriginError` explains itself by naming the host and
+        // database it refused, and dbGuard reports that refusal itself with the
+        // target reduced to a digest. Forwarding the sentence here would publish
+        // the topology the guard's own line takes care to withhold.
         return { code: error.code, error: safeError(error) };
     }
     if (isThrownInstanceOf(error, ManifestError)) {
-        return { code: error.code, error: safeError(error) };
+        // First-party: a manifest refusal names the file, the field and the two
+        // values that disagree, which is the whole remedy and survives in no
+        // code.
+        return { code: error.code, error: safeError(error), detail: firstPartyMessageField(error) };
     }
     // Reachable for the ledger's own refusals — a run row that vanished or was
     // closed under this invocation — rather than for the stage lock, which
@@ -4411,7 +5495,34 @@ export const describeFailure = (error: unknown): { code: string; error: SafeErro
     if (isThrownInstanceOf(error, UnitConversionError)) {
         return { code: 'unit_conversion_failed', error: safeError(error) };
     }
-    return { code: 'unexpected_error', error: safeError(error) };
+    // THE DATABASE, which used to be reported as a surprise.
+    //
+    // The stage takes its writer lock and the catalog graph hold through
+    // checkpoint.ts's own raw `pg` session before it writes anything, so a
+    // database that will not serve the run fails HERE — before Prisma exists to
+    // translate it — as a node-postgres `DatabaseError` whose `name` is the
+    // literal `'error'`. It matched none of the classes above and was reported
+    // as `{"code":"unexpected_error","error":{"name":"error"}}`: no class, no
+    // SQLSTATE, no remedy, for the most ordinary failure a stage has, which is
+    // what made triage of a host at `max_connections` guesswork. The taxonomy
+    // lives in logger.ts so every stage answers the same way, and `safeError`
+    // carries the SQLSTATE beside this code.
+    //
+    // Immediately before the fallback and after every arm above it, so a class
+    // this stage owns is never reclassified: a Prisma `P2002` is a seed-data
+    // defect wearing a database code and `classifyInfrastructureFailure`
+    // returns `null` for it, leaving it `unexpected_error`.
+    const infrastructure = classifyInfrastructureFailure(error);
+    if (infrastructure !== null) {
+        return {
+            code: infrastructure.code,
+            error: safeError(error),
+            detail: { remedy: `${infrastructure.remedy}${RERUN_CLAUSE}` },
+        };
+    }
+    // Genuinely unclassified, and it says so with something to do about it
+    // rather than with an empty hand.
+    return { code: 'unexpected_error', error: safeError(error), detail: { remedy: UNEXPECTED_FAILURE_REMEDY } };
 };
 
 const main = async (): Promise<number> => {

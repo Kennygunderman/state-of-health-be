@@ -34,6 +34,13 @@
  * backend-architecture §11 asks for the rules to be provable without one, and
  * every rule here is a decision over values rather than a query.
  *
+ * ONE BLOCK IS THE EXCEPTION, at the foot of the file, and it touches no
+ * database either: the runner's own `--help` REACHABILITY. An exit status and
+ * the module-load ordering ahead of `main()` cannot be observed from a process
+ * that has already imported the module, so that block launches the real command
+ * as a child against database URLs this stage's policy REFUSES — the two of
+ * them naming databases no server answers — and reads its status and streams.
+ *
  * Two files are read from the repository, both through the runner's own
  * loaders: `data/meal-planning/catalog/releases/v1/manifest.json`, because the
  * runner digests it as a measurement condition (the release version in every
@@ -70,6 +77,7 @@
  *     DATABASE_URL=postgresql://…@127.0.0.1:5433/<name>_test \
  *     npx jest src/__tests__/scripts/search-benchmark.test.ts --runInBand
  */
+import { spawnSync } from 'child_process';
 import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
@@ -3520,4 +3528,143 @@ describe('parseArgs', () => {
     it('resolves the default artefact to the committed report path', () => {
         expect(resolveOutPath(null)).toBe(reportPath('benchmark-report.json'));
     });
+});
+
+/* ---------------------------------------------------------------------------
+ * The usage block, under a database this policy refuses
+ * ------------------------------------------------------------------------- */
+
+// WHY A READ-ONLY STAGE NEEDS THIS CASE AT ALL. `search-benchmark` runs under
+// the widest policy in the pipeline, `read_only_recognised`, because §0.7.5
+// runs it ON the deployment host to record that environment's own report — so
+// the origins it refuses are the two it cannot classify or must never touch: an
+// unrecognised one, and the shadow database Prisma's schema tooling resets.
+// Those are the states an operator is in when they have just been handed the
+// command and no URL, which is when `--help` matters: the usage block is where
+// the flags, the artefact path and the acceptance protocol are written. The
+// guard asserted the origin at module load, ahead of this runner's `parseArgs`,
+// so it printed a refusal instead. `scripts/lib/dbGuard.ts` now skips the
+// assertion for a help invocation decided from argv alone, and the pair of
+// cases below is this runner's half of that claim: usage reachable with a help
+// flag, the same refusal without one. The policy table itself, and which class
+// each script accepts, stay in `dbGuard.test.ts`.
+//
+// It spawns because `require.main === module` guards `main()` and this file has
+// already imported the runner, so an exit status is not observable in process.
+// No database is reached: the help path returns before the lazy
+// `import('../src/prisma/client')`, and the refusal precedes `main()`.
+describe('reaching the usage block while the origin is refused', () => {
+    /** `<repo>/backend`, three levels above this file. */
+    const BACKEND_ROOT = path.resolve(__dirname, '..', '..', '..');
+
+    const SCRIPT = path.join(BACKEND_ROOT, 'scripts', 'search-benchmark.ts');
+
+    /** ts-node compiles the whole runner in the child; a minute is generous. */
+    const CHILD_TIMEOUT_MS = 60_000;
+
+    /**
+     * The two origins this policy refuses, as URLs no server answers.
+     *
+     * `127.0.0.2` is outside the guard's local-host set, so it classifies
+     * `unknown` and is refused outright; the `_shadow` name on loopback is
+     * refused whatever the policy says, because the schema tooling resets that
+     * database. Neither database exists on the test container, so a regression
+     * that let a run past the guard fails on a refused connection or a missing
+     * database in milliseconds instead of querying anything real — and this
+     * runner only ever reads, so there is nothing to undo either way. The
+     * userinfo is a placeholder: no connection is opened on either path.
+     */
+    const REFUSED_TARGETS: readonly { readonly code: string; readonly label: string; readonly url: string }[] = [
+        {
+            code: 'unrecognised_origin',
+            label: 'a host the guard cannot classify',
+            url: 'postgresql://benchmark_fixture:fixture-only@127.0.0.2:5432/state_of_health',
+        },
+        {
+            code: 'shadow_database',
+            label: 'the shadow class, refused to every script',
+            url: 'postgresql://benchmark_fixture:fixture-only@127.0.0.1:5433/help_reachability_shadow',
+        },
+    ];
+
+    interface CliOutcome {
+        readonly status: number | null;
+        readonly stdout: string;
+        readonly stderr: string;
+    }
+
+    /**
+     * The real command against one refused URL.
+     *
+     * `DATABASE_URL` is SET rather than inherited: `lib/bootstrap.ts` calls
+     * `dotenv.config()` without override, so a child without one falls back to
+     * `backend/.env`, whose `_test` database this policy ACCEPTS — the case
+     * would then prove nothing at all. No vendor key is passed because neither
+     * path reads one.
+     */
+    const runCommand = (databaseUrl: string, args: readonly string[]): CliOutcome => {
+        const child = spawnSync(
+            process.execPath,
+            ['--require', 'ts-node/register/transpile-only', SCRIPT, ...args],
+            {
+                cwd: BACKEND_ROOT,
+                encoding: 'utf8',
+                timeout: CHILD_TIMEOUT_MS,
+                env: {
+                    PATH: process.env.PATH,
+                    HOME: process.env.HOME,
+                    DATABASE_URL: databaseUrl,
+                    TS_NODE_PROJECT: 'tsconfig.scripts.json',
+                    TS_NODE_TRANSPILE_ONLY: '1',
+                },
+            },
+        );
+
+        expect(child.error).toBeUndefined();
+
+        return { status: child.status, stdout: child.stdout, stderr: child.stderr };
+    };
+
+    for (const target of REFUSED_TARGETS) {
+        describe(target.label, () => {
+            it.each([
+                ['--help', ['--help']],
+                ['-h', ['-h']],
+                // A help flag written after real options, which is how an
+                // operator mid-command asks what the rest of them are.
+                ['--passes 3 --help', ['--passes', '3', '--help']],
+            ])('prints the usage block and exits 0 for %s', (_label, args) => {
+                const outcome = runCommand(target.url, args);
+
+                expect(outcome.status).toBe(0);
+                expect(outcome.stdout.split('\n')[0]).toBe(
+                    'Usage: npm run search:benchmark -- [options]   (search-benchmark)',
+                );
+                expect(outcome.stdout).not.toContain('database_origin_refused');
+                expect(outcome.stderr).toBe('');
+                // The usage block names the artefact this runner writes, which
+                // is the reason an operator reads it before running anything.
+                expect(outcome.stdout).toContain('benchmark-report.json');
+            }, CHILD_TIMEOUT_MS);
+
+            it(`still refuses that database with ${target.code}, and writes no usage, when no help flag is given`, () => {
+                const outcome = runCommand(target.url, []);
+
+                expect(outcome.status).toBe(1);
+                expect(outcome.stderr).toContain('"event":"database_origin_refused"');
+                expect(outcome.stderr).toContain('"script":"search-benchmark"');
+                expect(outcome.stderr).toContain(`"code":"${target.code}"`);
+                expect(outcome.stdout).toBe('');
+                expect(outcome.stderr).not.toContain('Usage: npm run');
+            }, CHILD_TIMEOUT_MS);
+        });
+    }
+
+    it('refuses --help=x, which this parser does not read as help either', () => {
+        const outcome = runCommand(REFUSED_TARGETS[0].url, ['--help=x']);
+
+        expect(outcome.status).toBe(1);
+        expect(outcome.stderr).toContain('"event":"database_origin_refused"');
+        expect(outcome.stdout).toBe('');
+    }, CHILD_TIMEOUT_MS);
 });

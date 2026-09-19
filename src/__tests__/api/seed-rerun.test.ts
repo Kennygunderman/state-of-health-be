@@ -1966,33 +1966,105 @@ describe('the coverage matrix the seed derives from the seeded rows', () => {
         );
     });
 
-    it('satisfies every guaranteed cell: at least four eligible recipes', () => {
-        const shortfalls = report()
-            .guaranteedCells.filter((cell) => cell.count < cell.threshold)
-            .map(
-                (cell) =>
-                    `${cell.diet}/${cell.allergen}/${cell.slot}/<=${cell.timeTier}min: ${cell.count} eligible, ` +
-                    `threshold ${cell.threshold}`,
-            );
+    /**
+     * The guarantee-bearing assertion of this file, and the reason a count is
+     * no longer enough to make it.
+     *
+     * A cell used to pass on `count` — four recipes eligible for the slot. That
+     * measures the wrong thing: the planner admits a day on MACRO BALANCE, so a
+     * cell can hold twenty eligible recipes and still refuse every arrangement
+     * of them, which is exactly how vegan, vegetarian and pescatarian users
+     * came to be certified and unplannable at the same time. Since schema 2
+     * `deriveCoverageReport` probes each claimed cell through the production
+     * eligibility, portion and day-tolerance rules and certifies it only when a
+     * tolerance-satisfying day is actually FOUND, at every sampled target on
+     * every schedule containing the slot, with at least `threshold` distinct
+     * recipes able to appear in one. `guaranteedCells` and `reducedCells`
+     * therefore hold only what survived that gate, and everything §0.7.3 claims
+     * but the corpus cannot serve is named in `eligibleNotPlannableCells`.
+     *
+     * So the assertion is that the demotion list is EMPTY. Filtering makes
+     * `guaranteedCells` self-consistent by construction, which would let a
+     * corpus that serves one profile pass a test that reads the surviving
+     * cells; the claim totals below are what keep this honest, because they come
+     * from §0.7.3 rather than from the corpus and do not move when recipes do.
+     */
+    it('serves every cell §0.7.3 claims, with no profile demoted', () => {
+        const demoted = report().eligibleNotPlannableCells.map(
+            (cell) =>
+                `${cell.diet}/${cell.allergen}/${cell.slot}/<=${cell.timeTier}min: ${cell.count} eligible but ` +
+                `${cell.usable} usable against threshold ${cell.threshold} (${cell.reason}: ${cell.detail})`,
+        );
 
-        expect(shortfalls).toEqual([]);
-        // The clause is not passing because nothing exercises it.
-        expect(report().guaranteedCells.length).toBeGreaterThan(0);
-        expect(report().guaranteedCells.every((cell) => cell.threshold === 4)).toBe(true);
+        expect(demoted).toEqual([]);
+
+        // Every claimed cell is accounted for: certified, or named as demoted.
+        // The two totals are §0.7.3's, so this holds for any corpus and fails
+        // if a claim silently disappears from the document instead of failing
+        // the gate.
+        const certification = report().feasibility.certification;
+        const demotedAtThreshold = (threshold: number): number =>
+            report().eligibleNotPlannableCells.filter((cell) => cell.threshold === threshold).length;
+
+        expect(report().guaranteedCells.length + demotedAtThreshold(4)).toBe(certification.guaranteedClaimed);
+        expect(report().reducedCells.length + demotedAtThreshold(2)).toBe(certification.reducedClaimed);
+        expect(certification.guaranteedCertified).toBe(report().guaranteedCells.length);
+        expect(certification.reducedCertified).toBe(report().reducedCells.length);
     });
 
-    it('satisfies every reduced cell: at least two eligible recipes', () => {
-        const shortfalls = report()
-            .reducedCells.filter((cell) => cell.count < cell.threshold)
+    it('holds four usable recipes in every guaranteed cell and two in every reduced cell', () => {
+        // `usable` is the count certification turns on, and it is minimised over
+        // every plannable target rather than read at the most generous one, so
+        // this is what holds across the band. `count >= usable` is asserted too,
+        // because a cell claiming more usable recipes than it has eligible ones
+        // would mean the probe and the eligibility pass disagree.
+        const shortfalls = [...report().guaranteedCells, ...report().reducedCells]
+            .filter((cell) => cell.usable < cell.threshold || cell.count < cell.usable)
             .map(
                 (cell) =>
                     `${cell.diet}/${cell.allergen}/${cell.slot}/<=${cell.timeTier}min: ${cell.count} eligible, ` +
-                    `threshold ${cell.threshold}`,
+                    `${cell.usable} usable, threshold ${cell.threshold}`,
             );
 
         expect(shortfalls).toEqual([]);
+        // The clauses are not passing because nothing exercises them.
+        expect(report().guaranteedCells.length).toBeGreaterThan(0);
         expect(report().reducedCells.length).toBeGreaterThan(0);
+        expect(report().guaranteedCells.every((cell) => cell.threshold === 4)).toBe(true);
         expect(report().reducedCells.every((cell) => cell.threshold === 2)).toBe(true);
+    });
+
+    it('proves each claim by a probe that finished, at every sampled target', () => {
+        // A probe that spends its evaluation budget proves nothing either way,
+        // so an exhausted one must never be what a certified cell rests on.
+        const exhausted = report()
+            .feasibility.probes.filter((probe) => probe.searchExhausted)
+            .map((probe) => `${probe.diet}/${probe.allergen}/<=${probe.timeTier}min/${probe.schedule}`);
+
+        expect(exhausted).toEqual([]);
+
+        // Certification requires a feasible day at EVERY sampled target, so no
+        // probe backing a certified cell may report an unplannable one.
+        const certifiedKeys = new Set(
+            [...report().guaranteedCells, ...report().reducedCells].map(
+                (cell) => `${cell.diet}|${cell.allergen}|${cell.timeTier}`,
+            ),
+        );
+        const gaps = report()
+            .feasibility.probes.filter(
+                (probe) =>
+                    certifiedKeys.has(`${probe.diet}|${probe.allergen}|${probe.timeTier}`) &&
+                    probe.unplannableTargets.length > 0,
+            )
+            .map(
+                (probe) =>
+                    `${probe.diet}/${probe.allergen}/<=${probe.timeTier}min/${probe.schedule}: ` +
+                    `no day at ${probe.unplannableTargets.join(', ')} kcal`,
+            );
+
+        expect(gaps).toEqual([]);
+        expect(report().feasibility.probes.length).toBeGreaterThan(0);
+        expect(report().feasibility.weekFillMinUsableRecipesPerSlot).toBe(4);
     });
 
     it('meets the §0.7.3 composition floors for every slot that states them', () => {
@@ -3554,16 +3626,48 @@ describe('the coverage report recomputed from the rows that are actually seeded'
         expect(reducedDocument).not.toBe(fs.readFileSync(committedReportPath(), 'utf8'));
     });
 
-    it('reports the guaranteed cells as short, because the counts come from the rows', () => {
-        const met = reduced.guaranteedCells.filter((cell) => cell.count >= cell.threshold);
+    it('demotes the guaranteed cells, because the counts come from the rows', () => {
+        // Three recipes cannot fill any slot's guaranteed cell. Since schema 2
+        // a cell that fails the feasibility gate is not emitted as a short
+        // certified cell — it moves to `eligibleNotPlannableCells` with the
+        // reason — so the shortfall is read there, and `guaranteedCells` is
+        // compared as a COUNT against the whole corpus rather than for equal
+        // length with it.
+        expect(reduced.guaranteedCells.length).toBeLessThan(committed.guaranteedCells.length);
+        expect(reduced.eligibleNotPlannableCells.length).toBeGreaterThan(0);
+        expect(committed.eligibleNotPlannableCells).toEqual([]);
 
-        // Three recipes cannot fill any slot's guaranteed cell, and every cell
-        // still carries the threshold it is measured against: the numbers moved,
-        // the rules did not.
-        expect(met).toEqual([]);
-        expect(reduced.guaranteedCells.length).toBe(committed.guaranteedCells.length);
+        // What §0.7.3 claims does not move with the corpus: the same cells are
+        // accounted for either way, certified here and demoted there.
+        expect(reduced.feasibility.certification.guaranteedClaimed).toBe(
+            committed.feasibility.certification.guaranteedClaimed,
+        );
+        expect(reduced.feasibility.certification.reducedClaimed).toBe(
+            committed.feasibility.certification.reducedClaimed,
+        );
+
+        const demotedAtThreshold = (report: CoverageReport, threshold: number): number =>
+            report.eligibleNotPlannableCells.filter((cell) => cell.threshold === threshold).length;
+
+        expect(reduced.guaranteedCells.length + demotedAtThreshold(reduced, 4)).toBe(
+            reduced.feasibility.certification.guaranteedClaimed,
+        );
+        expect(reduced.reducedCells.length + demotedAtThreshold(reduced, 2)).toBe(
+            reduced.feasibility.certification.reducedClaimed,
+        );
+
+        // The rules did not move either: every cell, certified or demoted,
+        // still carries the threshold it is measured against.
         expect(reduced.guaranteedCells.every((cell) => cell.threshold === 4)).toBe(true);
         expect(reduced.reducedCells.every((cell) => cell.threshold === 2)).toBe(true);
+        expect(
+            reduced.eligibleNotPlannableCells.every((cell) => cell.threshold === 4 || cell.threshold === 2),
+        ).toBe(true);
+        expect(
+            reduced.eligibleNotPlannableCells.every(
+                (cell) => cell.usable < cell.threshold || cell.reason === 'search_exhausted',
+            ),
+        ).toBe(true);
     });
 
     it('keeps its dimensions, its eligibility rule and its documented boundary', () => {
@@ -3581,6 +3685,64 @@ describe('the coverage report recomputed from the rows that are actually seeded'
         expect(reduced.boundary).toBe(committed.boundary);
         expect(reduced.boundary).toContain('no_matching_meals');
         expect(reduced.schemaVersion).toBe(committed.schemaVersion);
+
+        // The feasibility block splits the same way: the rule it states, the
+        // schedules and targets it samples, the week-fill floor it derives and
+        // the cap it bounds each probe by are policy and identical whatever is
+        // seeded, while `certification` and `probes` are measurements and move
+        // with the corpus (asserted above and below respectively).
+        expect(reduced.feasibility.rule).toEqual(committed.feasibility.rule);
+        expect(reduced.feasibility.schedules).toEqual(committed.feasibility.schedules);
+        expect(reduced.feasibility.sampledTargets).toEqual(committed.feasibility.sampledTargets);
+        expect(reduced.feasibility.weekFillMinUsableRecipesPerSlot).toBe(
+            committed.feasibility.weekFillMinUsableRecipesPerSlot,
+        );
+        expect(reduced.feasibility.weekFillMinUsableRecipesPerSlot).toBe(
+            reduced.repeatRule.minEligiblePerSlotForFullWeek,
+        );
+        expect(reduced.feasibility.evaluationCapPerProbe).toBe(committed.feasibility.evaluationCapPerProbe);
+        // One probe per diet × allergen × tier × schedule either way, because
+        // the matrix is a dimension of the document and not of the corpus.
+        expect(reduced.feasibility.probes.length).toBe(committed.feasibility.probes.length);
+    });
+
+    it('finds fewer usable recipes per slot than the whole corpus does', () => {
+        // Non-vacuity for the block above: the probes are measurements, so the
+        // three-recipe run must actually report a smaller usable set. Compared
+        // probe by probe, since the probe list is ordered identically.
+        const committedBySlot = new Map<string, number>();
+        for (const probe of committed.feasibility.probes) {
+            for (const slot of probe.slots) {
+                committedBySlot.set(
+                    `${probe.diet}|${probe.allergen}|${probe.timeTier}|${probe.schedule}|${slot.slot}`,
+                    slot.usable,
+                );
+            }
+        }
+
+        const excesses: string[] = [];
+        let reductions = 0;
+        for (const probe of reduced.feasibility.probes) {
+            for (const slot of probe.slots) {
+                const key = `${probe.diet}|${probe.allergen}|${probe.timeTier}|${probe.schedule}|${slot.slot}`;
+                const whole = committedBySlot.get(key);
+                if (whole === undefined) {
+                    excesses.push(`${key}: the whole corpus reports no such probe slot`);
+                    continue;
+                }
+
+                if (slot.usable > whole) {
+                    excesses.push(`${key}: ${slot.usable} usable against the whole corpus's ${whole}`);
+                }
+
+                if (slot.usable < whole) {
+                    reductions += 1;
+                }
+            }
+        }
+
+        expect(excesses).toEqual([]);
+        expect(reductions).toBeGreaterThan(0);
     });
 
     it('moves the composition counts with the seeded set', () => {

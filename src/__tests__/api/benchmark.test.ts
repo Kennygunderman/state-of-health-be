@@ -1868,6 +1868,21 @@ describe('the schema the search rests on', () => {
         expect((gin as IndexRow).indexdef).toMatch(/USING gin \("?search_vector"?\)/i);
     });
 
+    it('carries the GIN index the alias full-text branch reads', async () => {
+        const indexes = await indexesOf('catalog_food_aliases');
+        const gin = indexes.find(
+            (index) => index.indexname === 'idx_catalog_food_aliases_search_vector',
+        );
+
+        // Without this index the alias full-text branch has no way to answer
+        // `search_vector @@ tsq` except by reading every alias row, which is a
+        // fixed floor under EVERY search including one that matches nothing:
+        // measured on the v1 release, a zero-result query cost 63 ms of that
+        // floor alone and fell to 3 ms once the index existed.
+        expect(gin).toBeDefined();
+        expect((gin as IndexRow).indexdef).toMatch(/USING gin \("?search_vector"?\)/i);
+    });
+
     it('carries the ASCII-fold index the alias prefix branch needs', async () => {
         const indexes = await indexesOf('catalog_food_aliases');
         const prefix = indexes.find((index) => index.indexname === 'idx_catalog_food_aliases_fold_alias');
@@ -2021,6 +2036,91 @@ describe('the schema the search rests on', () => {
 
         expect(JSON.stringify(plan)).toContain('idx_catalog_foods_search_vector');
     });
+
+    it('can answer the alias full-text branch from the GIN index', async () => {
+        // Same advisory gating and the same reason as the catalog_foods case
+        // above: the vector predicate stands alone so the GIN index is the only
+        // index that could answer it.
+        const plan = await prisma.$transaction(async (db) => {
+            await db.$executeRawUnsafe('SET LOCAL enable_seqscan = off');
+
+            return db.$queryRawUnsafe<{ 'QUERY PLAN': unknown }[]>(
+                'EXPLAIN (FORMAT JSON) SELECT catalog_food_id FROM catalog_food_aliases ' +
+                    "WHERE search_vector @@ plainto_tsquery('english', 'zentil')",
+            );
+        });
+
+        expect(JSON.stringify(plan)).toContain('idx_catalog_food_aliases_search_vector');
+    });
+
+    it('leaves every alias row with a populated search_vector', async () => {
+        const [{ unpopulated }] = await prisma.$queryRaw<{ unpopulated: bigint }[]>`
+            SELECT COUNT(*) AS unpopulated
+            FROM catalog_food_aliases
+            WHERE search_vector IS NULL OR search_vector = to_tsvector('english', '')
+        `;
+
+        // `alias` is NOT NULL, so the generated expression can only produce an
+        // empty vector for an alias with no lexemes. One that does is
+        // permanently unfindable through the full-text branch rather than
+        // merely mis-ranked.
+        expect(Number(unpopulated)).toBe(0);
+    });
+
+    it('offers the plan-cache mode the search statements are planned under', async () => {
+        // THE MECHANISM `searchPublishedFoods` DEPENDS ON, pinned because its
+        // absence is silent. Every branch of the match set is index-served only
+        // when the planner sees the parameter VALUES: the prefix branches derive
+        // their B-tree range bounds from the LIKE pattern and the full-text
+        // branches take their selectivity from the tsquery. Prisma sends one
+        // parameterised prepared statement whose text is identical for every
+        // query the app runs, so under the default `plan_cache_mode = auto`
+        // PostgreSQL switches to a GENERIC plan after five executions and
+        // abandons those indexes. Measured on the v1 release, that made the
+        // first query of a connection cost 64 ms and every query after it
+        // 196-283 ms; `force_custom_plan` puts the whole set at 2.9-79.5 ms.
+        const [{ mode }] = await prisma.$queryRaw<{ mode: string }[]>`
+            SELECT setting AS mode FROM pg_settings WHERE name = 'plan_cache_mode'
+        `;
+        expect(typeof mode).toBe('string');
+
+        // Transaction-scoped, which is what makes it safe to issue on a pooled
+        // connection: it must apply inside the transaction and be gone after it.
+        const inside = await prisma.$transaction(async (db) => {
+            await db.$executeRawUnsafe('SET LOCAL plan_cache_mode = force_custom_plan');
+            const [row] = await db.$queryRaw<{ mode: string }[]>`
+                SELECT current_setting('plan_cache_mode') AS mode
+            `;
+            return row.mode;
+        });
+        const [{ mode: after }] = await prisma.$queryRaw<{ mode: string }[]>`
+            SELECT current_setting('plan_cache_mode') AS mode
+        `;
+
+        expect(inside).toBe('force_custom_plan');
+        expect(after).not.toBe('force_custom_plan');
+    });
+
+    it('still issues that directive from the search transaction', () => {
+        // A SOURCE TRIPWIRE, and deliberately so. Removing the directive changes
+        // no result, no ordering and no row count, so every functional test in
+        // this repository keeps passing while the worst-case search doubles and
+        // the other seven triple. There is no observable the suite can read back
+        // after the fact either: `SET LOCAL` reverts at COMMIT, so by the time a
+        // test can query the session the evidence is gone. Pinning the call site
+        // is what makes its deletion fail loudly. If the service stops needing
+        // it — a Prisma release that stops preparing these statements, or a
+        // rewrite that makes the plan parameter-insensitive — delete this test
+        // WITH the measurement that shows the regression is gone.
+        const source = readFileSync(
+            join(__dirname, '..', '..', 'services', 'catalog.service.ts'),
+            'utf8',
+        );
+        const body = source.slice(source.indexOf('export const searchPublishedFoods'));
+
+        expect(body).toContain('forceCustomPlanForThisTransaction');
+        expect(source).toContain('SET LOCAL plan_cache_mode = force_custom_plan');
+    });
 });
 
 /* ---------------------------------------------------------------------------
@@ -2090,5 +2190,128 @@ describe('what the catalog read does not depend on', () => {
         `;
 
         expect(scoped).toStrictEqual([]);
+    });
+});
+
+/**
+ * The read-path schema objects that carry no behaviour of their own.
+ *
+ * WHY THESE ARE PINNED HERE AND NOT SOMEWHERE ELSE. An index and a statistics
+ * object change only how fast an answer arrives, never what it is, so every
+ * functional test in this repository passes with all four of them dropped. The
+ * two defects they fix were found by reading query plans, and nothing but an
+ * assertion of this shape can notice them coming back:
+ *
+ *  * `meal_plans_user_id_start_date_id_idx` replaced a declared index on
+ *    `(user_id, status, start_date)` that had `idx_scan = 0` on a 1,503-plan
+ *    fixture because no statement carried a `status` predicate. Its key order
+ *    matches the plan-lifecycle read — equality on `user_id`, then the read's
+ *    own `ORDER BY start_date, id` — which is what turns that read into an
+ *    Index Only Scan with no Sort node.
+ *  * The four statistics objects tell the planner that `meal_plan_id` and
+ *    `user_id` are correlated (a plan's days all belong to that plan's owner)
+ *    and that `user_id` and `date` are. Without them PostgreSQL multiplies the
+ *    two selectivities as if independent and underestimated by 7x, 22x and 41x
+ *    on the same fixture.
+ *
+ * THE STATEMENT AND THE INDEX MUST MOVE TOGETHER. The read that this index
+ * exists for lives in `mealPlan.service.ts`, which this unit does not own. That
+ * is exactly why the key order is asserted rather than described: if that read
+ * gains a `status` predicate or changes its ordering, this test fails and names
+ * the index that has to follow it, instead of the index quietly going unused
+ * again.
+ */
+describe('the schema the plan reads rest on', () => {
+    it('carries the plan-lifecycle index in the key order that read scans', async () => {
+        const indexes = await prisma.$queryRaw<{ indexname: string; indexdef: string }[]>`
+            SELECT indexname, indexdef
+            FROM pg_indexes
+            WHERE schemaname = current_schema() AND tablename = 'meal_plans'
+        `;
+        const lifecycle = indexes.find(
+            (index) => index.indexname === 'meal_plans_user_id_start_date_id_idx',
+        );
+
+        expect(lifecycle).toBeDefined();
+        // Key order is the whole point: `user_id` first for the equality, then
+        // `start_date, id` so the read's ORDER BY is satisfied by the scan.
+        expect((lifecycle as { indexdef: string }).indexdef).toMatch(
+            /\("?user_id"?, "?start_date"?, "?id"?\)/i,
+        );
+    });
+
+    it('no longer carries the status-leading index nothing could use', async () => {
+        const retired = await prisma.$queryRaw<{ present: boolean }[]>`
+            SELECT to_regclass('meal_plans_user_id_status_start_date_idx') IS NOT NULL AS present
+        `;
+
+        // Kept as its own assertion rather than folded into the one above: an
+        // unused index is not free. It is maintained on every insert and update
+        // to a hot, per-user table, so leaving it beside its replacement would
+        // pay for two and read from one.
+        expect(retired[0]?.present).toBe(false);
+    });
+
+    it('carries extended statistics on every correlated pair the plan reads filter by', async () => {
+        const stats = await prisma.$queryRaw<{ stxname: string; kinds: string }[]>`
+            SELECT stxname, stxkind::text AS kinds
+            FROM pg_statistic_ext
+            WHERE stxnamespace = current_schema()::regnamespace
+            ORDER BY stxname
+        `;
+        const names = stats.map((row) => row.stxname);
+
+        expect(names).toStrictEqual(
+            expect.arrayContaining([
+                'grocery_items_meal_plan_id_user_id_stx',
+                'meal_entries_user_id_date_stx',
+                'meal_plan_days_meal_plan_id_user_id_stx',
+                'meal_plan_meals_meal_plan_id_user_id_stx',
+            ]),
+        );
+    });
+
+    it('points each of those statistics at the column pair its read filters by', async () => {
+        // THE COLUMN PAIR IS THE WHOLE VALUE. A statistics object declared on
+        // the wrong two columns is indistinguishable from none at all — it is
+        // created, it is ANALYZEd, it reports as present, and it corrects
+        // nothing. Names cannot be trusted to encode it either, since the name
+        // is just a string the migration chose. So the keys are resolved back
+        // through `pg_attribute` and compared against the predicates the reads
+        // actually carry: `meal_plan_id = $1 AND user_id = $2` on the three
+        // plan-child tables, and `user_id = $1 AND date = $2` on the diary.
+        //
+        // WHY POPULATED-NESS IS NOT ASSERTED HERE. `CREATE STATISTICS` only
+        // declares; ANALYZE computes, and it can only compute from rows. This
+        // suite truncates its tables, so in this database three of the four
+        // objects hold ndistinct data and `meal_entries_user_id_date_stx` holds
+        // none — a property of the fixture, not of the schema, which would make
+        // such an assertion flap rather than protect anything. The migration
+        // runs ANALYZE on all four tables itself, and the estimates it corrects
+        // were verified against a populated 1,503-plan database, where the
+        // previous underestimates of 7x, 22x and 41x became exact.
+        const keyed = await prisma.$queryRaw<{ stxname: string; tbl: string; cols: string }[]>`
+            SELECT e.stxname,
+                c.relname AS tbl,
+                (
+                    SELECT string_agg(a.attname, ',' ORDER BY a.attnum)
+                    FROM pg_attribute a
+                    WHERE a.attrelid = e.stxrelid
+                        AND a.attnum = ANY (e.stxkeys::int2[])
+                ) AS cols
+            FROM pg_statistic_ext e
+            JOIN pg_class c ON c.oid = e.stxrelid
+            WHERE e.stxnamespace = current_schema()::regnamespace
+                AND e.stxname LIKE '%_stx'
+            ORDER BY e.stxname
+        `;
+        const pairs = Object.fromEntries(keyed.map((row) => [row.stxname, `${row.tbl}(${row.cols})`]));
+
+        expect(pairs).toMatchObject({
+            grocery_items_meal_plan_id_user_id_stx: 'grocery_items(meal_plan_id,user_id)',
+            meal_entries_user_id_date_stx: 'meal_entries(user_id,date)',
+            meal_plan_days_meal_plan_id_user_id_stx: 'meal_plan_days(meal_plan_id,user_id)',
+            meal_plan_meals_meal_plan_id_user_id_stx: 'meal_plan_meals(meal_plan_id,user_id)',
+        });
     });
 });

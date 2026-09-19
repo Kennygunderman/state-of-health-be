@@ -341,6 +341,13 @@ const MIGRATION_SQL = [
     '20260908000000_meal_planning',
     '20260909000000_usda_cache_http_status',
     '20260910000000_catalog_prefix_fold_indexes',
+    // 20260911000000_catalog_alias_search_vector_and_read_stats adds the
+    // generated `catalog_food_aliases.search_vector` column and its GIN index.
+    // The alias full-text branch of the match set READS that column, so leaving
+    // this entry out makes every `searchPublishedFoods` call in this file fail
+    // with `column a.search_vector does not exist` rather than assert anything
+    // about ordering.
+    '20260911000000_catalog_alias_search_vector_and_read_stats',
 ].map((migration) => path.join(BACKEND_ROOT, 'prisma', 'migrations', migration, 'migration.sql'));
 
 /**

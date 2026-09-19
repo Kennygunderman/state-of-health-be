@@ -938,6 +938,15 @@ export const runSeed = async (options: SeedDevOptions): Promise<SeedSummary> => 
     // runs unserialised: `withUserLock` issues the advisory lock as the first
     // statement of this transaction and only then calls back.
     return client.$transaction((tx) =>
+        // `requireProvisionedUser: false` because this transaction's PURPOSE is
+        // to create the `users` row: it deletes, reads and then upserts `users`
+        // inside the locked body, so for the seed an absent row is the starting
+        // state rather than a refusal. Every request path takes the default,
+        // which refuses an identity with no account with `UserNotProvisionedError`
+        // (`404 user_not_found`) instead of reaching a foreign key and answering
+        // `500` — see `UserLockOptions` in `mealPlanningAction.service.ts`. The
+        // seed is the one legitimate opt-out; nothing on a request path may
+        // repeat it.
         withUserLock(tx, identity.userId, async (locked) => {
             // `deleteMany` rather than `delete` so an absent user is a count of 0
             // instead of a P2025 to catch, and the predicate is the owner key
@@ -1065,7 +1074,7 @@ export const runSeed = async (options: SeedDevOptions): Promise<SeedSummary> => 
                     mealsCreated.length > 0 ||
                     weighInOutcome === 'created',
             };
-        }),
+        }, { requireProvisionedUser: false }),
     );
 };
 

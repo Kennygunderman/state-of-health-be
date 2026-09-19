@@ -592,10 +592,11 @@ describe('aggregatePlannedGrams', () => {
             expect(rows.find((line) => line.catalog_food_id === ingredient.catalog_food_id)).toMatchObject({
                 food_state: AS_PURCHASED,
                 category: 'dairy_alternatives',
-                // The state is not `raw` and the name does not state it, so the
-                // row says it: §0.7.3's suffix rule, applied to the fixture's
-                // own `as_purchased` yogurt.
-                name: 'Greek yogurt, plain, as purchased',
+                // `as_purchased` describes the form the CATALOG measured the
+                // yogurt in, which is how every shop sells it, so the shopping
+                // line is the food's own name: §0.7.3's suffix rule renders the
+                // state's shopper label, and this state's is empty.
+                name: 'Greek yogurt, plain',
                 quantity_grams: optionalRecipeGramsOf(ingredient),
                 display_unit: 'oz',
                 display_text: '3 oz',
@@ -1715,13 +1716,59 @@ describe('buildGroceryName', () => {
         expect(buildGroceryName('Rice', COOKED, both)).toBe('Rice, cooked');
     });
 
-    it('reads a multi-word state as words', () => {
+    it('distinguishes a multi-word state by its shopper label, never by its stored code', () => {
         const bothForms = indexFoodStatesByName([
             { name: 'Flour', food_state: 'as_purchased' },
             { name: 'Flour', food_state: DRY },
         ]);
 
-        expect(buildGroceryName('Flour', 'as_purchased', bothForms)).toBe('Flour, as purchased');
+        // The state has to be said here — two rows of one name — and what is
+        // said is the label a shopper reads, not the enum token.
+        expect(buildGroceryName('Flour', 'as_purchased', bothForms)).toBe('Flour, as sold');
+        expect(buildGroceryName('Flour', 'as_purchased', bothForms)).not.toContain('as purchased');
+    });
+
+    it('says nothing on its own for the states that describe how the catalog measured the food', () => {
+        // `as_purchased` and `prepared` state the form the CATALOG tabulated
+        // the food in, which is the default assumption of every line on a
+        // shopping list: a shopper buys olive oil and peanut butter.
+        expect(
+            buildGroceryName('Olive oil', AS_PURCHASED, indexFoodStatesByName([{ name: 'Olive oil', food_state: AS_PURCHASED }])),
+        ).toBe('Olive oil');
+        expect(
+            buildGroceryName('Peanut butter', PREPARED, indexFoodStatesByName([{ name: 'Peanut butter', food_state: PREPARED }])),
+        ).toBe('Peanut butter');
+    });
+
+    it('keeps the two states that are real shopping distinctions', () => {
+        // Dry lentils and cooked lentils are different purchases, and §0.7.3's
+        // own worked examples are exactly these two words.
+        expect(buildGroceryName('Lentils', DRY, indexFoodStatesByName([{ name: 'Lentils', food_state: DRY }]))).toBe(
+            'Lentils, dry',
+        );
+        expect(buildGroceryName('Lentils', COOKED, indexFoodStatesByName([{ name: 'Lentils', food_state: COOKED }]))).toBe(
+            'Lentils, cooked',
+        );
+    });
+
+    it('degrades an unknown future state to its own humanised words rather than to silence', () => {
+        // A sixth enum value nobody has written copy for still names the
+        // distinction the shopper is buying, plainly.
+        expect(buildGroceryName('Beef', 'air_dried', indexFoodStatesByName([{ name: 'Beef', food_state: 'air_dried' }]))).toBe(
+            'Beef, air dried',
+        );
+        expect(
+            buildGroceryName('Beef', 'air_dried', indexFoodStatesByName([
+                { name: 'Beef', food_state: 'air_dried' },
+                { name: 'Beef', food_state: RAW },
+            ])),
+        ).toBe('Beef, air dried');
+    });
+
+    it('appends nothing at all for a state token with no words in it', () => {
+        // Data this malformed can state nothing truthful, and a dangling
+        // "Herbs, " would be worse than the bare name.
+        expect(buildGroceryName('Herbs', '', new Map())).toBe('Herbs');
     });
 
     it('leaves a raw food unqualified when the list index does not mention it', () => {
@@ -1734,28 +1781,33 @@ describe('buildGroceryName', () => {
      * 43 committed recipes reference, grouped by their stored `food_state`.
      *
      * Real release data rather than an invented matrix, because the rule is
-     * about what a shopper reads on a real list: §0.7.3 and §6.2 of
-     * `docs/meal-planning/planning-policy.md` require the state as a suffix
-     * whenever it is not `raw`, so the twelve `as_purchased` foods are
-     * qualified too — a shopper buying `as_purchased` honey and `cooked`
-     * chickpeas is buying two different kinds of thing. The only names that
-     * stay bare are the ones whose own qualifier already contains the state's
-     * words literally.
+     * about WHAT A SHOPPER READS on a real list. §0.7.3 and §6.2 of
+     * `docs/meal-planning/planning-policy.md` require the state to be shown
+     * whenever it is not `raw`, and what is shown is the state's shopper label:
+     * `dry` and `cooked` are real shopping distinctions and keep their words,
+     * while `as_purchased` and `prepared` describe the form the CATALOG
+     * measured the food in — the default assumption of every line — so they say
+     * nothing on their own. Printing the codes instead put "Olive oil, as
+     * purchased" and "Peanut butter, prepared" on 30 of these 36 lines.
+     *
+     * Where the state does earn a word, the only names that stay bare are the
+     * ones whose own qualifier already contains it literally.
      */
     const RELEASE_NON_RAW_CASES: Array<[string, string, string]> = [
-        // as_purchased — nothing in these names says "as purchased".
-        ['Almond milk, unsweetened', AS_PURCHASED, 'Almond milk, unsweetened, as purchased'],
-        ['Almonds', AS_PURCHASED, 'Almonds, as purchased'],
-        ['Balsamic vinegar', AS_PURCHASED, 'Balsamic vinegar, as purchased'],
-        ['Canola oil', AS_PURCHASED, 'Canola oil, as purchased'],
-        ['Cheddar cheese', AS_PURCHASED, 'Cheddar cheese, as purchased'],
-        ['Feta cheese', AS_PURCHASED, 'Feta cheese, as purchased'],
-        ['Greek yogurt, plain', AS_PURCHASED, 'Greek yogurt, plain, as purchased'],
-        ['Honey', AS_PURCHASED, 'Honey, as purchased'],
-        ['Maple syrup', AS_PURCHASED, 'Maple syrup, as purchased'],
-        ['Milk, 2%', AS_PURCHASED, 'Milk, 2%, as purchased'],
-        ['Oat milk', AS_PURCHASED, 'Oat milk, as purchased'],
-        ['Olive oil', AS_PURCHASED, 'Olive oil, as purchased'],
+        // as_purchased — the shop sells all twelve exactly as the catalog
+        // measured them, so the row says the food and nothing else.
+        ['Almond milk, unsweetened', AS_PURCHASED, 'Almond milk, unsweetened'],
+        ['Almonds', AS_PURCHASED, 'Almonds'],
+        ['Balsamic vinegar', AS_PURCHASED, 'Balsamic vinegar'],
+        ['Canola oil', AS_PURCHASED, 'Canola oil'],
+        ['Cheddar cheese', AS_PURCHASED, 'Cheddar cheese'],
+        ['Feta cheese', AS_PURCHASED, 'Feta cheese'],
+        ['Greek yogurt, plain', AS_PURCHASED, 'Greek yogurt, plain'],
+        ['Honey', AS_PURCHASED, 'Honey'],
+        ['Maple syrup', AS_PURCHASED, 'Maple syrup'],
+        ['Milk, 2%', AS_PURCHASED, 'Milk, 2%'],
+        ['Oat milk', AS_PURCHASED, 'Oat milk'],
+        ['Olive oil', AS_PURCHASED, 'Olive oil'],
         // cooked — "canned" is not a way of saying "cooked", so the catalog's
         // qualifier is kept AND the state is stated.
         ['Black beans, canned', COOKED, 'Black beans, canned, cooked'],
@@ -1774,30 +1826,58 @@ describe('buildGroceryName', () => {
         ['Rolled oats, dry', DRY, 'Rolled oats, dry'],
         ['Salt', DRY, 'Salt, dry'],
         ['Sunflower seeds', DRY, 'Sunflower seeds, dry'],
-        // prepared — no name in the release says "prepared", including the two
-        // that carry a preparation word of their own.
-        ['Hummus', PREPARED, 'Hummus, prepared'],
-        ['Mayonnaise', PREPARED, 'Mayonnaise, prepared'],
-        ['Olives, black', PREPARED, 'Olives, black, prepared'],
-        ['Peanut butter', PREPARED, 'Peanut butter, prepared'],
-        ['Salsa', PREPARED, 'Salsa, prepared'],
-        ['Soy sauce', PREPARED, 'Soy sauce, prepared'],
-        ['Tuna, canned in water', PREPARED, 'Tuna, canned in water, prepared'],
-        ['Turkey breast, sliced', PREPARED, 'Turkey breast, sliced, prepared'],
-        ['Yellow mustard', PREPARED, 'Yellow mustard, prepared'],
+        // prepared — a jar of mayonnaise is bought ready to use, which is the
+        // only way a shop sells it, so the row says the food and nothing else.
+        ['Hummus', PREPARED, 'Hummus'],
+        ['Mayonnaise', PREPARED, 'Mayonnaise'],
+        ['Olives, black', PREPARED, 'Olives, black'],
+        ['Peanut butter', PREPARED, 'Peanut butter'],
+        ['Salsa', PREPARED, 'Salsa'],
+        ['Soy sauce', PREPARED, 'Soy sauce'],
+        ['Tuna, canned in water', PREPARED, 'Tuna, canned in water'],
+        ['Turkey breast, sliced', PREPARED, 'Turkey breast, sliced'],
+        ['Yellow mustard', PREPARED, 'Yellow mustard'],
     ];
 
     it.each(RELEASE_NON_RAW_CASES)('names %s in the %s state "%s"', (name, state, expected) => {
         expect(buildGroceryName(name, state, indexFoodStatesByName([{ name, food_state: state }]))).toBe(expected);
     });
 
-    it('states every non-raw food\u2019s stored state exactly once', () => {
-        for (const [name, state, expected] of RELEASE_NON_RAW_CASES) {
-            const words = state.replace(/_/g, ' ');
-            const occurrences = expected.split(words).length - 1;
+    /**
+     * The regression this table exists to hold shut, as one claim over all 36
+     * lines: the ONLY thing a shopping name ever gains on its own is one of the
+     * two shopping words, and an internal state code is never printed at all.
+     */
+    it('never appends an internal state token to a shopper name', () => {
+        /** Everything the ordinary path may ever add to a release name. */
+        const ORDINARY_SUFFIXES: readonly string[] = ['', ', dry', ', cooked'];
+        const SILENT_STATES: readonly string[] = [AS_PURCHASED, PREPARED];
 
-            expect(occurrences).toBe(1);
+        for (const [name, state, expected] of RELEASE_NON_RAW_CASES) {
             expect(expected.startsWith(name)).toBe(true);
+            expect(ORDINARY_SUFFIXES).toContain(expected.slice(name.length));
+
+            if (SILENT_STATES.includes(state)) {
+                // Nothing is added, so nothing of the code can reach the
+                // shopper: these are the 21 lines that read "…, as purchased"
+                // and "…, prepared".
+                expect(expected).toBe(name);
+                expect(expected).not.toContain(state.replace(/_/g, ' '));
+            }
+        }
+    });
+
+    it('states the word it does append exactly once', () => {
+        for (const [name, , expected] of RELEASE_NON_RAW_CASES) {
+            const appended = expected.slice(name.length);
+
+            if (appended === '') {
+                continue;
+            }
+
+            const word = appended.replace(', ', '');
+
+            expect(expected.split(word).length - 1).toBe(1);
         }
     });
 
@@ -1833,14 +1913,42 @@ describe('buildGroceryName', () => {
         ['Black beans, canned', COOKED, 'Black beans, canned, cooked'],
         ['Chickpeas, canned', COOKED, 'Chickpeas, canned, cooked'],
         ['Beef, roasted', DRY, 'Beef, roasted, dry'],
-        ['Tuna, canned in water', PREPARED, 'Tuna, canned in water, prepared'],
-        ['Turkey breast, sliced', PREPARED, 'Turkey breast, sliced, prepared'],
         ['Oats, uncooked', DRY, 'Oats, uncooked, dry'],
     ];
 
     it.each(PREPARATION_WORD_CASES)('states the stored state of %s rather than accepting its preparation word', (name, state, expected) => {
         expect(buildGroceryName(name, state, indexFoodStatesByName([{ name, food_state: state }]))).toBe(expected);
     });
+
+    /*
+     * The same claim for the two states that say nothing on their own: they are
+     * silent because the state is not worth saying, NOT because a preparation
+     * word in the catalog's name was read as saying it. Where such a row has to
+     * be distinguished, the label is appended over the preparation word exactly
+     * as `cooked` is over "canned".
+     */
+    const SILENT_STATE_PREPARATION_CASES: Array<[string, string, string, string]> = [
+        ['Tuna, canned in water', PREPARED, RAW, 'Tuna, canned in water, ready to use'],
+        ['Turkey breast, sliced', PREPARED, RAW, 'Turkey breast, sliced, ready to use'],
+        ['Yogurt, strained', AS_PURCHASED, COOKED, 'Yogurt, strained, as sold'],
+    ];
+
+    it.each(SILENT_STATE_PREPARATION_CASES)(
+        'distinguishes %s in the %s state without reading its preparation word as the state',
+        (name, state, other, expected) => {
+            expect(buildGroceryName(name, state, indexFoodStatesByName([{ name, food_state: state }]))).toBe(name);
+            expect(
+                buildGroceryName(
+                    name,
+                    state,
+                    indexFoodStatesByName([
+                        { name, food_state: state },
+                        { name, food_state: other },
+                    ]),
+                ),
+            ).toBe(expected);
+        },
+    );
 
     it('matches the state as whole words, not as a fragment of one', () => {
         // "predry" contains the letters of "dry" and says nothing about the
@@ -1869,8 +1977,8 @@ describe('buildGroceryName', () => {
     const RESIDUAL_SUFFIX_CASES: Array<[string, string, string]> = [
         ['Salt', DRY, 'Salt, dry'],
         ['All-purpose flour', DRY, 'All-purpose flour, dry'],
-        ['Salsa', 'prepared', 'Salsa, prepared'],
-        ['Hummus', 'prepared', 'Hummus, prepared'],
+        ['Rice', COOKED, 'Rice, cooked'],
+        ['Chickpeas', COOKED, 'Chickpeas, cooked'],
     ];
 
     it.each(RESIDUAL_SUFFIX_CASES)('still qualifies %s, whose name states no preparation', (name, state, expected) => {
@@ -1878,27 +1986,70 @@ describe('buildGroceryName', () => {
     });
 
     /**
-     * COEXISTENCE, PAIR BY PAIR: `[what the pair is, the shared base name, the
-     * first row's state and rendered name, the second row's]`.
+     * COEXISTENCE, PAIR BY PAIR. Two rows of one base name must never render
+     * the same string, or the shopper reads one line and buys half of what the
+     * week needs — so a row that would otherwise stay silent (`raw`,
+     * `as_purchased`, `prepared`, or a name whose qualifier is merely a
+     * preparation word) is qualified here, with that state's DISTINGUISHING
+     * label. What coexistence does NOT do is state a row's state twice: the
+     * last pair's name already says `cooked`, so its cooked line keeps its name
+     * and only its raw line is suffixed, and the two are still distinct.
      *
-     * Two rows of one base name must never render the same string, or the
-     * shopper reads one line and buys half of what the week needs — so a row
-     * that would otherwise stay silent (`raw`, or a name whose qualifier is
-     * merely a preparation word) is qualified here. What coexistence does NOT
-     * do is state a row's state twice: the last pair's name already says
-     * `cooked`, so its cooked line keeps its name and only its raw line is
-     * suffixed, and the two are still distinct.
+     * `label` is the word each side is expected to carry, held beside the
+     * rendered name so the "exactly once" claim below counts the words actually
+     * appended rather than the enum token — which for two of the five states is
+     * not the text a shopper sees at all.
      */
-    const COEXISTING_PAIRS: Array<[string, string, [string, string], [string, string]]> = [
-        ['a name that says nothing about either state', 'Rice', [RAW, 'Rice, raw'], [COOKED, 'Rice, cooked']],
-        [
-            'a name whose qualifier is a preparation word rather than a state',
-            'Black beans, canned',
-            [COOKED, 'Black beans, canned, cooked'],
-            [DRY, 'Black beans, canned, dry'],
-        ],
-        ['a shopping-form state beside raw', 'Olive oil', [AS_PURCHASED, 'Olive oil, as purchased'], [RAW, 'Olive oil, raw']],
-        ['a name that already states one of the two states', 'Peas, cooked', [COOKED, 'Peas, cooked'], [RAW, 'Peas, cooked, raw']],
+    interface CoexistenceSide {
+        readonly state: string;
+        readonly label: string;
+        readonly expected: string;
+    }
+
+    interface CoexistencePair {
+        readonly what: string;
+        readonly name: string;
+        readonly first: CoexistenceSide;
+        readonly second: CoexistenceSide;
+    }
+
+    const COEXISTING_PAIRS: readonly CoexistencePair[] = [
+        {
+            what: 'a name that says nothing about either state',
+            name: 'Rice',
+            first: { state: RAW, label: 'raw', expected: 'Rice, raw' },
+            second: { state: COOKED, label: 'cooked', expected: 'Rice, cooked' },
+        },
+        {
+            what: 'a name whose qualifier is a preparation word rather than a state',
+            name: 'Black beans, canned',
+            first: { state: COOKED, label: 'cooked', expected: 'Black beans, canned, cooked' },
+            second: { state: DRY, label: 'dry', expected: 'Black beans, canned, dry' },
+        },
+        {
+            what: 'a shopping-form state beside raw',
+            name: 'Olive oil',
+            first: { state: AS_PURCHASED, label: 'as sold', expected: 'Olive oil, as sold' },
+            second: { state: RAW, label: 'raw', expected: 'Olive oil, raw' },
+        },
+        {
+            what: 'the two states a shopper could otherwise confuse',
+            name: 'Chickpeas',
+            first: { state: AS_PURCHASED, label: 'as sold', expected: 'Chickpeas, as sold' },
+            second: { state: COOKED, label: 'cooked', expected: 'Chickpeas, cooked' },
+        },
+        {
+            what: 'a ready-to-use form beside a dry one',
+            name: 'Hummus',
+            first: { state: PREPARED, label: 'ready to use', expected: 'Hummus, ready to use' },
+            second: { state: DRY, label: 'dry', expected: 'Hummus, dry' },
+        },
+        {
+            what: 'a name that already states one of the two states',
+            name: 'Peas, cooked',
+            first: { state: COOKED, label: 'cooked', expected: 'Peas, cooked' },
+            second: { state: RAW, label: 'raw', expected: 'Peas, cooked, raw' },
+        },
     ];
 
     const coexistingIndex = (name: string, first: string, second: string): FoodStatesByName =>
@@ -1907,22 +2058,34 @@ describe('buildGroceryName', () => {
             { name, food_state: second },
         ]);
 
-    /** How many times `name` states `foodState`'s own words. */
-    const timesStated = (name: string, foodState: string): number => name.split(foodState.replace(/_/g, ' ')).length - 1;
+    /** How many times `name` states `label`'s own words. */
+    const timesStated = (name: string, label: string): number => name.split(label).length - 1;
 
-    it.each(COEXISTING_PAIRS)('renders %s as two distinct lines', (_case, name, [stateA, expectedA], [stateB, expectedB]) => {
-        const coexisting = coexistingIndex(name, stateA, stateB);
+    it.each(COEXISTING_PAIRS)('renders $what as two distinct lines', ({ name, first, second }) => {
+        const coexisting = coexistingIndex(name, first.state, second.state);
 
-        expect(buildGroceryName(name, stateA, coexisting)).toBe(expectedA);
-        expect(buildGroceryName(name, stateB, coexisting)).toBe(expectedB);
-        expect(expectedA).not.toBe(expectedB);
+        expect(buildGroceryName(name, first.state, coexisting)).toBe(first.expected);
+        expect(buildGroceryName(name, second.state, coexisting)).toBe(second.expected);
+        expect(first.expected).not.toBe(second.expected);
     });
 
-    it.each(COEXISTING_PAIRS)('states each coexisting state of %s exactly once', (_case, name, [stateA, expectedA], [stateB, expectedB]) => {
-        expect(timesStated(expectedA, stateA)).toBe(1);
-        expect(timesStated(expectedB, stateB)).toBe(1);
-        expect(expectedA.startsWith(name)).toBe(true);
-        expect(expectedB.startsWith(name)).toBe(true);
+    it.each(COEXISTING_PAIRS)('states each coexisting label of $what exactly once', ({ name, first, second }) => {
+        expect(timesStated(first.expected, first.label)).toBe(1);
+        expect(timesStated(second.expected, second.label)).toBe(1);
+        expect(first.expected.startsWith(name)).toBe(true);
+        expect(second.expected.startsWith(name)).toBe(true);
+    });
+
+    it.each(COEXISTING_PAIRS)('never prints a stored state code on either line of $what', ({ first, second }) => {
+        for (const side of [first, second]) {
+            expect(side.expected).not.toContain('_');
+
+            if (side.label !== side.state) {
+                // The two states whose label is not their code: the code must
+                // not reach the shopper under any rule.
+                expect(side.expected).not.toContain(side.state.replace(/_/g, ' '));
+            }
+        }
     });
 
     it('suffixes both rows when the shared name states both coexisting states', () => {
@@ -2096,12 +2259,12 @@ describe('buildGroceryRows', () => {
             [eggFacts(), oilFacts()],
         );
 
-        // The eggs are `raw`, which is the unmarked state and earns no suffix;
-        // the oil is `as_purchased`, which does, and its own name does not state
-        // it.
+        // Neither line carries a state: `raw` is the unmarked case, and
+        // `as_purchased` describes how the catalog measured the oil rather than
+        // anything the shopper is choosing between.
         expect(rows.map((line) => [line.name, line.display_text, line.display_unit])).toEqual([
             ['Eggs', '12 eggs', COUNT_DISPLAY_UNIT],
-            ['Olive oil, as purchased', '1 cup', 'cup'],
+            ['Olive oil', '1 cup', 'cup'],
         ]);
     });
 
@@ -2122,6 +2285,286 @@ describe('buildGroceryRows', () => {
 
     it('returns an empty list for a plan with no ingredients', () => {
         expect(buildGroceryRows([], [])).toEqual([]);
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * A total that lands on a display-rounding midpoint
+ *
+ * The column keeps two decimals and the aggregate keeps all of them, so a total
+ * can sit on the far side of a rounding step from the number that is actually
+ * stored. Both cases below are the shipped data's own: a `13.1625 g` spice total
+ * whose truncation drops it below a ¼-tbsp step, and a `208.125 g` grain total
+ * whose truncation lifts it over a ¼-cup one. Each density is the one that puts
+ * the food's real total on the step, so the drift is a property of the numbers
+ * rather than of an invented fixture.
+ *
+ * What the rows prove is one invariant — A ROW'S TEXT IS THE RENDERING OF THE
+ * GRAMS THAT ROW STORES — and then the two flag failures that invariant is the
+ * only defence against, because `applyToggle` records the acknowledged baseline
+ * as GRAMS and every "was Y" and every visibility test re-renders it.
+ * ------------------------------------------------------------------------- */
+
+describe('a total that lands on a display-rounding midpoint', () => {
+    /**
+     * One drifting total: the density and portion that make the food a volume
+     * row, the per-recipe grams behind the total, and the three numbers the two
+     * roundings disagree about.
+     */
+    interface MidpointCase {
+        readonly what: string;
+        readonly densityGPerMl: number;
+        readonly portionUnit: string;
+        /** Grams of the food in the whole recipe; the yield below halves it. */
+        readonly gramsPerRecipe: number;
+        readonly exactGrams: number;
+        readonly storedGrams: number;
+        /** What the STORED grams render as — the text the row must carry. */
+        readonly storedText: string;
+        /** What the untruncated aggregate rendered as, before this was fixed. */
+        readonly untruncatedText: string;
+        /** A later week's total, chosen to move the row's rendered text. */
+        readonly increasedGramsPerRecipe: number;
+        readonly increasedText: string;
+        readonly deltaText: string;
+    }
+
+    /** Two servings per recipe, so the stored total is not the recipe's own weight. */
+    const YIELD_SERVINGS = 2;
+
+    const MIDPOINT_CASES: readonly MidpointCase[] = [
+        {
+            // "Chili powder, dry": six planned contributions summing to
+            // 13.1625 g. The untruncated total renders a quarter-tablespoon
+            // HIGHER than the stored one, which is what used to overstate both
+            // the pill's "was Y" and its delta.
+            what: 'a truncation that drops the total below a ¼-tbsp step',
+            densityGPerMl: 0.5477,
+            portionUnit: 'tbsp',
+            gramsPerRecipe: 26.325,
+            exactGrams: 13.1625,
+            storedGrams: 13.16,
+            storedText: '1½ tbsp',
+            untruncatedText: '1¾ tbsp',
+            increasedGramsPerRecipe: 32.4,
+            increasedText: '2 tbsp',
+            deltaText: '+½ tbsp',
+        },
+        {
+            // "Quinoa, cooked": 208.125 g, where the drift runs the other way.
+            // The untruncated total renders a quarter-cup LOWER, which is what
+            // used to suppress the flag entirely — the row visibly grew from
+            // "1 cup" to "1¼ cups" while the baseline re-rendered to "1¼ cups"
+            // and the two read equal.
+            what: 'a truncation that lifts the total over a ¼-cup step',
+            densityGPerMl: 0.78195,
+            portionUnit: 'cup',
+            gramsPerRecipe: 416.25,
+            exactGrams: 208.125,
+            storedGrams: 208.13,
+            storedText: '1¼ cups',
+            untruncatedText: '1 cup',
+            increasedGramsPerRecipe: 510,
+            increasedText: '1½ cups',
+            deltaText: '+¼ cup',
+        },
+    ];
+
+    /** The drifting food as a volume row: its own density, its own portion unit. */
+    const midpointFacts = (midpoint: MidpointCase): GroceryFoodFacts =>
+        oilFacts({
+            density_g_per_ml: midpoint.densityGPerMl,
+            default_portion: portion({
+                description: `1 ${midpoint.portionUnit}`,
+                unit: midpoint.portionUnit,
+                gram_weight: midpoint.densityGPerMl * MILLILITERS_PER_TABLESPOON,
+            }),
+        });
+
+    /** The one line a week of this food implies, built by the production builder. */
+    const midpointRow = (midpoint: MidpointCase, gramsPerRecipe: number): GroceryRowDraft => {
+        const food = midpointFacts(midpoint);
+        const rows = buildGroceryRows(
+            [
+                meal([{ catalog_food_id: food.catalog_food_id, food_state: food.food_state, gram_weight: gramsPerRecipe }], {
+                    yield_servings: YIELD_SERVINGS,
+                }),
+            ],
+            [food],
+        );
+
+        return rows[0];
+    };
+
+    /** That line as the database would hold it, with the check state stated. */
+    const asStoredRow = (line: GroceryRowDraft, overrides: Partial<StoredGroceryRow> = {}): StoredGroceryRow => ({
+        id: 'midpoint-row',
+        catalog_food_id: line.catalog_food_id,
+        food_state: line.food_state,
+        name: line.name,
+        category: line.category,
+        quantity_grams: line.quantity_grams,
+        display_quantity: line.display_quantity,
+        display_unit: line.display_unit,
+        display_text: line.display_text,
+        is_checked: false,
+        previous_quantity_grams: null,
+        flagged_at: null,
+        sort_order: line.sort_order,
+        ...overrides,
+    });
+
+    it.each(MIDPOINT_CASES)('is a real midpoint: $what renders two different amounts', (midpoint) => {
+        const food = midpointFacts(midpoint);
+
+        // Without this the cases below would pass on any implementation: the
+        // two roundings have to disagree for there to be anything to get wrong.
+        expect(buildGroceryDisplay(midpoint.exactGrams, 'volume', food).text).toBe(midpoint.untruncatedText);
+        expect(buildGroceryDisplay(midpoint.storedGrams, 'volume', food).text).toBe(midpoint.storedText);
+        expect(midpoint.untruncatedText).not.toBe(midpoint.storedText);
+    });
+
+    it.each(MIDPOINT_CASES)('stores $what as the rendering of its own grams', (midpoint) => {
+        const line = midpointRow(midpoint, midpoint.gramsPerRecipe);
+
+        expect(line.quantity_grams).toBe(midpoint.storedGrams);
+        expect(line.display_text).toBe(midpoint.storedText);
+        expect(line.display_text).toBe(
+            buildGroceryDisplay(line.quantity_grams, 'volume', midpointFacts(midpoint)).text,
+        );
+    });
+
+    it.each(MIDPOINT_CASES)('makes the acknowledged baseline re-render to the text the row showed, for $what', (midpoint) => {
+        const line = midpointRow(midpoint, midpoint.gramsPerRecipe);
+        const checkState = applyToggle(line, true, EARLIER);
+
+        // The mechanism behind BOTH symptoms: the baseline is recorded as
+        // grams, and every "was Y" and every visibility test renders it again.
+        expect(checkState.previous_quantity_grams).toBe(midpoint.storedGrams);
+        expect(
+            buildGroceryDisplay(checkState.previous_quantity_grams as number, 'volume', midpointFacts(midpoint)).text,
+        ).toBe(line.display_text);
+    });
+
+    it.each(MIDPOINT_CASES)('flags a visible increase on $what, with a pill that reconciles', (midpoint) => {
+        const food = midpointFacts(midpoint);
+        const line = midpointRow(midpoint, midpoint.gramsPerRecipe);
+        const checked = asStoredRow(line, {
+            is_checked: true,
+            previous_quantity_grams: applyToggle(line, true, EARLIER).previous_quantity_grams,
+        });
+        const increased = midpointRow(midpoint, midpoint.increasedGramsPerRecipe);
+        const plan = diffGroceryList([checked], [increased], [food], NOW);
+        const flaggedRow = {
+            ...checked,
+            quantity_grams: plan.updates[0].quantity_grams,
+            display_quantity: plan.updates[0].display_quantity,
+            display_unit: plan.updates[0].display_unit,
+            display_text: plan.updates[0].display_text,
+            previous_quantity_grams: plan.updates[0].previous_quantity_grams,
+            flagged_at: plan.updates[0].flagged_at,
+        };
+
+        expect(increased.display_text).toBe(midpoint.increasedText);
+        // The increase is visible on the row, so it is flagged — the half of
+        // this defect that used to leave a checked row growing silently.
+        expect(plan.updates[0].flagged_at).toBe(NOW);
+        expect(plan.summary.increased).toBe(1);
+        expect(buildGroceryFlag(flaggedRow, food)).toEqual({
+            previousDisplayText: line.display_text,
+            newDisplayText: midpoint.increasedText,
+            deltaDisplayText: midpoint.deltaText,
+            flaggedAt: NOW.toISOString(),
+        });
+        // The pill is exactly what the shopper gets by subtracting the numbers
+        // in front of them: "was" is the text the row itself was showing, not a
+        // re-rendering that disagrees with it.
+        expect(buildGroceryFlag(flaggedRow, food)?.previousDisplayText).toBe(midpoint.storedText);
+        expect(bannerFor([flaggedRow], { mealSlot: 'lunch', changedList: true })).toEqual({
+            code: 'amount_increased',
+            itemNames: [flaggedRow.name],
+        });
+    });
+
+    /**
+     * The suppression half, stated as the equivalence it actually is rather
+     * than as one scenario: on a row the shopper has just checked, an increase
+     * raises a flag EXACTLY WHEN it moves the row's own rendered text.
+     *
+     * That equivalence is what the drift used to break, and it broke it in both
+     * directions — an increase the shopper could see went unflagged because the
+     * re-rendered baseline already read the larger amount, and the sub-line
+     * could claim a previous amount the row had never shown. It holds now
+     * because the baseline re-renders to exactly the text the row carries, so
+     * "visible against what was acknowledged" and "visible on the row" are the
+     * same question. Swept at a quarter of a gram, which is under the epsilon,
+     * so the sweep also crosses the equality tolerance itself.
+     */
+    it.each(MIDPOINT_CASES)('flags exactly the increases the shopper can see on $what', (midpoint) => {
+        const food = midpointFacts(midpoint);
+        const line = midpointRow(midpoint, midpoint.gramsPerRecipe);
+        const checked = asStoredRow(line, {
+            is_checked: true,
+            previous_quantity_grams: applyToggle(line, true, EARLIER).previous_quantity_grams,
+        });
+
+        for (let step = 1; step <= 200; step += 1) {
+            const increased = midpointRow(midpoint, (midpoint.storedGrams + step * 0.25) * YIELD_SERVINGS);
+            const plan = diffGroceryList([checked], [increased], [food], NOW);
+            const update = plan.updates[0];
+
+            if (!update) {
+                // Sub-epsilon: the row is left entirely alone — the text the
+                // shopper is reading is kept even where the draft would have
+                // rendered the next step — so there is no flag to judge.
+                expect(plan.unchangedItemIds).toEqual([checked.id]);
+                continue;
+            }
+
+            expect(update.flagged_at === NOW).toBe(update.display_text !== checked.display_text);
+        }
+    });
+
+    /**
+     * The invariant as a sweep rather than as two cases, across all three
+     * families: whatever the aggregate, a built row's text is the rendering of
+     * the grams that row stores. The step is a hundredth of a gram, which is the
+     * column's own resolution, so every case walks the truncation through a
+     * whole stored gram in each family.
+     */
+    it('never builds a row whose text disagrees with its own grams', () => {
+        const SWEEP_STEPS = 400;
+        const sweptFoods: readonly [GroceryFoodFacts, number][] = [
+            [midpointFacts(MIDPOINT_CASES[0]), 13],
+            [midpointFacts(MIDPOINT_CASES[1]), 208],
+            [facts(), 2.5 * GRAMS_PER_POUND],
+            [eggFacts(), 600],
+        ];
+
+        for (const [food, base] of sweptFoods) {
+            const family = displayFamilyForPortion(food);
+
+            for (let step = 0; step < SWEEP_STEPS; step += 1) {
+                const line = buildGroceryRows(
+                    [
+                        meal(
+                            [
+                                {
+                                    catalog_food_id: food.catalog_food_id,
+                                    food_state: food.food_state,
+                                    gram_weight: (base + step * 0.0025) * YIELD_SERVINGS,
+                                },
+                            ],
+                            { yield_servings: YIELD_SERVINGS },
+                        ),
+                    ],
+                    [food],
+                )[0];
+
+                expect(line.display_text).toBe(buildGroceryDisplay(line.quantity_grams, family, food).text);
+                expect(line.display_quantity).toBe(buildGroceryDisplay(line.quantity_grams, family, food).quantity);
+            }
+        }
     });
 });
 
@@ -2284,13 +2727,16 @@ describe('diffGroceryList', () => {
         });
 
         /**
-         * A row flagged at 3.1 lb and re-aggregated to 2.9 lb is still above the
-         * 2.5 lb the shopper acknowledged, and the flag goes anyway: the amount
-         * they were warned about has come back down, so there is nothing left to
-         * warn about. The baseline stays put, which is what the next increase is
-         * measured from.
+         * A row flagged at 3.1 lb and re-aggregated to 2.9 lb is STILL above the
+         * 2.5 lb the shopper acknowledged, and the row still says so, so the
+         * flag stands — the fall added nothing, and it retracted nothing
+         * either. This is the case a direction-driven rule got wrong: the
+         * shopper had bought 2.5 lb and ticked the row off, the week now needs
+         * 2.9 lb, and clearing the flag left them with a struck-through line
+         * they could not cook from. §0.7.3's baseline is the LAST ACKNOWLEDGED
+         * amount and the user acknowledged nothing between the two swaps.
          */
-        it('clears a standing flag even while the amount is still above what was acknowledged', () => {
+        it('keeps a standing flag while the amount is still visibly above what was acknowledged', () => {
             const flaggedRow = acknowledgedRow({
                 quantity_grams: 3.1 * GRAMS_PER_POUND,
                 display_quantity: 3.1,
@@ -2302,6 +2748,45 @@ describe('diffGroceryList', () => {
 
             expect(plan.updates[0]).toMatchObject({
                 display_text: '2.9 lb',
+                // The instant is the one the flag was raised at: the divergence
+                // dates from then, not from the swap that lowered it.
+                flagged_at: EARLIER,
+                previous_quantity_grams: TWO_AND_A_HALF_LB,
+            });
+            // A fall is not an increase, so it is not counted as one.
+            expect(plan.summary.increased).toBe(0);
+            expect(decreased.is_checked).toBe(true);
+            expect(buildGroceryFlag(decreased, facts())).toEqual({
+                previousDisplayText: '2.5 lb',
+                newDisplayText: '2.9 lb',
+                deltaDisplayText: '+0.4 lb',
+                flaggedAt: EARLIER.toISOString(),
+            });
+            expect(bannerFor([decreased], { mealSlot: 'lunch', changedList: true })).toEqual({
+                code: 'amount_increased',
+                itemNames: ['Chicken breast'],
+            });
+        });
+
+        /**
+         * The half of the old expectation that was always right: once the
+         * amount is back to what the shopper acknowledged there is nothing
+         * outstanding, so the flag goes, the sub-line goes, and the banner
+         * falls back to the swap notice. The baseline stays put, which is what
+         * the next increase is measured from.
+         */
+        it('clears a standing flag once the amount comes back to what was acknowledged', () => {
+            const flaggedRow = acknowledgedRow({
+                quantity_grams: 3.1 * GRAMS_PER_POUND,
+                display_quantity: 3.1,
+                display_text: '3.1 lb',
+                flagged_at: EARLIER,
+            });
+            const plan = diffGroceryList([flaggedRow], [massDraft(TWO_AND_A_HALF_LB)], chickenFacts, NOW);
+            const decreased = applyUpdate(flaggedRow, plan.updates[0]);
+
+            expect(plan.updates[0]).toMatchObject({
+                display_text: '2.5 lb',
                 flagged_at: null,
                 previous_quantity_grams: TWO_AND_A_HALF_LB,
             });
@@ -2314,6 +2799,33 @@ describe('diffGroceryList', () => {
             });
         });
 
+        /**
+         * And the boundary between the two: an amount that is still above the
+         * acknowledged one in GRAMS but renders the acknowledged TEXT clears
+         * the flag, because the row no longer shows the shopper anything to
+         * act on. 0.6 g above 2.5 lb is past the half-gram epsilon and still
+         * reads "2.5 lb".
+         */
+        it('clears a standing flag once the amount lands back on the acknowledged display text', () => {
+            const flaggedRow = acknowledgedRow({
+                quantity_grams: 3.1 * GRAMS_PER_POUND,
+                display_quantity: 3.1,
+                display_text: '3.1 lb',
+                flagged_at: EARLIER,
+            });
+            const plan = diffGroceryList([flaggedRow], [massDraft(TWO_AND_A_HALF_LB + 0.6)], chickenFacts, NOW);
+            const decreased = applyUpdate(flaggedRow, plan.updates[0]);
+
+            expect(plan.updates[0]).toMatchObject({
+                quantity_grams: TWO_AND_A_HALF_LB + 0.6,
+                display_text: '2.5 lb',
+                flagged_at: null,
+                previous_quantity_grams: TWO_AND_A_HALF_LB,
+            });
+            expect(buildGroceryFlag(decreased, facts())).toBeNull();
+            expect(bannerFor([decreased], null)).toBeNull();
+        });
+
         it('flags a later increase afresh, from the amount the shopper acknowledged', () => {
             const flaggedRow = acknowledgedRow({
                 quantity_grams: 3.1 * GRAMS_PER_POUND,
@@ -2323,11 +2835,12 @@ describe('diffGroceryList', () => {
             });
             const cleared = applyUpdate(
                 flaggedRow,
-                diffGroceryList([flaggedRow], [massDraft(2.9 * GRAMS_PER_POUND)], chickenFacts, EARLIER).updates[0],
+                diffGroceryList([flaggedRow], [massDraft(TWO_AND_A_HALF_LB)], chickenFacts, EARLIER).updates[0],
             );
             const raised = diffGroceryList([cleared], [massDraft(3.1 * GRAMS_PER_POUND)], chickenFacts, NOW);
             const reflagged = applyUpdate(cleared, raised.updates[0]);
 
+            expect(cleared.flagged_at).toBeNull();
             expect(raised.updates[0]).toMatchObject({
                 display_text: '3.1 lb',
                 flagged_at: NOW,
@@ -2343,10 +2856,10 @@ describe('diffGroceryList', () => {
 
         /**
          * The state a decrease leaves behind — checked, unflagged, and reading
-         * more than was acknowledged — is where the same-display exception is
-         * easiest to lose: the new amount differs from the 2.5 lb the shopper
-         * accepted, so a rule that only compared against the baseline would
-         * raise a flag over a gram that moves nothing on the row.
+         * exactly what was acknowledged — is where the same-display exception
+         * is easiest to lose: a gram above 2.5 lb differs from the acknowledged
+         * amount in the column and moves nothing on the row, so it must raise
+         * nothing.
          */
         it('raises no flag for a later increase that does not move the row\u2019s own text', () => {
             const flaggedRow = acknowledgedRow({
@@ -2357,19 +2870,14 @@ describe('diffGroceryList', () => {
             });
             const cleared = applyUpdate(
                 flaggedRow,
-                diffGroceryList([flaggedRow], [massDraft(2.9 * GRAMS_PER_POUND)], chickenFacts, EARLIER).updates[0],
+                diffGroceryList([flaggedRow], [massDraft(TWO_AND_A_HALF_LB)], chickenFacts, EARLIER).updates[0],
             );
-            const invisible = diffGroceryList(
-                [cleared],
-                [massDraft(2.9 * GRAMS_PER_POUND + 1)],
-                chickenFacts,
-                NOW,
-            );
+            const invisible = diffGroceryList([cleared], [massDraft(TWO_AND_A_HALF_LB + 1)], chickenFacts, NOW);
             const unflagged = applyUpdate(cleared, invisible.updates[0]);
 
             expect(invisible.updates[0]).toMatchObject({
-                quantity_grams: 2.9 * GRAMS_PER_POUND + 1,
-                display_text: '2.9 lb',
+                quantity_grams: TWO_AND_A_HALF_LB + 1,
+                display_text: '2.5 lb',
                 flagged_at: null,
                 previous_quantity_grams: TWO_AND_A_HALF_LB,
             });
@@ -2387,18 +2895,65 @@ describe('diffGroceryList', () => {
             });
             const cleared = applyUpdate(
                 flaggedRow,
-                diffGroceryList([flaggedRow], [massDraft(2.9 * GRAMS_PER_POUND)], chickenFacts, EARLIER).updates[0],
+                diffGroceryList([flaggedRow], [massDraft(TWO_AND_A_HALF_LB)], chickenFacts, EARLIER).updates[0],
             );
-            const noise = diffGroceryList(
-                [cleared],
-                [massDraft(2.9 * GRAMS_PER_POUND + 0.2)],
-                chickenFacts,
-                NOW,
-            );
+            const noise = diffGroceryList([cleared], [massDraft(TWO_AND_A_HALF_LB + 0.2)], chickenFacts, NOW);
 
             expect(noise.updates).toEqual([]);
             expect(noise.unchangedItemIds).toEqual(['r1']);
             expect(cleared.flagged_at).toBeNull();
+        });
+
+        it('never flags an unchecked row, however far above its recorded amount it sits', () => {
+            // An unchecked row has acknowledged nothing, so there is nothing to
+            // warn it about — and the baseline is cleared rather than carried.
+            const unchecked = row({
+                id: 'r1',
+                is_checked: false,
+                quantity_grams: 3.1 * GRAMS_PER_POUND,
+                display_quantity: 3.1,
+                display_text: '3.1 lb',
+                previous_quantity_grams: TWO_AND_A_HALF_LB,
+            });
+            const plan = diffGroceryList([unchecked], [massDraft(2.9 * GRAMS_PER_POUND)], chickenFacts, NOW);
+
+            expect(plan.updates[0]).toMatchObject({
+                display_text: '2.9 lb',
+                flagged_at: null,
+                previous_quantity_grams: null,
+            });
+        });
+
+        /**
+         * The user's own way out, and the reason a standing flag is safe: any
+         * toggle re-acknowledges the amount on screen, so a row the shopper has
+         * looked at again starts from that amount and a later fall to it has
+         * nothing left to say.
+         */
+        it('stops flagging a row the shopper re-acknowledges by toggling it', () => {
+            const flaggedRow = acknowledgedRow({
+                quantity_grams: 3.1 * GRAMS_PER_POUND,
+                display_quantity: 3.1,
+                display_text: '3.1 lb',
+                flagged_at: EARLIER,
+            });
+            const checkState = applyToggle(flaggedRow, true, NOW);
+            const reacknowledged: StoredGroceryRow = {
+                ...flaggedRow,
+                is_checked: checkState.is_checked,
+                previous_quantity_grams: checkState.previous_quantity_grams,
+                flagged_at: checkState.flagged_at,
+            };
+            const plan = diffGroceryList([reacknowledged], [massDraft(2.9 * GRAMS_PER_POUND)], chickenFacts, NOW);
+
+            expect(checkState.previous_quantity_grams).toBe(3.1 * GRAMS_PER_POUND);
+            expect(checkState.flagged_at).toBeNull();
+            expect(plan.updates[0]).toMatchObject({
+                display_text: '2.9 lb',
+                flagged_at: null,
+                previous_quantity_grams: 3.1 * GRAMS_PER_POUND,
+            });
+            expect(buildGroceryFlag(applyUpdate(reacknowledged, plan.updates[0]), facts())).toBeNull();
         });
     });
 
@@ -3484,11 +4039,16 @@ describe('parseToggleGroceryBody', () => {
      * grocery writes no idempotency key and no expected revision, and the body
      * is where either would first appear. The mapped type below stops
      * compiling the moment the payload grows a second field, and the parse
-     * proves a client that sends one anyway does not get it threaded through —
-     * so making check marks revisioned has to be a deliberate change to this
-     * test rather than a quiet one somewhere else.
+     * REFUSES a client that sends one anyway — so making check marks
+     * revisioned has to be a deliberate change to this test rather than a quiet
+     * one somewhere else.
+     *
+     * Refusing rather than ignoring is the point: "this route needs no
+     * revision" is a statement about what it requires, and a request accepted
+     * with an `expectedPlanRevision` in it is the server telling the client a
+     * concurrency guard was applied when none exists.
      */
-    it('names the desired state alone, carrying no idempotency key and no expected revision', () => {
+    it('names the desired state alone, refusing an idempotency key and an expected revision', () => {
         const everyPayloadField: { [K in keyof ToggleGroceryItemPayload]-?: true } = { isChecked: true };
 
         expect(Object.keys(everyPayloadField)).toEqual(['isChecked']);
@@ -3498,7 +4058,58 @@ describe('parseToggleGroceryBody', () => {
                 idempotencyKey: '0f4d8a2e-6b1c-4f3a-9e7d-2c5b8a1f6d40',
                 expectedPlanRevision: 4,
             }),
-        ).toEqual({ kind: 'ok', payload: { isChecked: true } });
+        ).toEqual({
+            kind: 'error',
+            code: 'invalid_request',
+            message: 'The grocery check request is not valid',
+            details: [
+                { field: 'idempotencyKey', code: GROCERY_FIELD_CODES.UNKNOWN_FIELD },
+                { field: 'expectedPlanRevision', code: GROCERY_FIELD_CODES.UNKNOWN_FIELD },
+            ],
+        });
+    });
+
+    it('names an unknown field on its own, the way its four sibling writes do', () => {
+        expect(parseToggleGroceryBody({ isChecked: true, userId: 'someone-else' })).toMatchObject({
+            kind: 'error',
+            code: 'invalid_request',
+            details: [{ field: 'userId', code: GROCERY_FIELD_CODES.UNKNOWN_FIELD }],
+        });
+    });
+
+    it('reports every unknown key rather than only the first', () => {
+        expect(
+            parseToggleGroceryBody({ isChecked: true, quantityGrams: 400, flag: null, planId: PLAN_ID }),
+        ).toMatchObject({
+            details: [
+                { field: 'quantityGrams', code: GROCERY_FIELD_CODES.UNKNOWN_FIELD },
+                { field: 'flag', code: GROCERY_FIELD_CODES.UNKNOWN_FIELD },
+                { field: 'planId', code: GROCERY_FIELD_CODES.UNKNOWN_FIELD },
+            ],
+        });
+    });
+
+    it('accumulates the two kinds of problem, so a caller is not sent back twice', () => {
+        // The same discipline `parseGroceryItemPath` applies to its two ids: a
+        // body with a bad `isChecked` AND a stray key reports both.
+        expect(parseToggleGroceryBody({ isChecked: 'yes', expectedPlanRevision: 7 })).toMatchObject({
+            details: [
+                { field: 'isChecked', code: GROCERY_FIELD_CODES.INVALID_TYPE },
+                { field: 'expectedPlanRevision', code: GROCERY_FIELD_CODES.UNKNOWN_FIELD },
+            ],
+        });
+    });
+
+    it('still reports the missing field alone when the body carries nothing else', () => {
+        // The single-field sentences are unchanged, so a client rendering
+        // either beside the field keeps its copy.
+        expect(parseToggleGroceryBody({ expectedPlanRevision: 7 })).toMatchObject({
+            message: 'The grocery check request is not valid',
+            details: [
+                { field: 'isChecked', code: GROCERY_FIELD_CODES.REQUIRED },
+                { field: 'expectedPlanRevision', code: GROCERY_FIELD_CODES.UNKNOWN_FIELD },
+            ],
+        });
     });
 });
 

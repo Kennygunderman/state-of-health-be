@@ -1,0 +1,110 @@
+{
+  "slug": "quick-tuna-rice-bowl",
+  "name": "Tuna and rice bowl",
+  "description": "Canned tuna flaked through quickly cooked broccoli and carrot with lemon, spooned over warm white rice.",
+  "iconKey": "bowl",
+  "instructions": [
+    "Cut the broccoli into small florets and slice the carrot into thin coins.",
+    "Warm the olive oil in a skillet over medium-high heat, add the broccoli and the carrot and cook for 5 minutes, until just tender.",
+    "Drain the tuna, flake it into the pan and heat it through for 2 minutes.",
+    "Season with the salt and the black pepper, then squeeze the lemon over the pan.",
+    "Divide the warm white rice between two bowls and spoon the tuna and vegetables over it."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 bowl",
+  "prepMinutes": 5,
+  "cookMinutes": 10,
+  "mealSlots": [
+    "lunch",
+    "dinner"
+  ],
+  "dietTags": [
+    "gluten_free",
+    "pescatarian"
+  ],
+  "allergenTags": [
+    "fish"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "dairy_free",
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:171986",
+      "quantity": 8,
+      "unit": "oz",
+      "gramWeight": 226.6664,
+      "displayText": "8 oz",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169757",
+      "quantity": 1.5,
+      "unit": "cup",
+      "gramWeight": 237.0,
+      "displayText": "1½ cups",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170379",
+      "quantity": 1,
+      "unit": "cup",
+      "gramWeight": 88.0,
+      "displayText": "1 cup",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170393",
+      "quantity": 1,
+      "unit": "each",
+      "gramWeight": 61.0,
+      "displayText": "1",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 1.5,
+      "unit": "tbsp",
+      "gramWeight": 20.25,
+      "displayText": "1½ tbsp",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:167746",
+      "quantity": 0.5,
+      "unit": "each",
+      "gramWeight": 42.0,
+      "displayText": "½",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170931",
+      "quantity": 0.25,
+      "unit": "tsp",
+      "gramWeight": 0.575,
+      "displayText": "¼ tsp",
+      "sortOrder": 6,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 3.0,
+      "displayText": "½ tsp",
+      "sortOrder": 7,
+      "isOptional": false
+    }
+  ]
+}

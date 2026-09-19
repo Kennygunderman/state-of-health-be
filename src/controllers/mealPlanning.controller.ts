@@ -80,6 +80,7 @@ import {
     IdempotencyConflictError,
     MealPlanningDisabledError,
     NoMatchingMealsError,
+    OutsidePlanWeekError,
     PlanGenerationError,
     PlanNotActiveError,
     PlanNotFoundError,
@@ -113,6 +114,11 @@ import {
 import { commitSwap, getSwapAlternatives, getSwapPreview } from '../services/swap.service';
 import { parseSaveTargetsRequest } from '../services/targets.logic';
 import { getTargetEstimate, getTargets, saveTargets } from '../services/targets.service';
+// The error CLASS only, for the `instanceof` arm below. Nothing in this file
+// calls `user.service.ts` — the owner-existence guard runs inside the per-user
+// lock, where it cannot be overtaken (`mealPlanningAction.service.ts::
+// withUserLock`) — so this adds a mapping and not a service call at the edge.
+import { UserNotProvisionedError } from '../services/user.service';
 // Type-only, so this stays a compile-time reference and adds no runtime import
 // of the keyed-action service to the controller: the result shape a keyed write
 // answers with is declared once, where the write produces it.
@@ -126,6 +132,18 @@ import { SafeLogFields, describeErrorSafely, logSafeEvent } from '../utils/safeL
 const FEATURE_DISABLED = 'feature_disabled';
 const INVALID_REQUEST = 'invalid_request';
 const PLAN_NOT_FOUND = 'Plan not found';
+
+/**
+ * The answer for an authenticated identity that has no `users` row.
+ *
+ * A machine code, unlike `PLAN_NOT_FOUND` above, and deliberately so: the
+ * legacy diary family answers this state with the human sentence
+ * `"User not found"` and keeps it, while every meal-planning body carries a code
+ * the client maps (§0.5.2). The client already declares this exact string, so a
+ * `404 user_not_found` classifies as a CONFIRMED failure rather than the unknown
+ * outcome an unmapped 5xx produced (§0.2.5).
+ */
+const USER_NOT_FOUND = 'user_not_found';
 
 /**
  * The residual 500's body, for every handler in this file.
@@ -693,6 +711,21 @@ const handleMealPlanningError = (res: Response, error: unknown, context: EdgeCon
             refusalLogFields(error.details),
         );
     }
+    if (error instanceof OutsidePlanWeekError) {
+        // The second thrown 400 on this edge, and it renders exactly like the
+        // returned verdicts: `invalid_request` with the field named, so a client
+        // marks up the date control it already marks up for `invalid_date` on
+        // the same route. The detail list belongs to the class — both members are
+        // server constants — which is why nothing is assembled here.
+        return rejectRequest(
+            res,
+            context,
+            error,
+            400,
+            { error: INVALID_REQUEST, details: error.details },
+            refusalLogFields(error.details),
+        );
+    }
     if (error instanceof TargetsMissingError) {
         return rejectRequest(
             res,
@@ -741,6 +774,18 @@ const handleMealPlanningError = (res: Response, error: unknown, context: EdgeCon
     }
     if (error instanceof SwapFailedError) {
         return failRequest(res, context, error, 502, 'swap_failed', error.cause);
+    }
+    if (error instanceof UserNotProvisionedError) {
+        // An authenticated identity with no `users` row: permanent, wrote
+        // nothing, and the same 404 the shipped `PUT /api/user/targets` has
+        // always answered for it. A MACHINE CODE rather than that route's human
+        // sentence, because every meal-planning body carries a code the client
+        // maps (§0.5.2) and `user_not_found` is already declared in the client's
+        // own code map — which is what turns this from an unknown outcome, with
+        // its automatic retry and "We couldn't confirm that", into a confirmed
+        // one (§0.2.5, §0.7.2). The id the class carries is never rendered: the
+        // caller is the correlation field the event already has.
+        return rejectRequest(res, context, error, 404, { error: USER_NOT_FOUND });
     }
     if (error instanceof PlanNotFoundError) {
         return rejectRequest(res, context, error, 404, { error: PLAN_NOT_FOUND });

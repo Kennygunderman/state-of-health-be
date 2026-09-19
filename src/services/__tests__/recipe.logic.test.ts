@@ -1504,15 +1504,16 @@ describe('formatIngredientQuantity', () => {
 
     it('never promotes a mass to a larger unit the way a grocery row would', () => {
         // `formatMass` would render these as "1 lb" and "1.3 lb", which is right
-        // for something you buy and wrong for something you measure.
-        expect(formatIngredientQuantity(453.6, 'g')).toBe('453.6 g');
+        // for something you buy and wrong for something you measure. A gram is
+        // also the smallest amount worth naming, so it carries no decimal.
+        expect(formatIngredientQuantity(453.6, 'g')).toBe('454 g');
         expect(formatIngredientQuantity(20, 'oz')).toBe('20 oz');
     });
 
-    it('renders a volume with fraction glyphs', () => {
+    it('renders a volume with fraction glyphs, snapped to the nearest stop', () => {
         expect(formatIngredientQuantity(0.75, 'cup')).toBe('¾ cup');
-        expect(formatIngredientQuantity(1.25, 'cup')).toBe('1¼ cup');
-        expect(formatIngredientQuantity(0.6, 'tbsp')).toBe('½ tbsp');
+        expect(formatIngredientQuantity(1.25, 'cup')).toBe('1¼ cups');
+        expect(formatIngredientQuantity(0.6, 'tbsp')).toBe('⅔ tbsp');
     });
 
     it('renders a generic count as a bare fraction, as the design does for a quarter avocado', () => {
@@ -1520,9 +1521,24 @@ describe('formatIngredientQuantity', () => {
         expect(formatIngredientQuantity(0.25, 'whole')).toBe('¼');
     });
 
-    it('keeps a named count unit exactly as the recipe authored it', () => {
+    it('inflects a named count unit to agree with the amount in front of it', () => {
+        // The seed corpus spells this unit both ways, so the stored spelling cannot be
+        // trusted to agree with the amount it ends up beside once a portion is scaled.
         expect(formatIngredientQuantity(2, 'cloves')).toBe('2 cloves');
+        expect(formatIngredientQuantity(2, 'clove')).toBe('2 cloves');
         expect(formatIngredientQuantity(1, 'clove')).toBe('1 clove');
+        expect(formatIngredientQuantity(1, 'cloves')).toBe('1 clove');
+    });
+
+    it('leaves a part of one singular, since one is the only plural threshold', () => {
+        expect(formatIngredientQuantity(0.5, 'cloves')).toBe('½ clove');
+        expect(formatIngredientQuantity(0.5, 'cup')).toBe('½ cup');
+    });
+
+    it('never inflects a unit abbreviation', () => {
+        expect(formatIngredientQuantity(2, 'tbsp')).toBe('2 tbsp');
+        expect(formatIngredientQuantity(4, 'oz')).toBe('4 oz');
+        expect(formatIngredientQuantity(200, 'g')).toBe('200 g');
     });
 
     it('falls back to fraction glyphs for an unrecognised or absent unit', () => {

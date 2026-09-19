@@ -60,9 +60,11 @@ import path from 'path';
 import {
     CatalogReleaseError,
     RELEASE_DATA_FILES,
+    RELEASE_INTEGRITY_FALLBACK_CODE,
     RELEASE_MANIFEST_FILE_NAME,
     ReleaseIntegrityError,
     ReleasePublicationError,
+    describeFailure,
     nodeReleaseFileSystem,
     orphanStagingPid,
     pidIsRunning,
@@ -98,7 +100,9 @@ import type { SourceCacheRow } from '../../../scripts/lib/catalogEvidence';
 import { canonicalJsonString, sha256Hex } from '../../../scripts/lib/catalogFoodFacts';
 import { canonicalValidationRunKey, catalogInputIdentity } from '../../../scripts/lib/checkpoint';
 import type { CatalogInputRunRow } from '../../../scripts/lib/checkpoint';
-import type { ScriptLogger } from '../../../scripts/lib/logger';
+import { UNEXPECTED_FAILURE_REMEDY } from '../../../scripts/lib/logger';
+import type { LogFields, SafeErrorFields, ScriptLogger } from '../../../scripts/lib/logger';
+import { DatabaseOriginError, classifyDatabaseOrigin } from '../../../scripts/lib/dbGuard';
 import {
     ManifestError,
     assertCoveragePlanModelShape,
@@ -136,6 +140,19 @@ const VALIDATED_AT = new Date('2026-09-16T09:00:00.000Z');
  * these are the routes that actually mint a new canonical run.
  */
 const RESTRICTED_REMEDY_PHRASE = 'newer catalog:import or catalog:load';
+
+/**
+ * A connection string whose PASSWORD contains an `@`, and what the logger's
+ * userinfo rule leaves of it.
+ *
+ * The password is the hard case on purpose: an unescaped `@` is legal in a URL
+ * password, so a rule that stops at the first one prints its suffix. It is used
+ * where a first-party refusal's sentence is forwarded, because the sentence
+ * being this repository's own is not on its own a reason to trust what it
+ * interpolated.
+ */
+const DSN_WITH_AT_IN_PASSWORD = 'postgresql://user:pa@ss@localhost:5433/db';
+const DSN_REDACTED = 'postgresql://***@localhost:5433/db';
 
 /** A logger that records, so a rule's own diagnostics are assertable. */
 const recordingLogger = (): { readonly lines: { level: string; event: string; fields: unknown }[]; logger: ScriptLogger } => {
@@ -968,7 +985,23 @@ describe('a published row this release cannot evidence is not shipped (F01, F25)
         expect(system.files.has(path.join(FINAL_DIRECTORY, RELEASE_MANIFEST_FILE_NAME))).toBe(false);
         expect(system.directoryExists(FINAL_DIRECTORY)).toBe(false);
         expect(db.updated[0].data).toMatchObject({ status: 'failed' });
-        expect((db.updated[0].data.log as { code?: string }[])[1].code).toBe('release_integrity_failed');
+        // The code names the floor that refused, not the family it belongs to:
+        // this row's retrieval record states no observed status, which is the
+        // evidence floor and is repaired by re-running the IMPORT. It was
+        // `release_integrity_failed` here, a code eleven other floors also
+        // reported, and the assertion is updated rather than dropped because
+        // what it pins — the ledger records the refusal's code — is unchanged.
+        const entry = (db.updated[0].data.log as Record<string, unknown>[])[1];
+        expect(entry.code).toBe('release_evidence_incomplete');
+        // And the durable log carries what the code cannot: the member, the
+        // food, and the sentence naming the command that repairs it. A
+        // committed run report is assembled from this column, so a reader of it
+        // has the same question as the operator who watched the run.
+        expect(entry).toMatchObject({
+            file: 'validation-records.jsonl',
+            sourceKey: 'usda:1',
+        });
+        expect(String(entry.firstPartyMessage)).toContain('npm run catalog:import');
     });
 });
 
@@ -2694,6 +2727,415 @@ describe('a restricted validation that moved the published set is not certified 
 
         it('never reports a negative change from counters that disagree', () => {
             expect(validationDispositionChanges({ judged: 2, unchanged: 5 })).toBe(0);
+        });
+    });
+});
+
+// ---------------------------------------------------------------------------
+
+/**
+ * WHAT AN INTEGRITY REFUSAL TELLS THE OPERATOR WHO HIT IT (F04).
+ *
+ * Twelve integrity floors reported the one code `release_integrity_failed`, and
+ * `describeFailure` mapped the class to that code and nothing else — so a run
+ * that refused because no `catalog:validate` was on record and a run that
+ * refused because a published AI-generated row carried no generation batch
+ * printed the same line:
+ *
+ *   {"code":"release_integrity_failed","error":{"name":"ReleaseIntegrityError"}}
+ *
+ * The class already carried `file` and `sourceKey` "so the one thing that must
+ * change is reported without re-deriving it from the message", and both were
+ * dropped along with the sentence that named the count, the offending keys and
+ * the command that repairs them. This block is that contract from both ends:
+ * the codes the REAL floors report when a run refuses, and the fields
+ * `describeFailure` puts on the line `main()` and the run ledger write.
+ *
+ * Every refusal below is produced by running the export over rows that violate
+ * exactly one floor — not by constructing an error — because the finding was
+ * observed at the CLI and the mapping between a floor and its code is the thing
+ * that has to hold. The two constructed cases say so where they appear, and
+ * neither of them is a floor a double can reach.
+ */
+describe('an integrity refusal names WHICH floor refused and what it is about (F04)', () => {
+    /**
+     * The failure a real run produces, as `main()`'s catch and the ledger both
+     * report it: run the export, keep what it threw, and describe it.
+     */
+    const reportedFailureFrom = async (
+        rows: readonly ReleaseFoodRow[],
+        runs: readonly ReleaseRunRow[] = readyLedger(),
+        cacheRows: ReadonlyMap<string, SourceCacheRow> = defaultCacheRows(),
+    ): Promise<{ code: string; error: SafeErrorFields; detail?: LogFields }> => {
+        const files = new Map<string, string>();
+        const failure = await runRelease(exportDeps(fakeDb(rows, runs, [], cacheRows), files)).then(
+            () => null,
+            (error: unknown) => error,
+        );
+
+        expect(failure).toBeInstanceOf(ReleaseIntegrityError);
+        return describeFailure(failure);
+    };
+
+    /** A composition-bearing parent, with the target's publication status under the test's control. */
+    const composedParent = (overrides: Partial<ReleaseFoodRow> = {}): ReleaseFoodRow =>
+        publishedFood({
+            source_key: 'ai:prepared_meal:dressing:prepared',
+            nutrition_provenance: 'ingredient_derived',
+            catalog_food_components: [
+                {
+                    quantity_grams: 30,
+                    yield_factor: 1,
+                    component_nutrition_version: 1,
+                    sort_order: 0,
+                    component_catalog_foods: { source_key: 'usda:2', publication_status: 'candidate' },
+                },
+            ],
+            catalog_validation_records: validationRecord({ nutrition_provenance: 'ingredient_derived' }),
+            ...overrides,
+        });
+
+    const aiGenerated = (overrides: Partial<ReleaseFoodRow> = {}): ReleaseFoodRow =>
+        publishedFood({
+            source_key: 'ai:snack:seed cluster:prepared',
+            identity_source: 'ai_generated',
+            catalog_generation_batches: {
+                batch_key: 'v1:snack:0001',
+                model: 'google/gemini-2.5-flash',
+                prompt_version: 'catalog-generation-2026-09-08',
+            },
+            ...overrides,
+        });
+
+    describe('the code says which floor', () => {
+        it('reports a catalog nothing has judged as release_validation_stale, about the run and not a member', async () => {
+            // The ingest alone: no successful validation is on record, which is
+            // the refusal an operator meets first and the one the QA run hit.
+            const described = await reportedFailureFrom([publishedFood()], [readyLedger()[0]]);
+
+            expect(described.code).toBe('release_validation_stale');
+            expect(described.detail?.firstPartyMessage).toContain('no successful catalog:validate run is on record');
+            expect(described.detail?.firstPartyMessage).toContain('Run catalog:validate before catalog:release');
+            // This refusal is about the ledger, so it names no member and no
+            // food — and the absent members are ABSENT rather than `undefined`,
+            // which is what the ledger column and a report reader need.
+            expect(Object.keys(described.detail ?? {})).toEqual(['firstPartyMessage']);
+        });
+
+        it('reports a published row with no validation record as release_validation_unrecorded', async () => {
+            const described = await reportedFailureFrom([publishedFood({ catalog_validation_records: null })]);
+
+            expect(described.code).toBe('release_validation_unrecorded');
+            expect(described.detail).toMatchObject({
+                file: 'validation-records.jsonl',
+                sourceKey: 'usda:1',
+            });
+            expect(described.detail?.firstPartyMessage).toContain('carry no validation record');
+        });
+
+        it('reports an unusable retrieval record as release_evidence_incomplete', async () => {
+            const described = await reportedFailureFrom([
+                publishedFood({
+                    catalog_validation_records: validationRecord({
+                        identity_evidence: [usdaEvidence({ http_status: null })],
+                    }),
+                }),
+            ]);
+
+            expect(described.code).toBe('release_evidence_incomplete');
+            expect(described.detail).toMatchObject({
+                file: 'validation-records.jsonl',
+                sourceKey: 'usda:1',
+            });
+            // The remedy that separates this floor from the one above it: the
+            // retrieval has to be MADE again, not re-judged.
+            expect(described.detail?.firstPartyMessage).toContain('npm run catalog:import');
+        });
+
+        it('reports digests that stand for nothing as release_source_cache_unresolved', async () => {
+            // The evidence record is well formed and cites a cache key no row
+            // answers to, which is the floor only this stage can apply.
+            const described = await reportedFailureFrom(
+                [publishedFood()],
+                readyLedger(),
+                new Map<string, SourceCacheRow>(),
+            );
+
+            expect(described.code).toBe('release_source_cache_unresolved');
+            expect(described.detail).toMatchObject({
+                file: 'validation-records.jsonl',
+                sourceKey: 'usda:1',
+            });
+            expect(described.detail?.firstPartyMessage).toContain('usda_api_cache');
+        });
+
+        it('reports a food nothing can convert to grams as release_default_portion_unusable', async () => {
+            const described = await reportedFailureFrom([publishedFood({ catalog_food_portions: [] })]);
+
+            expect(described.code).toBe('release_default_portion_unusable');
+            expect(described.detail).toMatchObject({ file: 'portions.jsonl', sourceKey: 'usda:1' });
+        });
+
+        it('reports a composition naming a food the release omits as release_component_unresolved', async () => {
+            // Only the parent is exported, so its component names a key
+            // `foods.jsonl` does not carry.
+            const described = await reportedFailureFrom([composedParent()]);
+
+            expect(described.code).toBe('release_component_unresolved');
+            expect(described.detail).toMatchObject({
+                file: 'components.jsonl',
+                sourceKey: 'ai:prepared_meal:dressing:prepared',
+            });
+            expect(described.detail?.firstPartyMessage).toContain('component_reference_unresolved');
+        });
+
+        it('reports a derived food with no composition as release_component_set_empty', async () => {
+            const described = await reportedFailureFrom([composedParent({ catalog_food_components: [] })]);
+
+            expect(described.code).toBe('release_component_set_empty');
+            expect(described.detail).toMatchObject({
+                file: 'components.jsonl',
+                sourceKey: 'ai:prepared_meal:dressing:prepared',
+            });
+        });
+
+        it('reports a composition its parent denies as release_provenance_disagrees', async () => {
+            // The target IS carried, so the reference resolves; what disagrees
+            // is the parent's own claim about where its numbers came from.
+            const described = await reportedFailureFrom([
+                composedParent({
+                    nutrition_provenance: 'source_backed',
+                    catalog_food_components: [
+                        {
+                            quantity_grams: 30,
+                            yield_factor: 1,
+                            component_nutrition_version: 1,
+                            sort_order: 0,
+                            component_catalog_foods: { source_key: 'usda:2', publication_status: 'published' },
+                        },
+                    ],
+                    catalog_validation_records: validationRecord({ nutrition_provenance: 'source_backed' }),
+                }),
+                publishedFood({ source_key: 'usda:2' }),
+            ]);
+
+            expect(described.code).toBe('release_provenance_disagrees');
+            expect(described.detail).toMatchObject({
+                file: 'components.jsonl',
+                sourceKey: 'ai:prepared_meal:dressing:prepared',
+            });
+        });
+
+        it('reports an unattributable generated row as release_generation_batch_missing', async () => {
+            const described = await reportedFailureFrom([aiGenerated({ catalog_generation_batches: null })]);
+
+            expect(described.code).toBe('release_generation_batch_missing');
+            expect(described.detail).toMatchObject({
+                file: 'foods.jsonl',
+                sourceKey: 'ai:snack:seed cluster:prepared',
+            });
+            // The remedy no other floor has: the batch is recorded by
+            // generation, so re-running validation would change nothing.
+            expect(described.detail?.firstPartyMessage).toContain('Re-run catalog:generate');
+        });
+
+        it('reports a manifest it cannot state as release_manifest_not_measured', async () => {
+            // The defect this floor exists for, driven rather than constructed:
+            // a provenance value that is an OBJECT at runtime while its type
+            // says `string` — which is exactly how the coverage plan's
+            // `generationModel` block once reached `model_versions`.
+            const described = await reportedFailureFrom([
+                aiGenerated({
+                    catalog_generation_batches: {
+                        batch_key: 'v1:snack:0001',
+                        model: { envVar: 'CATALOG_GENERATION_MODEL' } as unknown as string,
+                        prompt_version: 'catalog-generation-2026-09-08',
+                    },
+                }),
+            ]);
+
+            expect(described.code).toBe('release_manifest_not_measured');
+            expect(described.detail).toMatchObject({ file: RELEASE_MANIFEST_FILE_NAME });
+            expect(described.detail?.firstPartyMessage).toContain('model_versions');
+            // No `sourceKey`: the manifest assertions are about the block this
+            // export measured, not about one row.
+            expect(described.detail).not.toHaveProperty('sourceKey');
+        });
+
+        it('gives no two floors the same code, which is the whole of the finding', async () => {
+            // The nine floors above plus the manifest assertion, collected from
+            // the runs themselves. A regrouping that collapsed two of them —
+            // or a throw site that lost its reason and fell back to the
+            // residual — fails here rather than in an operator's terminal.
+            const codes = await Promise.all([
+                reportedFailureFrom([publishedFood()], [readyLedger()[0]]),
+                reportedFailureFrom([publishedFood({ catalog_validation_records: null })]),
+                reportedFailureFrom([
+                    publishedFood({
+                        catalog_validation_records: validationRecord({
+                            identity_evidence: [usdaEvidence({ http_status: null })],
+                        }),
+                    }),
+                ]),
+                reportedFailureFrom([publishedFood()], readyLedger(), new Map<string, SourceCacheRow>()),
+                reportedFailureFrom([publishedFood({ catalog_food_portions: [] })]),
+                reportedFailureFrom([composedParent()]),
+                reportedFailureFrom([composedParent({ catalog_food_components: [] })]),
+                reportedFailureFrom([aiGenerated({ catalog_generation_batches: null })]),
+            ]).then((described) => described.map((failure) => failure.code));
+
+            expect(new Set(codes).size).toBe(codes.length);
+            // And none of them is the residual any more, which is what an
+            // operator was given for every one of these runs.
+            expect(codes).not.toContain(RELEASE_INTEGRITY_FALLBACK_CODE);
+        });
+    });
+
+    describe('the residual, and the sentences a refusal may carry', () => {
+        it('keeps release_integrity_failed for a refusal that names no reason', () => {
+            // Constructed on purpose: this is the code path a floor added later
+            // takes before it is given a reason, and it must still say what KIND
+            // of failure it is rather than falling through to
+            // `unexpected_error`.
+            const described = describeFailure(new ReleaseIntegrityError('a floor that names no reason'));
+
+            expect(described.code).toBe(RELEASE_INTEGRITY_FALLBACK_CODE);
+            expect(described.detail).toEqual({ firstPartyMessage: 'a floor that names no reason' });
+        });
+
+        it('reports a publication refusal’s own code with the member it concerns', () => {
+            const described = describeFailure(
+                new ReleasePublicationError('release_directory_exists', 'the destination already holds a release', {
+                    file: RELEASE_MANIFEST_FILE_NAME,
+                }),
+            );
+
+            expect(described.code).toBe('release_directory_exists');
+            expect(described.detail).toEqual({
+                file: RELEASE_MANIFEST_FILE_NAME,
+                firstPartyMessage: 'the destination already holds a release',
+            });
+        });
+
+        it('scrubs the sentence even though this repository wrote it', () => {
+            // The narrowing obligation is not the only defence: a first-party
+            // refusal can still interpolate a DSN, and this one does.
+            const described = describeFailure(
+                new ReleaseIntegrityError(`the export could not read ${DSN_WITH_AT_IN_PASSWORD}`),
+            );
+
+            expect(described.detail?.firstPartyMessage).toBe(`the export could not read ${DSN_REDACTED}`);
+            // Aimed at the forwarded VALUE and at the fragments that cannot
+            // occur in a field NAME: `ss` occurs in `firstPartyMessage` itself,
+            // so the two-character fragments are asserted about the value and
+            // the credential shapes about the whole rendered document.
+            for (const fragment of ['pa@ss', 'pa', 'ss', 'user:', 'user']) {
+                expect(String(described.detail?.firstPartyMessage)).not.toContain(fragment);
+            }
+            for (const fragment of ['pa@ss', 'user:', ':pa']) {
+                expect(JSON.stringify(described)).not.toContain(fragment);
+            }
+            expect(described.error).not.toHaveProperty('message');
+        });
+
+        it('withholds a database-origin refusal’s sentence, because it names the target', () => {
+            const described = describeFailure(
+                new DatabaseOriginError(
+                    'DATABASE_URL names database "state_of_health" on host "db.example.com"',
+                    'unrecognised_origin',
+                    classifyDatabaseOrigin('postgresql://svc:secret@db.example.com:5432/state_of_health'),
+                ),
+            );
+
+            expect(described.code).toBe('unrecognised_origin');
+            expect(described.detail).toBeUndefined();
+            // dbGuard reports this refusal itself with the target reduced to a
+            // digest; forwarding the sentence would publish the topology that
+            // line takes care to withhold.
+            expect(JSON.stringify(described)).not.toContain('db.example.com');
+            expect(JSON.stringify(described)).not.toContain('state_of_health');
+        });
+    });
+
+    /**
+     * THE DATABASE, which used to be reported as a surprise.
+     *
+     * The export reads the published graph through Prisma and takes the
+     * catalog-graph lock through checkpoint.ts's own `pg` session, so a database
+     * that will not answer fails as a driver error whose `name` is the literal
+     * `'error'` — outside every class above, and reported as
+     * `unexpected_error` with no SQLSTATE and no remedy.
+     */
+    describe('a database that will not serve the export', () => {
+        const driverFailure = (sqlState: string): Error => {
+            // The shape node-postgres really throws: `name` is `'error'` and
+            // the SQLSTATE is on `code`.
+            const error = new Error(`connection failure (${sqlState})`);
+            error.name = 'error';
+            (error as unknown as { code: string }).code = sqlState;
+
+            return error;
+        };
+
+        it('names a refused connection, with the SQLSTATE beside it', () => {
+            const described = describeFailure(driverFailure('08006'));
+
+            expect(described.code).toBe('database_unavailable');
+            expect(described.error).toEqual({ name: 'error', code: '08006' });
+            expect(described.detail?.remedy).toContain('DATABASE_URL');
+        });
+
+        it('adds what the shared remedy cannot know: a refused export publishes nothing', () => {
+            // This stage has no --resume and needs none — it stages and then
+            // moves — so the clause it appends is about what a stopped run
+            // leaves behind, which is nothing.
+            const remedy = String(describeFailure(driverFailure('53300')).detail?.remedy);
+
+            expect(remedy).toContain('staging directory');
+            expect(remedy).toContain('safe to run again');
+            expect(remedy).not.toContain('--resume');
+        });
+
+        it.each([
+            ['3D000', 'database_missing'],
+            ['28P01', 'database_authentication_failed'],
+            ['42P01', 'database_error'],
+            ['P1001', 'database_unavailable'],
+        ])('reports %s as %s', (code, expected) => {
+            const described = describeFailure(driverFailure(code));
+
+            expect(described.code).toBe(expected);
+            expect(described.error.code).toBe(code);
+        });
+
+        it('does not file a Prisma query error as infrastructure', () => {
+            // P2002 is a unique-constraint violation: a defect in this stage's
+            // own data or logic wearing a database code. Filing it under the
+            // one heading an operator reads as "not your code" would send them
+            // to the wrong place.
+            const described = describeFailure(driverFailure('P2002'));
+
+            expect(described.code).toBe('unexpected_error');
+            expect(described.detail?.remedy).toBe(UNEXPECTED_FAILURE_REMEDY);
+        });
+
+        it('forwards no driver prose on any of them', () => {
+            const described = describeFailure(driverFailure('3D000'));
+
+            expect(described.error).not.toHaveProperty('message');
+            expect(described.detail).not.toHaveProperty('firstPartyMessage');
+            expect(JSON.stringify(described)).not.toContain('connection failure');
+        });
+
+        it('gives a genuinely unclassified failure something to do', () => {
+            const described = describeFailure(new TypeError('cannot read properties of undefined'));
+
+            expect(described.code).toBe('unexpected_error');
+            expect(described.detail?.remedy).toBe(UNEXPECTED_FAILURE_REMEDY);
+            // Foreign prose, so it stays off the line: the remedy is this
+            // repository's fixed sentence and nothing is interpolated into it.
+            expect(described.detail).not.toHaveProperty('firstPartyMessage');
+            expect(JSON.stringify(described)).not.toContain('cannot read properties');
         });
     });
 });

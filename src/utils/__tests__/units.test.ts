@@ -50,6 +50,14 @@ import {
     countPortionLabel,
     countPortionItems,
     formatCount,
+    snapToFraction,
+    ingredientUnitPrecision,
+    roundIngredientAmount,
+    isGenericCountUnit,
+    isInvariantUnitAbbreviation,
+    pluralizeUnit,
+    formatIngredientAmount,
+    authoredAmountQualifier,
 } from '../units';
 
 /**
@@ -1251,6 +1259,267 @@ describe('the conversion constants', () => {
     it('keeps the metric prefixes at a thousand base units', () => {
         expect(GRAMS_PER_KILOGRAM).toBe(1000);
         expect(MILLILITERS_PER_LITER).toBe(1000);
+    });
+});
+
+/* -------------------------------------------------------------------------
+ * The recipe card's own display contract.
+ *
+ * These primitives answer a different question from the grocery rules above.
+ * A grocery row is something you buy, so it promotes to the largest unit that
+ * keeps the number above one and rounds volumes to the quarter. A recipe
+ * ingredient is something you measure: it keeps the unit the recipe wrote, it
+ * never promotes, and it reaches for the nearest of the five fractions the
+ * design draws rather than printing a decimal. The two contracts share this
+ * module and must not share behaviour, so each rule is pinned here against
+ * the grocery rule it is deliberately unlike.
+ * ------------------------------------------------------------------------- */
+
+describe('snapToFraction', () => {
+    it('snaps to the nearest of the five stops the design draws', () => {
+        expect(snapToFraction(0.2).text).toBe('¼');
+        expect(snapToFraction(0.3125).text).toBe('⅓');
+        expect(snapToFraction(0.6).text).toBe('⅔');
+        expect(snapToFraction(0.8).text).toBe('¾');
+    });
+
+    it('reports the stop it chose, not the value it was given', () => {
+        expect(snapToFraction(0.31).value).toBeCloseTo(1 / 3, 10);
+        expect(snapToFraction(0.2).value).toBe(0.25);
+    });
+
+    it('takes the larger stop at an exact midpoint between two of them', () => {
+        // Five twelfths is the true midpoint between a third and a half, and is
+        // what a third of an authored 1¼ cups comes to.
+        expect(snapToFraction(5 / 12).text).toBe('½');
+    });
+
+    it('renders a midpoint the same way however the arithmetic reached it', () => {
+        // Two call sites deriving the same amount by different routes land on
+        // either side of the midpoint in binary floating point. Both must read
+        // alike, or one screen contradicts another over one ingredient.
+        expect(snapToFraction(1.25 * (1 / 3)).text).toBe(snapToFraction(1.25 / 3).text);
+        expect(snapToFraction(1.25 / 3).text).toBe('½');
+    });
+
+    it('carries a snap to one into the whole rather than printing "1 and nothing"', () => {
+        expect(snapToFraction(1.9)).toEqual({ text: '2', value: 2 });
+        expect(snapToFraction(0.95)).toEqual({ text: '1', value: 1 });
+    });
+
+    it('renders a positive amount that would round away as the smallest stop', () => {
+        // The same reason `clampPositiveToOne` exists: an ingredient the recipe
+        // needs must never read as none of it.
+        expect(snapToFraction(0.01)).toEqual({ text: '¼', value: 0.25 });
+    });
+
+    it('renders a true zero as zero', () => {
+        expect(snapToFraction(0)).toEqual({ text: '0', value: 0 });
+    });
+
+    it('keeps the sign of a negative amount', () => {
+        expect(snapToFraction(-0.5)).toEqual({ text: '-½', value: -0.5 });
+        expect(snapToFraction(-0.01)).toEqual({ text: '-¼', value: -0.25 });
+    });
+
+    it('rejects a non-finite amount rather than rendering one', () => {
+        expect(() => snapToFraction(Number.NaN)).toThrow(UnitConversionError);
+        expect(() => snapToFraction(Number.POSITIVE_INFINITY)).toThrow(UnitConversionError);
+    });
+});
+
+describe('ingredientUnitPrecision', () => {
+    it('gives the smallest measurable units no decimal at all', () => {
+        expect(ingredientUnitPrecision('g')).toBe('integer');
+        expect(ingredientUnitPrecision('ml')).toBe('integer');
+        expect(ingredientUnitPrecision('milligrams')).toBe('integer');
+    });
+
+    it('gives the larger masses and volumes a tenth', () => {
+        expect(ingredientUnitPrecision('oz')).toBe('tenth');
+        expect(ingredientUnitPrecision('lb')).toBe('tenth');
+        expect(ingredientUnitPrecision('kg')).toBe('tenth');
+        expect(ingredientUnitPrecision('fl oz')).toBe('tenth');
+    });
+
+    it('measures everything else in fractions, including an unrecognised unit', () => {
+        expect(ingredientUnitPrecision('cup')).toBe('fraction');
+        expect(ingredientUnitPrecision('tbsp')).toBe('fraction');
+        expect(ingredientUnitPrecision('sprig')).toBe('fraction');
+        expect(ingredientUnitPrecision('')).toBe('fraction');
+    });
+
+    it('reads a unit however the recipe cased or spaced it', () => {
+        expect(ingredientUnitPrecision('  CUP ')).toBe('fraction');
+        expect(ingredientUnitPrecision(' G ')).toBe('integer');
+    });
+});
+
+describe('roundIngredientAmount', () => {
+    it('rounds to its precision, half away from zero', () => {
+        expect(roundIngredientAmount(453.6, 'integer')).toEqual({ text: '454', value: 454 });
+        expect(roundIngredientAmount(2.44, 'tenth')).toEqual({ text: '2.4', value: 2.4 });
+        expect(roundIngredientAmount(2.45, 'tenth')).toEqual({ text: '2.5', value: 2.5 });
+    });
+
+    it('drops to a tenth rather than let a needed amount round away to nothing', () => {
+        expect(roundIngredientAmount(0.04, 'integer')).toEqual({ text: '0.1', value: 0.1 });
+        expect(roundIngredientAmount(-0.04, 'integer')).toEqual({ text: '-0.1', value: -0.1 });
+    });
+
+    it('leaves a true zero at zero', () => {
+        expect(roundIngredientAmount(0, 'integer')).toEqual({ text: '0', value: 0 });
+        expect(roundIngredientAmount(0, 'tenth')).toEqual({ text: '0', value: 0 });
+    });
+
+    it('rejects a non-finite amount', () => {
+        expect(() => roundIngredientAmount(Number.NaN, 'tenth')).toThrow(UnitConversionError);
+    });
+});
+
+describe('isGenericCountUnit', () => {
+    it('recognises every placeholder the catalog stores for a thing with no unit', () => {
+        expect(['each', 'whole', 'piece', 'pieces', 'count'].every(isGenericCountUnit)).toBe(true);
+    });
+
+    it('reads a placeholder however it was cased', () => {
+        expect(isGenericCountUnit('Whole')).toBe(true);
+        expect(isGenericCountUnit('  PIECE ')).toBe(true);
+    });
+
+    it('does not mistake a real unit, or none at all, for a placeholder', () => {
+        expect(isGenericCountUnit('cup')).toBe(false);
+        expect(isGenericCountUnit('clove')).toBe(false);
+        expect(isGenericCountUnit('')).toBe(false);
+    });
+});
+
+describe('isInvariantUnitAbbreviation', () => {
+    it('holds every abbreviation that has no plural form', () => {
+        expect(['g', 'kg', 'mg', 'ml', 'l', 'oz', 'lb', 'lbs', 'tsp', 'tbsp', 'fl oz'].every(isInvariantUnitAbbreviation)).toBe(
+            true,
+        );
+    });
+
+    it('leaves a spelled-out unit to be inflected', () => {
+        expect(isInvariantUnitAbbreviation('cup')).toBe(false);
+        expect(isInvariantUnitAbbreviation('clove')).toBe(false);
+        expect(isInvariantUnitAbbreviation('ounces')).toBe(false);
+    });
+});
+
+describe('pluralizeUnit', () => {
+    it('turns the plural on above one, unlike the whole-item rule of pluralizeCount', () => {
+        expect(pluralizeUnit(2, 'clove')).toBe('cloves');
+        expect(pluralizeUnit(1.25, 'cup')).toBe('cups');
+        expect(pluralizeUnit(1, 'cup')).toBe('cup');
+    });
+
+    it('leaves a part of one singular, where pluralizeCount would keep the plural', () => {
+        expect(pluralizeUnit(0.5, 'cloves')).toBe('clove');
+        expect(pluralizeCount(0.5, 'cloves')).toBe('cloves');
+    });
+
+    it('inflects in whichever direction the stored spelling needs', () => {
+        // The seed corpus spells this unit both ways for the same ingredient.
+        expect(pluralizeUnit(1, 'cloves')).toBe('clove');
+        expect(pluralizeUnit(3, 'cup')).toBe('cups');
+    });
+
+    it('keeps the case the recipe wrote', () => {
+        expect(pluralizeUnit(3, 'Cup')).toBe('Cups');
+    });
+
+    it('never inflects an abbreviation', () => {
+        expect(pluralizeUnit(2, 'tbsp')).toBe('tbsp');
+        expect(pluralizeUnit(2, 'fl oz')).toBe('fl oz');
+        expect(pluralizeUnit(200, 'g')).toBe('g');
+    });
+
+    it('leaves alone what it cannot read as a word', () => {
+        expect(pluralizeUnit(2, '')).toBe('');
+        expect(pluralizeUnit(2, '---')).toBe('---');
+    });
+
+    it('leaves the unit untouched for an amount that is not a number', () => {
+        expect(pluralizeUnit(Number.NaN, 'clove')).toBe('clove');
+    });
+});
+
+describe('formatIngredientAmount', () => {
+    it('keeps the unit the recipe wrote instead of promoting it', () => {
+        // `formatMass` would call these "1 lb" and "1.3 lb".
+        expect(formatIngredientAmount(453.6, 'g')).toBe('454 g');
+        expect(formatIngredientAmount(20, 'oz')).toBe('20 oz');
+        expect(formatMass(453.6)).not.toBe('454 g');
+    });
+
+    it('renders a volume as a fraction glyph rather than a decimal', () => {
+        expect(formatIngredientAmount(0.75, 'cup')).toBe('¾ cup');
+        expect(formatIngredientAmount(2 / 3, 'cup')).toBe('⅔ cup');
+        expect(formatIngredientAmount(1.25, 'cup')).toBe('1¼ cups');
+    });
+
+    it('prints no unit at all for a count placeholder', () => {
+        expect(formatIngredientAmount(0.25, 'each')).toBe('¼');
+        expect(formatIngredientAmount(2, 'whole')).toBe('2');
+    });
+
+    it('prints a named count unit, inflected', () => {
+        expect(formatIngredientAmount(2, 'clove')).toBe('2 cloves');
+        expect(formatIngredientAmount(1, 'cloves')).toBe('1 clove');
+    });
+
+    it('prints nothing beside the number when there is no unit', () => {
+        expect(formatIngredientAmount(2, '')).toBe('2');
+        expect(formatIngredientAmount(1.5, '   ')).toBe('1½');
+    });
+
+    it('measures an unrecognised unit in fractions and prints it', () => {
+        expect(formatIngredientAmount(0.5, 'sprig')).toBe('½ sprig');
+    });
+
+    it('renders a zero amount as zero', () => {
+        expect(formatIngredientAmount(0, 'cup')).toBe('0 cup');
+        expect(formatIngredientAmount(0, 'each')).toBe('0');
+    });
+
+    it('rejects a non-finite amount', () => {
+        expect(() => formatIngredientAmount(Number.NaN, 'cup')).toThrow(UnitConversionError);
+    });
+});
+
+describe('authoredAmountQualifier', () => {
+    it('carries the phrasing the recipe wrote beyond its own amount', () => {
+        expect(authoredAmountQualifier('1 tomato, chopped', 1, 'each')).toBe(' tomato, chopped');
+        expect(authoredAmountQualifier('240 g, drained', 240, 'g')).toBe(', drained');
+        expect(authoredAmountQualifier('1 cup, sliced', 1, 'cup')).toBe(', sliced');
+    });
+
+    it('refuses a remainder holding a number, which would state a stale amount', () => {
+        // Scaling this row halves the grams but not the "4 medium" it names.
+        expect(authoredAmountQualifier('480 g (4 medium)', 480, 'g')).toBe('');
+    });
+
+    it('refuses a remainder that does not begin at a word boundary', () => {
+        // "1 cupcake" begins with this row's own rendering of "1 cup".
+        expect(authoredAmountQualifier('1 cupcake', 1, 'cup')).toBe('');
+    });
+
+    it('refuses text its own rendering does not open, so a disagreeing row is left alone', () => {
+        // One seeded row stores 320 g and reads "2 cups, drained".
+        expect(authoredAmountQualifier('2 cups, drained', 320, 'g')).toBe('');
+    });
+
+    it('finds nothing to carry when the text is exactly the amount', () => {
+        expect(authoredAmountQualifier('1 cup', 1, 'cup')).toBe('');
+        expect(authoredAmountQualifier('   ', 1, 'cup')).toBe('');
+    });
+
+    it('carries nothing when there is no text or no amount to match it against', () => {
+        expect(authoredAmountQualifier(null, 1, 'cup')).toBe('');
+        expect(authoredAmountQualifier(undefined, 1, 'cup')).toBe('');
+        expect(authoredAmountQualifier('1 cup', Number.NaN, 'cup')).toBe('');
     });
 });
 

@@ -1,0 +1,117 @@
+{
+  "slug": "shrimp-black-bean-rice-bowl",
+  "name": "Shrimp, black bean and rice bowl",
+  "description": "Chilli-spiced shrimp over cooked white rice and drained black beans, with bell pepper, onion, lime and cilantro.",
+  "iconKey": "bowl",
+  "instructions": [
+    "Warm the olive oil in a skillet over medium-high heat, add the onion and bell pepper and cook until they soften, about 4 minutes.",
+    "Toss the shrimp with the chili powder, add them to the pan and cook until just opaque, about 3 minutes.",
+    "Stir in the drained black beans and the cooked white rice and heat everything through.",
+    "Squeeze the lime over the pan, chop the cilantro and scatter it across, then divide between two bowls."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 bowl",
+  "prepMinutes": 10,
+  "cookMinutes": 12,
+  "mealSlots": [
+    "lunch",
+    "dinner"
+  ],
+  "dietTags": [
+    "gluten_free",
+    "pescatarian"
+  ],
+  "allergenTags": [
+    "shellfish"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 2,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "dairy_free"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:174210",
+      "quantity": 12,
+      "unit": "oz",
+      "gramWeight": 340,
+      "displayText": "12 oz",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:175238",
+      "quantity": 0.75,
+      "unit": "cup",
+      "gramWeight": 180,
+      "displayText": "¾ cup, drained",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169757",
+      "quantity": 0.75,
+      "unit": "cup",
+      "gramWeight": 118.5,
+      "displayText": "¾ cup",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170108",
+      "quantity": 1,
+      "unit": "cup",
+      "gramWeight": 149,
+      "displayText": "1 cup, chopped",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170000",
+      "quantity": 0.25,
+      "unit": "cup",
+      "gramWeight": 40,
+      "displayText": "¼ cup, chopped",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168155",
+      "quantity": 0.5,
+      "unit": "each",
+      "gramWeight": 33.5,
+      "displayText": "½",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 1,
+      "unit": "tbsp",
+      "gramWeight": 13.5,
+      "displayText": "1 tbsp",
+      "sortOrder": 6,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169997",
+      "quantity": 4,
+      "unit": "g",
+      "gramWeight": 4,
+      "displayText": "4 g",
+      "sortOrder": 7,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171319",
+      "quantity": 1,
+      "unit": "tsp",
+      "gramWeight": 2.7,
+      "displayText": "1 tsp",
+      "sortOrder": 8,
+      "isOptional": false
+    }
+  ]
+}

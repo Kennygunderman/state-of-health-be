@@ -830,13 +830,25 @@ describe('a refused planned log', () => {
             await expectNothingWritten(week.plan.id);
         });
 
-        it('refuses a date outside the plan week even when the bucket belongs to the caller', async () => {
-            // §0.5.2 lists the in-week rule beside the request validations, but
-            // it is judged against STORED plan data and not against the shape
-            // of the request — the parser cannot know the plan's week — so it
-            // is one of this route's indistinguishable 404s rather than a 400.
-            // A well-formed day key outside the week is the case; a malformed
-            // one is the parser's, above.
+        it('answers a date outside the plan week 400 invalid_request naming the date', async () => {
+            // THE TYPED VERDICT, not one of this route's 404s. §0.5.2 lists the
+            // in-week rule among the REQUEST validations — `date ∈
+            // [plan.startDate, plan.endDate]` — and a malformed date on this
+            // very route already answers `400 [{date, invalid_date}]`, so a
+            // well-formed day key outside the week answering 404 typed the two
+            // halves of one input differently: a client was told its plan was
+            // gone and sent to regenerate, when the plan was exactly where it
+            // left it and only the date was wrong.
+            //
+            // It is judged against STORED plan data, which is why the parser
+            // cannot give it and why it arrives late — but late is not the same
+            // as untyped. It is raised only AFTER the plan has been read by
+            // `{id, user_id}` and the meal by `{id, meal_plan_id, user_id}`, so
+            // it cannot confirm the existence of either: the case below, and the
+            // ownership cases above, are what keep that true.
+            //
+            // The code is `outside_plan_week`, the exact string the client
+            // declares as `API_ERROR_DETAIL_CODES.outsidePlanWeek`.
             const outsideDayKey = addDaysToDayKey(week.planEndDayKey, 1);
             const outsideBucketId = await diaryBucketId(USER_ID, outsideDayKey);
 
@@ -844,6 +856,68 @@ describe('a refused planned log', () => {
                 week.plan.id,
                 week.breakfast.id,
                 logBody({ diaryMealId: outsideBucketId, date: outsideDayKey }),
+            );
+
+            expect(response.status).toBe(400);
+            expect(response.body).toStrictEqual({
+                error: 'invalid_request',
+                details: [{ field: 'date', code: 'outside_plan_week' }],
+            });
+
+            // The refusal is raised INSIDE the `$transaction` the keyed write
+            // opens, after the ledger row has been reserved, so the rollback is
+            // the only thing that keeps the key reusable and the plan still.
+            await expectNothingWritten(week.plan.id);
+        });
+
+        it('answers a date before the plan week the same way, and the day before its start', async () => {
+            // Both ends of the window, because one bound is as easy to get wrong
+            // as the other, and a date days before the week is not a different
+            // rule from the day before it.
+            const dayBeforeStart = addDaysToDayKey(toDayKey(week.plan.start_date), -1);
+            const wellBeforeStart = addDaysToDayKey(toDayKey(week.plan.start_date), -8);
+            const bucketId = await diaryBucketId(USER_ID, dayBeforeStart);
+            const earlierBucketId = await diaryBucketId(USER_ID, wellBeforeStart);
+
+            const answers = await Promise.all([
+                logRequest(
+                    week.plan.id,
+                    week.breakfast.id,
+                    logBody({ diaryMealId: bucketId, date: dayBeforeStart }),
+                ),
+                logRequest(
+                    week.plan.id,
+                    week.breakfast.id,
+                    logBody({ diaryMealId: earlierBucketId, date: wellBeforeStart }),
+                ),
+            ]);
+
+            for (const answer of answers) {
+                expect(answer.status).toBe(400);
+                expect(answer.body).toStrictEqual({
+                    error: 'invalid_request',
+                    details: [{ field: 'date', code: 'outside_plan_week' }],
+                });
+            }
+
+            await expectNothingWritten(week.plan.id);
+        });
+
+        it('still answers a date outside the week of a plan that is not the caller\'s with the shared 404', async () => {
+            // THE ORDERING THE DATE VERDICT DEPENDS ON. A 400 about the date for
+            // a plan the caller does not own would confirm that plan exists —
+            // and would confirm its week, one probe at a time. Ownership is
+            // settled first, so a stranger's plan answers 404 whatever the date
+            // says (Rules §1.5, §8).
+            await makeUser({ id: OTHER_USER_ID });
+            const outsideDayKey = addDaysToDayKey(week.planEndDayKey, 1);
+            const outsideBucketId = await diaryBucketId(OTHER_USER_ID, outsideDayKey);
+
+            const response = await logRequest(
+                week.plan.id,
+                week.breakfast.id,
+                logBody({ diaryMealId: outsideBucketId, date: outsideDayKey }),
+                OTHER_USER_ID,
             );
 
             expect(response.status).toBe(404);

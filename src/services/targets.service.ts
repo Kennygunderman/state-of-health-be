@@ -151,6 +151,22 @@ interface TargetsJoinRow {
     confirmed_targets: unknown;
     targets_input_revision: number | null;
     revision: number | null;
+    /**
+     * The route and the seven answers the estimate is computed from.
+     * `deriveTargetsResponse` recomputes the estimate from these to decide
+     * whether a confirmed one is stale, so they are read in the SAME statement
+     * as the record they are judged against — a second read could recompute
+     * against answers that no longer belong to the snapshot the confirmed
+     * figure was compared with.
+     */
+    target_route: string | null;
+    goal: string | null;
+    pace_lb_per_week: number | null;
+    age: number | null;
+    height_cm: number | null;
+    weight_kg: number | null;
+    sex_for_estimate: string | null;
+    activity_level: string | null;
 }
 
 /** The two rows `deriveTargetsResponse` judges, read together. */
@@ -203,7 +219,15 @@ const readStoredTargets = async (
             p.targets_revision,
             p.confirmed_targets,
             p.targets_input_revision,
-            p.revision
+            p.revision,
+            p.target_route,
+            p.goal,
+            p.pace_lb_per_week,
+            p.age,
+            p.height_cm,
+            p.weight_kg,
+            p.sex_for_estimate,
+            p.activity_level
         FROM users u
         LEFT JOIN meal_plan_preferences p ON p.user_id = u.id
         WHERE u.id = ${userId}
@@ -253,6 +277,18 @@ const readPreferencesHalf = (row: TargetsJoinRow): TargetsPreferencesRow | null 
         confirmed_targets: row.confirmed_targets,
         targets_input_revision: row.targets_input_revision,
         revision: row.revision,
+        // The estimate inputs are carried through unvalidated on purpose:
+        // `resolveEstimateInputs` is the one place that decides whether a
+        // stored answer is usable, and re-deciding it here is how two callers
+        // would come to disagree about the same row.
+        target_route: row.target_route,
+        goal: row.goal,
+        pace_lb_per_week: row.pace_lb_per_week,
+        age: row.age,
+        height_cm: row.height_cm,
+        weight_kg: row.weight_kg,
+        sex_for_estimate: row.sex_for_estimate,
+        activity_level: row.activity_level,
     };
 };
 

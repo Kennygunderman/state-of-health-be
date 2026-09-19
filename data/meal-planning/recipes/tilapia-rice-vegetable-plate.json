@@ -1,0 +1,108 @@
+{
+  "slug": "tilapia-rice-vegetable-plate",
+  "name": "Tilapia with rice and vegetables",
+  "description": "Pan-seared tilapia over cooked brown rice with broccoli and carrot, brightened with lemon and a spoonful of olive oil.",
+  "iconKey": "fork_knife",
+  "instructions": [
+    "Steam the broccoli and the sliced carrot until crisp-tender, about 5 minutes, then set them aside.",
+    "Season the tilapia with the salt and the black pepper and sear it in a skillet with the olive oil over medium-high heat, about 3 minutes a side, until it flakes.",
+    "Warm the cooked brown rice through and divide it between two plates.",
+    "Set the tilapia and the vegetables on the rice and squeeze the lemon over both plates."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 plate",
+  "prepMinutes": 10,
+  "cookMinutes": 15,
+  "mealSlots": [
+    "lunch",
+    "dinner"
+  ],
+  "dietTags": [
+    "gluten_free",
+    "pescatarian"
+  ],
+  "allergenTags": [
+    "fish"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "dairy_free"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:175176",
+      "quantity": 10,
+      "unit": "oz",
+      "gramWeight": 283.3,
+      "displayText": "10 oz",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169704",
+      "quantity": 1.25,
+      "unit": "cup",
+      "gramWeight": 252.5,
+      "displayText": "1¼ cups",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170379",
+      "quantity": 1.5,
+      "unit": "cup",
+      "gramWeight": 132,
+      "displayText": "1½ cups, chopped",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170393",
+      "quantity": 1,
+      "unit": "each",
+      "gramWeight": 61,
+      "displayText": "1 medium",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:167746",
+      "quantity": 0.5,
+      "unit": "each",
+      "gramWeight": 42,
+      "displayText": "½",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 1,
+      "unit": "tbsp",
+      "gramWeight": 13.5,
+      "displayText": "1 tbsp",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 3,
+      "displayText": "½ tsp",
+      "sortOrder": 6,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170931",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 1.15,
+      "displayText": "½ tsp",
+      "sortOrder": 7,
+      "isOptional": false
+    }
+  ]
+}

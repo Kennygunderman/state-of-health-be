@@ -1,0 +1,119 @@
+{
+  "slug": "egg-white-fried-rice",
+  "name": "Egg white fried rice",
+  "description": "Cold cooked white rice tossed in a hot pan with plenty of egg white, broccoli, carrot, onion and garlic, sharpened with sriracha.",
+  "iconKey": "bowl",
+  "instructions": [
+    "Heat the canola oil in a wok or wide skillet over high heat.",
+    "Add the onion, carrot and broccoli and stir-fry until crisp-tender, about 4 minutes.",
+    "Add the garlic, then the cooked white rice, and toss until the rice is hot and the grains separate.",
+    "Push the rice to one side, pour in the egg white and stir until it just sets, then toss it back through the rice.",
+    "Season with the salt and the sriracha and serve in two bowls."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 bowl",
+  "prepMinutes": 10,
+  "cookMinutes": 10,
+  "mealSlots": [
+    "lunch",
+    "dinner"
+  ],
+  "dietTags": [
+    "gluten_free",
+    "pescatarian",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "eggs"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "dairy_free"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:172183",
+      "quantity": 15,
+      "unit": "each",
+      "gramWeight": 495,
+      "displayText": "15",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169757",
+      "quantity": 1.25,
+      "unit": "cup",
+      "gramWeight": 197.5,
+      "displayText": "1¼ cups",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170379",
+      "quantity": 1.5,
+      "unit": "cup",
+      "gramWeight": 132,
+      "displayText": "1½ cups, chopped",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170393",
+      "quantity": 1,
+      "unit": "each",
+      "gramWeight": 61,
+      "displayText": "1 medium",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170000",
+      "quantity": 0.5,
+      "unit": "cup",
+      "gramWeight": 80,
+      "displayText": "½ cup, chopped",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169230",
+      "quantity": 2,
+      "unit": "clove",
+      "gramWeight": 6,
+      "displayText": "2 cloves",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:172336",
+      "quantity": 1.5,
+      "unit": "tbsp",
+      "gramWeight": 21,
+      "displayText": "1½ tbsp",
+      "sortOrder": 6,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171186",
+      "quantity": 2,
+      "unit": "tsp",
+      "gramWeight": 13,
+      "displayText": "2 tsp",
+      "sortOrder": 7,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 3,
+      "displayText": "½ tsp",
+      "sortOrder": 8,
+      "isOptional": false
+    }
+  ]
+}

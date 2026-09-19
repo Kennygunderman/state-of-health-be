@@ -61,10 +61,17 @@
 // column and converting a stored number could misread a value typed under an
 // earlier unit), the activity multipliers and every calorie and macro figure
 // (`targets.logic.ts`), the plan start-date bounds, which need today's date in
-// the user's zone (`mealPlan.logic.ts` and the service), the food-group
-// taxonomy itself (data in `data/meal-planning/coverage-plan.v1.json`, which
-// this module receives as a PARAMETER and never reads — `tsconfig.json` sets
-// `rootDir: "./src"` and the image excludes `data/`), and any HTTP status code.
+// the user's zone (`mealPlan.logic.ts` and the service), which foods carry which
+// group (read from `catalog_foods` by the service and handed here as DATA), and
+// any HTTP status code.
+//
+// The food-group VOCABULARY is a special case worth stating plainly. It is
+// authored in `data/meal-planning/coverage-plan.v1.json`, which this module
+// cannot read — `tsconfig.json` sets `rootDir: "./src"` and the image excludes
+// `data/` — so {@link FOOD_GROUP_VALUES} carries a copy of it here, and
+// `preferences.logic.test.ts` reads the plan and asserts the two agree. That is
+// the same declare-and-pin arrangement {@link BODY_INPUT_RANGES} uses against
+// `targets.logic.ts`, and it is what lets a submitted group be judged at all.
 
 import {
     ActivityLevel,
@@ -230,6 +237,79 @@ export const NAMED_ALLERGENS: readonly string[] = [
 
 /** Every accepted allergen answer: the nine named values and 'none'. */
 export const ALLERGEN_VALUES: readonly string[] = [...NAMED_ALLERGENS, ALLERGEN_NONE];
+
+/* ---------------------------------------------------------------------------
+ * Food groups — the controlled taxonomy a dislike may exclude
+ * ------------------------------------------------------------------------- */
+
+/**
+ * Every term the food-group taxonomy contains: the vocabulary each catalog food
+ * carries one of, and the only values a dislike may exclude by group
+ * (AAP §0.7.3).
+ *
+ * DECLARED HERE RATHER THAN READ FROM WHERE IT IS AUTHORED. The taxonomy is
+ * authored in `data/meal-planning/coverage-plan.v1.json`, which no runtime
+ * module may read: the production build's `rootDir` is `./src` and the image
+ * excludes `data/` (`.dockerignore`), so a food group named in a request has to
+ * be judged against a copy that ships inside `src/`. The two are pinned to each
+ * other by `preferences.logic.test.ts`, which reads the plan and asserts this
+ * list IS its `foodGroups` — values and count both. That is the arrangement
+ * {@link BODY_INPUT_RANGES} already uses against `targets.logic.ts`'s copy of
+ * the same numbers, and it is what makes extending the taxonomy a reviewed
+ * change to two files rather than a silent divergence in which the catalog
+ * carries a group this endpoint refuses.
+ *
+ * Order is the plan's own, which groups related terms together; membership is
+ * asked through {@link isKnownFoodGroup} rather than by scanning this list, so
+ * the order is documentation rather than behaviour.
+ */
+export const FOOD_GROUP_VALUES: readonly string[] = [
+    'mushroom', 'onion', 'garlic', 'tomato',
+    'bell_pepper', 'chili_pepper', 'broccoli', 'cauliflower',
+    'cabbage', 'leafy_green', 'carrot', 'root_vegetable',
+    'potato', 'squash', 'celery', 'eggplant',
+    'olive', 'vegetable_other', 'apple', 'banana',
+    'citrus', 'berry', 'stone_fruit', 'tropical_fruit',
+    'avocado', 'dried_fruit', 'fruit_other', 'beef',
+    'pork', 'lamb', 'game_meat', 'cured_meat',
+    'organ_meat', 'chicken', 'turkey', 'duck',
+    'processed_poultry', 'salmon', 'tuna', 'white_fish',
+    'anchovy', 'crustacean', 'mollusk', 'seafood_other',
+    'chicken_egg', 'egg_product', 'tofu', 'tempeh',
+    'seitan', 'plant_based_meat', 'milk', 'cream',
+    'butter', 'yogurt', 'cheese', 'blue_cheese',
+    'soy_milk', 'nut_milk', 'coconut_milk', 'plant_dairy_other',
+    'rice', 'wheat_grain', 'oat', 'quinoa',
+    'pasta', 'grain_other', 'bread_leavened', 'flatbread',
+    'tortilla', 'cracker', 'pastry', 'lentil',
+    'chickpea', 'black_bean', 'soybean', 'bean_other',
+    'peanut', 'almond', 'cashew', 'walnut',
+    'coconut', 'sesame', 'sunflower_seed', 'nut_other',
+    'olive_oil', 'vegetable_oil', 'coconut_oil', 'animal_fat',
+    'mayonnaise', 'mustard', 'hot_sauce', 'soy_sauce',
+    'vinegar', 'salad_dressing', 'condiment_other', 'cilantro',
+    'basil', 'mint', 'dill', 'chili_spice',
+    'spice_other', 'coffee', 'tea', 'juice',
+    'beverage_other', 'potato_chip', 'popcorn', 'snack_bar',
+    'snack_other', 'chocolate', 'candy', 'sweetener',
+    'sweet_other', 'sandwich', 'wrap', 'pizza',
+    'pasta_dish', 'soup', 'salad_dish', 'prepared_dish_other',
+    'meal_replacement', 'nutritional_supplement', 'food_ingredient_other',
+];
+
+/**
+ * The longest a single food-group name may be.
+ *
+ * A SHAPE BOUND, not a second vocabulary check. The taxonomy's longest term is
+ * `nutritional_supplement` at 22 characters, so this leaves headroom both for
+ * the taxonomy to grow and for a catalog group that has drifted ahead of the
+ * plan, while capping the column at roughly 6 KB rather than the ~100 KB a
+ * hundred unbounded entries reach under the global `express.json()` limit alone.
+ * It is applied BEFORE {@link comparisonKey} normalises an entry, which is the
+ * other half of its purpose: a ninety-thousand-character string is refused for
+ * its length instead of being NFKD-normalised and regex-rewritten first.
+ */
+export const MAX_FOOD_GROUP_LENGTH = 64;
 
 /* ---------------------------------------------------------------------------
  * Unit conversion — exact factors, no rounding
@@ -1135,16 +1215,46 @@ export interface CatalogFoodGroupAssignment {
     food_group?: string | null;
 }
 
+const FOOD_GROUP_BY_KEY: ReadonlyMap<string, string> = new Map(
+    FOOD_GROUP_VALUES.map((group) => [comparisonKey(group), group]),
+);
+
+/**
+ * The taxonomy term a food-group name denotes, or `null` when it denotes none.
+ *
+ * Spelling is normalised the way allergens are: `Blue cheese`, `blue-cheese`
+ * and `blue_cheese` all resolve to the catalog's `blue_cheese`, so a client that
+ * echoes a display label back is understood rather than refused. Matching is
+ * whole-term and exact after that normalisation — `mush` and `mushroom_soup`
+ * resolve to nothing, because a prefix or substring match here would let one
+ * request exclude a group the user never chose.
+ *
+ * It answers only "is this a term of the vocabulary". Whether excluding it is
+ * ALLOWED for a given request is the service's question, since a group already
+ * stored on the row must keep round-tripping whatever the vocabulary now says
+ * (see `resolveDislikeWrites`).
+ */
+export const resolveFoodGroup = (value: string): string | null =>
+    FOOD_GROUP_BY_KEY.get(comparisonKey(value)) ?? null;
+
+/** Whether a food-group name is a term of the controlled taxonomy. */
+export const isKnownFoodGroup = (value: string): boolean => resolveFoodGroup(value) !== null;
+
 /**
  * What a dislike derivation needs, supplied as DATA.
  *
- * Both halves come from outside this module because neither may be read here:
  * `foods` are the `catalog_foods` rows the service resolved for the ids the user
- * selected, and `knownFoodGroups` is the ~120-term controlled vocabulary that
- * lives in `data/meal-planning/coverage-plan.v1.json` — a file this module
- * cannot import, since the production build's `rootDir` is `./src` and the image
- * excludes `data/`. Omitting `knownFoodGroups` skips the drift check; it never
- * changes which groups are excluded.
+ * selected — read from the database, so they cannot come from here.
+ *
+ * `knownFoodGroups` is the vocabulary to check the derived groups against, and
+ * it stays an injected parameter even though {@link FOOD_GROUP_VALUES} now
+ * carries that vocabulary in this module: the derivation's own tests supply a
+ * small deliberate vocabulary to exercise the drift report, and a caller that
+ * omits it skips the check. Passing {@link FOOD_GROUP_VALUES} here would report
+ * drift that nothing currently reads, so no caller does. Either way it never
+ * changes which groups are excluded — a group the catalog carries but the
+ * vocabulary lacks is still excluded, because under-excluding a dislike is the
+ * worse failure.
  */
 export interface DislikedFoodTaxonomy {
     foods: readonly CatalogFoodGroupAssignment[];
@@ -2407,6 +2517,43 @@ export type ParsedPreferencesUpdate =
 
 const MAX_DISLIKED_FOOD_GROUPS = MAX_DISLIKED_FOOD_IDS;
 
+/**
+ * A submitted food-group list as it will be stored, or why it cannot be.
+ *
+ * SHAPE ONLY, which is the same division {@link parseDislikedFoodIds} draws:
+ * that parser asks whether an entry is a UUID and leaves "does it name a
+ * published food" to the service, and this one asks whether an entry is a
+ * plausible group NAME and leaves "does it name a term this request may
+ * exclude" to the service too. The reason is the same in both halves — the
+ * answer depends on the row being edited, because a group already stored keeps
+ * round-tripping whatever the current vocabulary says, and this module has no
+ * row (see `preferences.service.ts::resolveDislikeWrites`).
+ *
+ * Three shape rules, each refusing rather than dropping the offending entry, so
+ * a client is never silently saved a shorter exclusion list than it sent:
+ *
+ *  * a non-array, and a list longer than {@link MAX_DISLIKED_FOOD_GROUPS};
+ *  * an entry that is not a string, or normalises to nothing (`''`, `'   '`,
+ *    `'---'`) — `invalid_type`, naming the index;
+ *  * an entry longer than {@link MAX_FOOD_GROUP_LENGTH} — `above_maximum`,
+ *    naming the index. `above_maximum` rather than a new code: it is already
+ *    this module's answer for a well-formed value that exceeds its bound, and
+ *    already reaches non-numeric values (a start date beyond the window uses
+ *    it), so the client's existing handling of the code covers this without a
+ *    contract change. The bound is checked BEFORE normalising, so an enormous
+ *    string is refused on its length instead of being NFKD-normalised first.
+ *
+ * Entries are de-duplicated by {@link comparisonKey}, so `['Olive', 'olive']`
+ * is one exclusion, and the FIRST spelling of a duplicate pair is the one kept.
+ *
+ * The survivors are returned IN THE ORDER THEY WERE SENT, which is what
+ * {@link parseDislikedFoodIds} does with ids and is load-bearing for the same
+ * reason: the service refuses an unselectable entry by its index in this list,
+ * so a list reordered here would name the wrong element of the client's array.
+ * Storage order is not affected — `resolveDislikeWrites` sorts the union it
+ * writes, so the column and the response stay stable across saves whatever
+ * order a client sends.
+ */
 const parseFoodGroupList = (value: unknown, field: string): string[] | PreferenceErrorVerdict => {
     if (!Array.isArray(value)) {
         return invalidRequest([detail(field, PREFERENCE_FIELD_CODES.INVALID_TYPE)]);
@@ -2420,12 +2567,22 @@ const parseFoodGroupList = (value: unknown, field: string): string[] | Preferenc
     const byKey = new Map<string, string>();
 
     value.forEach((entry, index) => {
-        if (typeof entry !== 'string' || comparisonKey(entry).length === 0) {
+        if (typeof entry !== 'string') {
             details.push(detail(`${field}[${index}]`, PREFERENCE_FIELD_CODES.INVALID_TYPE));
             return;
         }
 
+        if (entry.length > MAX_FOOD_GROUP_LENGTH) {
+            details.push(detail(`${field}[${index}]`, PREFERENCE_FIELD_CODES.ABOVE_MAXIMUM));
+            return;
+        }
+
         const key = comparisonKey(entry);
+
+        if (key.length === 0) {
+            details.push(detail(`${field}[${index}]`, PREFERENCE_FIELD_CODES.INVALID_TYPE));
+            return;
+        }
 
         if (!byKey.has(key)) {
             byKey.set(key, entry);
@@ -2436,7 +2593,9 @@ const parseFoodGroupList = (value: unknown, field: string): string[] | Preferenc
         return invalidRequest(details);
     }
 
-    return [...byKey.keys()].sort().map((key) => byKey.get(key) as string);
+    // `Map` preserves insertion order, so this IS the submitted order with
+    // duplicates dropped.
+    return [...byKey.values()];
 };
 
 /**

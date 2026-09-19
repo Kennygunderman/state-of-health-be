@@ -345,6 +345,31 @@ const aisleOrderedRows = (rows: readonly GroceryItemRow[]): GroceryItemRow[] =>
  * flagged first. All three of `sections`, `checkedItems` and `banner` are always
  * present — arrays, and null for "nothing to announce" — because the client
  * reads each of them unconditionally.
+ *
+ * THIS IS THE ONE PLAN-FACING READ WHOSE COST IS GENUINELY SET BY ITS PAYLOAD.
+ * Measured: the body is linear at about 265 bytes per line — 11.3 KB at 42
+ * lines, 106.0 KB at 400, 211.9 KB at 800 — and latency tracks it, 8.0 / 20.5 /
+ * 35.9 ms. PostgreSQL execution is about 1 ms of that, so the cost sits in this
+ * composition, serialisation and transport rather than in the queries.
+ *
+ * STATEMENT COUNT IS DELIBERATELY NOT CONSTANT HERE, unlike the plan read.
+ * `grocery.service.ts` hydrates catalog facts in bounded id slices, so the read
+ * costs `ceil(distinct foods / 300)` `catalog_foods` statements plus one
+ * default-portion statement each — five, seven and nine statements at the three
+ * sizes above. That is the guard keeping every one of them on
+ * `catalog_foods_pkey` rather than crossing the planner's selectivity threshold
+ * into a whole-table read, and one extra round trip per 300 foods is what it
+ * costs.
+ *
+ * PAGING IS NOT WARRANTED AT THE SHIPPED SHAPE, recorded as a bound rather than
+ * an opinion: a seven-day plan aggregates to roughly 37–42 distinct foods, which
+ * is the 11.3 KB / 8.0 ms row above. Were it ever needed, the per-line lever is
+ * the name, display text and flag block every row carries, together with the
+ * fact that `sections` and `checkedItems` between them cover the whole list. The
+ * threshold to revisit is one plan reaching the low hundreds of distinct
+ * `(food, state)` lines — an order of magnitude past the shipped list — and at
+ * that point the aggregation is the thing to question rather than this response,
+ * because a seven-day week cannot legitimately need that many distinct foods.
  */
 export const toGroceryListResponse = (
     plan: GroceryPlanRow,

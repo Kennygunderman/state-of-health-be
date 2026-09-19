@@ -56,7 +56,8 @@ import * as featureFlags from '../../utils/featureFlags';
 import { prisma } from '../../prisma/client';
 import { CatalogFoodRow, CatalogMappingError, mapCatalogFood } from '../../services/catalog.mapper';
 import { CatalogFoodResponse, CatalogStatusResponse, CatalogSuggestionResponse } from '../../types/catalog';
-import { MealEntryResponse } from '../../types/nutrition';
+import { DailyMacrosResponse, MealEntryResponse } from '../../types/nutrition';
+import { RecipeVersionResponse } from '../../types/recipe';
 import { MakeCatalogFoodOptions, makeCatalogFood, makeRecipeVersion, makeUser } from '../setup/factories';
 import { asUser, request } from '../setup/testApp';
 import { truncateFeatureTables } from '../setup/testDb';
@@ -100,8 +101,20 @@ interface HttpOutcome {
     body: unknown;
 }
 
-/** The only two members any error body of these routes may carry. */
-const ERROR_BODY_KEYS: readonly string[] = ['error', 'details'];
+/**
+ * The only members any error body of these routes may carry.
+ *
+ * `code` joined `error` and `details` when the legacy diary refusal stopped
+ * REPLACING its frozen sentence with a machine code and started carrying both:
+ * `POST /api/macros/meal/:mealId/entries` with a body that matches neither the
+ * legacy nor the catalog shape answers
+ * `{error: '<the frozen sentence>', code: 'invalid_payload', details: […]}`, so
+ * that a shipped client still reads the sentence it has always read (AAP §0.5.2,
+ * existing contracts change additively only) while the machine code AAP §0.3.1
+ * names travels beside it. Adding the key here keeps this a CLOSED set — an
+ * unexpected fourth member is still a leak — rather than relaxing the check.
+ */
+const ERROR_BODY_KEYS: readonly string[] = ['error', 'code', 'details'];
 
 /**
  * Text that would mean an internal detail reached the client: a stack frame, a
@@ -301,6 +314,29 @@ describe('GET /api/catalog/foods', () => {
 
             expect(namesOf(items)).toEqual(['Kumquat Gamma']);
             expect(pagination).toEqual({ page: 2, limit: 2, total: 3, totalPages: 2 });
+        });
+
+        it('still states the whole total on a page past the last one', async () => {
+            await makePrefixOnlyFood(1, 'Kumquat Alpha');
+            await makePrefixOnlyFood(2, 'Kumquat Beta');
+            await makePrefixOnlyFood(3, 'Kumquat Gamma');
+
+            // THE EMPTY-PAGE CASE, which is the one the total can be lost on.
+            // The count normally rides on the page itself as a
+            // `COUNT(*) OVER ()` window, so a page that returns NO rows carries
+            // no window value to read. Reporting `total: 0` here would tell a
+            // client that a 3-match term matches nothing the moment it steps one
+            // page too far, so the service falls back to counting the match set
+            // when — and only when — an empty page sits at a non-zero offset.
+            const { status, items, pagination } = await searchFoods({
+                q: TERM,
+                page: '9',
+                limit: '2',
+            });
+
+            expect(status).toBe(200);
+            expect(items).toEqual([]);
+            expect(pagination).toEqual({ page: 9, limit: 2, total: 3, totalPages: 2 });
         });
 
         it('reports no pages at all for a term nothing matches', async () => {
@@ -1278,6 +1314,212 @@ describe('the mounting of the catalog router', () => {
     });
 });
 
+/**
+ * THE APP-LEVEL MOUNT ORDER, WHICH ONLY A COMMENT USED TO STATE.
+ *
+ * The describe above pins an INTRA-router collision — two literals of
+ * `catalog.routes.ts` against each other. This one pins the claim the comment
+ * on `app.ts`'s last two mounts makes about every router ABOVE them: that
+ * `/catalog`, `/recipes` and `/meal-planning` "share no first path segment with
+ * any route above — nutrition's `/macros/:date`, the only parameterized path
+ * that could swallow a sibling, cannot reach them". That is AAP §0.5.1
+ * ("prefixes `/catalog`, `/recipes`, `/meal-planning` never collide with
+ * `/macros/:date`, so they mount after `nutritionRoutes`") and the constraint
+ * Rule backend-architecture §3.1 states as "registration order is
+ * load-bearing" — a future reader who changes those two mounts should find
+ * this block from either reference.
+ *
+ * WHY A COMMENT IS NOT ENOUGH. Mount order is invisible everywhere except
+ * `app.ts`: each router declares its paths relative to `/api` and none of them
+ * can see which mount claimed a path first. So a router inserted one line too
+ * early, or these two mounts moved above `nutritionRoutes`, changes which
+ * handler an existing URL reaches while every route file, every controller and
+ * every pure-logic test still reads as correct. Nothing else in the suite would
+ * report it.
+ *
+ * EVERY CASE ASSERTS THE ANSWER, NEVER "NOT 404". A 404 is what an unmounted
+ * router, a mis-mounted one and a genuinely absent row all look like, so each
+ * case below names a status AND a body that exactly one handler in the whole
+ * app can produce, and says at the case which re-ordering its failure reports.
+ * No case asserts a response header or the answer to an unrouted path: this
+ * block is about which handler ran, and those two are the business of the
+ * app-wide hardening and terminal-handler middleware instead.
+ */
+describe('the mounting of the three new routers in app.ts', () => {
+    /**
+     * The seven `/macros/<segment>` paths whose segment spells one of the three
+     * new prefixes (`catalog`, `recipes`, `meal-planning`) or the first segment
+     * of a route one of them owns (`status`, `foods`, `branded-food`,
+     * `suggestions`).
+     *
+     * Each is a word that entered the route table with this feature, so each is
+     * a word some future mount could plausibly claim ahead of `nutritionRoutes`
+     * — which is exactly the set the `app.ts` claim has to hold for.
+     *
+     * Written as WHOLE PATHS rather than assembled from a segment and a prefix:
+     * the collision is a property of the literal URL, and a grep for
+     * `macros/catalog` is how someone auditing the mount order finds this block
+     * at all.
+     */
+    const SHADOW_CANDIDATE_PATHS: readonly string[] = [
+        '/api/macros/catalog',
+        '/api/macros/recipes',
+        '/api/macros/meal-planning',
+        '/api/macros/status',
+        '/api/macros/foods',
+        '/api/macros/branded-food',
+        '/api/macros/suggestions',
+    ];
+
+    it.each(SHADOW_CANDIDATE_PATHS)(
+        'answers GET %s from the diary date handler, no new router having claimed it',
+        async (path) => {
+            const outcome = await getAsUser(path);
+
+            // `date must be yyyy-MM-dd` is `nutrition.controller.ts::
+            // getDailyMacrosController` refusing its `:date` parameter, and no
+            // other handler in the app emits that string — so this body is the
+            // evidence that the request walked past `userRoutes` … `foodRoutes`
+            // untouched and reached `nutritionRoutes` with the segment bound to
+            // `:date`.
+            //
+            // A failure means something now matches that `/macros/<word>`
+            // path BEFORE nutrition does: a router mounted too early, or
+            // `catalogRoutes`/`mealPlanningRoutes` moved above
+            // `nutritionRoutes` on a path broad enough to reach here. Read the
+            // other way round, a pass is the positive form of the `app.ts`
+            // claim — `/macros/:date` is the only parameterized path that could
+            // swallow a sibling prefix, and here it is still swallowing these
+            // seven words itself rather than losing them to a new router.
+            expectRefusal(outcome, 400, { error: 'date must be yyyy-MM-dd' });
+        },
+    );
+
+    it('answers GET /api/macros/search-branded-foods from foodRoutes, which mounts first for it', async () => {
+        // Sent with no `q`, so `food.controller.ts::searchBrandedFoodsController`
+        // refuses before it calls USDA: which handler answered is the whole
+        // question here, and it must not depend on a vendor being reachable.
+        const outcome = await getAsUser('/api/macros/search-branded-foods');
+
+        // The one ordering Rule backend-architecture §3.1 names explicitly, and
+        // the reason `foodRoutes` mounts before `nutritionRoutes` at all. Lose
+        // that order and this path STILL answers 400 — with `date must be
+        // yyyy-MM-dd`, because `/macros/:date` matched it with date =
+        // "search-branded-foods" — so the status alone would prove nothing and
+        // the body is the whole assertion. The regression it catches is branded
+        // search silently ceasing to work for every shipped client.
+        expectRefusal(outcome, 400, { error: 'q must be at least 2 characters' });
+    });
+
+    it('answers GET /api/macros/<a real date> with the diary day itself', async () => {
+        const user = await makeUser({ sequence: 1 });
+
+        const { status, body } = await getAsUser(`/api/macros/${DAY_KEY}`, {}, { uid: user.id });
+        const day = body as DailyMacrosResponse;
+
+        // The control the seven cases above need. They all assert a 400, so a
+        // `/macros` route — or a middleware — that refused EVERY date would
+        // satisfy all seven while the diary was broken, and the sweep would
+        // pass against a dead route. This is the same handler answering a date
+        // it accepts, which is what makes those seven mean "nutrition still
+        // owns `/macros/:date`" rather than merely "something answers 400".
+        //
+        // The member set and the four materialised buckets are that read's own
+        // projection: no catalog, recipe or meal-planning handler produces it.
+        expect(status).toBe(200);
+        expect(Object.keys(day).sort()).toEqual(['date', 'meals', 'targets', 'totals']);
+        expect({ date: day.date, meals: day.meals.map((meal) => meal.name) }).toEqual({
+            date: DAY_KEY,
+            meals: ['Breakfast', 'Lunch', 'Dinner', 'Snack'],
+        });
+    });
+
+    it('reaches the catalog search handler at /api/catalog/foods', async () => {
+        const food = await makePrefixOnlyFood(1, 'Kumquat Whole');
+
+        const { status, items, pagination } = await searchFoods({ q: TERM });
+
+        // The `{items, pagination}` envelope belongs to
+        // `searchCatalogFoodsController` alone: the suggestions read answers a
+        // bare `items`, the status read a counts projection, the recipe read a
+        // single object, and the legacy `/api/foods` list is a different path
+        // on a router that mounts earlier. A failure therefore means a route
+        // above `catalogRoutes` has begun claiming `/catalog/foods` — the half
+        // of the `app.ts` claim that says nothing above it can.
+        expect(status).toBe(200);
+        expect(items.map((item) => item.id)).toEqual([food.id]);
+        expect(pagination).toEqual({ page: 1, limit: SEARCH_DEFAULT_LIMIT, total: 1, totalPages: 1 });
+    });
+
+    it('reaches the suggestions handler at /api/catalog/foods/suggestions', async () => {
+        const food = await makeCatalogFood({ sequence: 1, is_common_dislike: true, food_group: 'legume' });
+
+        const { status, body } = await suggestions();
+
+        // The same path as the intra-router case at the top of the previous
+        // describe, against a different rival: that case can only observe a
+        // collision INSIDE `catalog.routes.ts`, because a route mounted above
+        // `catalogRoutes` would answer before that file ran at all. This one
+        // fails on exactly that mount, and the three-member projection with no
+        // page block is the answer only `getCatalogSuggestionsController`
+        // gives.
+        expect(status).toBe(200);
+        expect(body).not.toHaveProperty('pagination');
+        expect(body.items).toEqual([{ id: food.id, name: food.display_name, foodGroup: 'legume' }]);
+    });
+
+    it('reaches the status handler at /api/catalog/status', async () => {
+        await makeCatalogFood({ sequence: 1 });
+
+        const { status, body } = await catalogStatus();
+
+        // The operator projection: release identity, four counts, and no
+        // `items` or page block anywhere. Neither of the two literals it
+        // neighbours in `catalog.routes.ts`, and no route mounted above them,
+        // produces this member set — so the keys are what identify the handler
+        // and `publishedCount` is what proves it counted the seeded row rather
+        // than answering a constant.
+        expect(status).toBe(200);
+        expect(Object.keys(body).sort()).toEqual([
+            'catalogRelease',
+            'lastLoadedAt',
+            'publishedCount',
+            'quarantinedCount',
+            'recipeCount',
+            'rejectedCount',
+        ]);
+        expect(body.publishedCount).toBe(1);
+    });
+
+    it('reaches the recipe handler at /api/recipes/:recipeVersionId', async () => {
+        const version = await makeRecipeVersion({ sequence: 1 });
+
+        const { status, body } = await getAsUser(`/api/recipes/${version.id}`);
+        const recipe = body as RecipeVersionResponse;
+
+        // `/recipes` is the SECOND prefix `catalogRoutes` owns, and the only
+        // gated route in it — so it is the mount that could move without any
+        // `/catalog/*` case noticing, which is why it gets its own case rather
+        // than riding on the three above. The identity triple beside the frozen
+        // ingredient list is the recipe read's own answer: no catalog handler
+        // emits `versionId`, `recipeId` or `ingredients`, and the 404 the
+        // feature-flag describe above asserts for an absent id cannot
+        // distinguish this handler from a router that stopped being mounted.
+        expect(status).toBe(200);
+        expect({
+            versionId: recipe.versionId,
+            recipeId: recipe.recipeId,
+            version: recipe.version,
+            ingredientFoodIds: recipe.ingredients.map((ingredient) => ingredient.catalogFoodId),
+        }).toEqual({
+            versionId: version.id,
+            recipeId: version.recipe_id,
+            version: version.version,
+            ingredientFoodIds: version.recipe_ingredients.map((row) => row.catalog_food_id),
+        });
+    });
+});
+
 describe('POST /api/macros/meal/:mealId/entries — the catalog body', () => {
     const owner = { uid: '' };
     let breakfastId = '';
@@ -1555,11 +1797,21 @@ describe('POST /api/macros/meal/:mealId/entries — the catalog body', () => {
             expect(await storedEntries()).toEqual([]);
         });
 
-        it('refuses a body that matches neither shape', async () => {
+        it('refuses a body that matches neither shape, keeping the frozen sentence beside the code', async () => {
             const response = await postEntry({ servings: 1 });
 
+            // The sentence is the pre-feature contract for this refusal and is
+            // restored verbatim as `error`; `invalid_payload` is what AAP §0.3.1
+            // names and now travels as `code` beside it rather than instead of
+            // it. A shipped client reading `error` is unaffected, and a new one
+            // can branch on `code`. The CONFLICT refusal below is deliberately
+            // different — a body naming both a personal and a catalog food is
+            // unreachable from any shipped client, and the sentence would be
+            // factually false there, so that one keeps `invalid_payload` as
+            // `error`.
             expectRefusal({ status: response.status, body: response.body }, 400, {
-                error: 'invalid_payload',
+                error: 'name, calories, protein, carbs, and fat are required',
+                code: 'invalid_payload',
                 details: [{ field: 'body', code: 'unrecognized_payload' }],
             });
         });

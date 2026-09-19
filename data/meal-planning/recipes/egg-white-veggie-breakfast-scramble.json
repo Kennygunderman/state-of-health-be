@@ -1,0 +1,108 @@
+{
+  "slug": "egg-white-veggie-breakfast-scramble",
+  "name": "Egg white and vegetable scramble",
+  "description": "A lean, high-protein scramble: egg whites set in soft curds around diced potato, spinach, bell pepper and onion, with just enough olive oil to brown the potato.",
+  "iconKey": "crosshair",
+  "instructions": [
+    "Dice the potato small, then cook it in a wide nonstick skillet with the olive oil over medium heat until tender and browned at the edges, about 7 minutes.",
+    "Add the onion and bell pepper and cook until they soften, about 3 minutes.",
+    "Pour in the egg white, season with the salt and black pepper, and stir slowly until it sets into soft curds.",
+    "Fold in the spinach, cook just until it wilts, then divide between two warm plates."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 plate",
+  "prepMinutes": 10,
+  "cookMinutes": 10,
+  "mealSlots": [
+    "breakfast"
+  ],
+  "dietTags": [
+    "gluten_free",
+    "pescatarian",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "eggs"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "dairy_free"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:172183",
+      "quantity": 14,
+      "unit": "each",
+      "gramWeight": 462,
+      "displayText": "14",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170027",
+      "quantity": 1.5,
+      "unit": "each",
+      "gramWeight": 319.5,
+      "displayText": "1½ medium",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168462",
+      "quantity": 4,
+      "unit": "cup",
+      "gramWeight": 120,
+      "displayText": "4 cups",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170108",
+      "quantity": 1,
+      "unit": "cup",
+      "gramWeight": 149,
+      "displayText": "1 cup, chopped",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170000",
+      "quantity": 0.5,
+      "unit": "cup",
+      "gramWeight": 80,
+      "displayText": "½ cup, chopped",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 1.5,
+      "unit": "tbsp",
+      "gramWeight": 20.25,
+      "displayText": "1½ tbsp",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 3,
+      "displayText": "½ tsp",
+      "sortOrder": 6,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170931",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 1.15,
+      "displayText": "½ tsp",
+      "sortOrder": 7,
+      "isOptional": false
+    }
+  ]
+}

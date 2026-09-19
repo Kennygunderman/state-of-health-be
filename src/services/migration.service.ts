@@ -1,8 +1,13 @@
 import { db } from '../utils/firebase';
-import { PrismaClient } from '../generated/prisma';
 import { parse } from 'date-fns';
 
-const prisma = new PrismaClient();
+// The process-wide singleton, not a second client: `app.ts` imports
+// `migration.routes.ts`, whose live import of this module runs in every API
+// process, so a `new PrismaClient()` here would give that process a SECOND
+// connection pool of its own — and Prisma's default pool is sized from the
+// host's core count, not from the server's `max_connections`. Two unbounded
+// pools is how a burst opens more backends than the database permits.
+import { prisma } from '../prisma/client';
 
 interface FirebaseUser {
     id: string;

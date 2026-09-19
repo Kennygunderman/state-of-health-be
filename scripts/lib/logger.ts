@@ -251,6 +251,90 @@ export const redactUrlUserinfo = (value: string): string => {
     return redacted + value.slice(copiedUpTo);
 };
 
+/**
+ * An opaque run long enough to be a credential body: 40 or more base64
+ * characters, with the padding that may follow them.
+ *
+ * This is the shape of every secret this pipeline configures that is NOT
+ * written beside its own name — a base64 `FIREBASE_SERVICE_ACCOUNT`, a key body
+ * lifted out of its PEM markers, an opaque vendor token quoted inside a
+ * sentence — which is why the rule that uses it is the last and least specific
+ * of the five.
+ */
+const OPAQUE_RUN_PATTERN = /[A-Za-z0-9+/]{40,}={0,2}/g;
+
+/** A path segment as this repository writes one: lowercase, unpunctuated, short. */
+const DATA_PATH_SEGMENT_PATTERN = /^[a-z0-9]{1,32}$/;
+
+/**
+ * How many segments a run must have before it can be read as a path: three,
+ * i.e. at least two separators. One separator is a ratio a base64 body reaches
+ * by chance far too often to be evidence of anything.
+ */
+const MIN_DATA_PATH_SEGMENTS = 3;
+
+/**
+ * Whether an opaque run is really a fragment of a repository-relative data
+ * path, and therefore the one thing {@link OPAQUE_RUN_PATTERN} matches that
+ * must be printed rather than redacted.
+ *
+ * WHY THIS EXEMPTION EXISTS. `/` is a base64 character, so a path is the same
+ * shape as a key body once its separators are counted, and the paths this
+ * pipeline names are long: `data/meal-planning/catalog/releases/v9005/
+ * manifest.json` contains the 40-character run
+ * `planning/catalog/releases/v9005/manifest` and was printed as
+ * `data/meal-***.json` — in the preflight gap message whose whole purpose is to
+ * name the manifest an operator has to produce. The shipped `v1` release sat
+ * one character under the threshold and hid the defect; any release id of four
+ * characters or more crosses it, and so does any deeper artefact path.
+ *
+ * WHY IT IS SAFE, which is the only question that matters in this module. A run
+ * is exempt only if it carries no `+` and no `=`, holds at least two
+ * separators, and every one of its segments is unpunctuated lowercase
+ * alphanumeric of at most 32 characters. Real base64 fails that structurally
+ * rather than probabilistically: an encoded service account or key body is long
+ * enough to contain uppercase with certainty and usually ends in padding, a
+ * USDA key carries no separator at all, and an OpenRouter `sk-or-v1-…` key
+ * carries `-`, which is outside the run class and so never reaches this test.
+ * The residue is a random base64 body whose other 38 characters happen to be
+ * uppercase-free, at (36/64)^38 ≈ 5e-10 per run, and which would additionally
+ * have to be slashed in the right two places. That is the trade: a certainty of
+ * destroying the diagnostic against a probability no operator will meet.
+ *
+ * A trailing separator is dropped before the segments are judged, because a
+ * directory is named as often as a file (`… /releases/v9005/`) and is the same
+ * claim. A LEADING separator is not: an absolute path is not what this
+ * repository's `describePath` produces, and keeping the exemption to the
+ * relative form is the tighter of the two readings.
+ */
+const looksLikeDataPath = (run: string): boolean => {
+    if (run.includes('+') || run.includes('=')) {
+        return false;
+    }
+
+    const segments = run.split('/');
+    // One trailing empty segment means the run ended on a separator.
+    if (segments.length > 1 && segments[segments.length - 1] === '') {
+        segments.pop();
+    }
+    if (segments.length < MIN_DATA_PATH_SEGMENTS) {
+        return false;
+    }
+
+    return segments.every((segment) => DATA_PATH_SEGMENT_PATTERN.test(segment));
+};
+
+/**
+ * The last scrub rule: redacts every opaque run except a data path.
+ *
+ * Idempotent on both outcomes, which is what SCRUB_RULES requires of every
+ * entry: a redacted run becomes `***`, which contains no character of the run
+ * class and cannot be matched again, and an exempt run is still a path on the
+ * next pass and is exempted again.
+ */
+const redactOpaqueRuns = (value: string): string =>
+    value.replace(OPAQUE_RUN_PATTERN, (run) => (looksLikeDataPath(run) ? run : REDACTED));
+
 // THE SECURITY CONTRACT OF THIS MODULE.
 //
 // These rules are applied in order to every caller-supplied string that
@@ -272,10 +356,13 @@ export const redactUrlUserinfo = (value: string): string => {
 // widening the pattern.
 //
 // A rule is either a pattern and its replacement or a named transform. The
-// second form exists because one of the five rules below cannot be a regex
-// without either leaking or stalling — see `redactUrlUserinfo` above, which
-// documents both measurements. The list stays an ORDERED list of transforms
-// whichever form each entry takes, and `scrubSecrets` applies them in order.
+// second form exists because two of the five rules below cannot be a regex: the
+// userinfo rule would either leak or stall — see `redactUrlUserinfo` above,
+// which documents both measurements — and the opaque-run rule has to inspect
+// what it matched before deciding, because one shape it matches is a data path
+// rather than a credential (see `looksLikeDataPath`). The list stays an ORDERED
+// list of transforms whichever form each entry takes, and `scrubSecrets`
+// applies them in order.
 type ScrubRule = { pattern: RegExp; replacement: string } | { scrub: (value: string) => string };
 
 const SCRUB_RULES: Array<ScrubRule> = [
@@ -315,7 +402,11 @@ const SCRUB_RULES: Array<ScrubRule> = [
             /([?&;_-]|\b)((?:access[_-]?token|refresh[_-]?token|id[_-]?token|api[_-]?key|private[_-]?key|client[_-]?secret|service[_-]?account|authorization|credentials?|password|passwd|signature|secret|token|auth|bearer|key)(?:[_-][A-Za-z0-9]{1,32}){0,4}[_-]?)(\s*=\s*)[^&\s#"']*/gi,
         replacement: `$1$2$3${REDACTED}`,
     },
-    { pattern: /[A-Za-z0-9+/]{40,}={0,2}/g, replacement: REDACTED },
+    // The opaque-run rule, LAST because it is the least specific: every rule
+    // above recognises a credential by something written beside it, and this one
+    // recognises one by shape alone. A named transform rather than a pattern
+    // because of the one exemption it carries — see `redactOpaqueRuns`.
+    { scrub: redactOpaqueRuns },
 ];
 
 export const scrubSecrets = (value: string): string => {
@@ -460,6 +551,36 @@ export const isSecretBearingKey = (key: string): boolean => {
  */
 const ERROR_CODE_PATTERN = /^[A-Za-z][A-Za-z0-9_]{0,31}$/;
 
+/**
+ * A PostgreSQL SQLSTATE, which {@link ERROR_CODE_PATTERN} cannot express: the
+ * class is five characters of digits and uppercase letters, and the interesting
+ * ones are DIGIT-LEADING — `53300` too_many_connections, `08006`
+ * connection_failure, `3D000` invalid_catalog_name, `28P01` invalid_password,
+ * `57P03` cannot_connect_now — so every one of them failed the leading-letter
+ * test and was dropped.
+ *
+ * THE FAILURE THAT COST. node-postgres sets `name` to the literal `'error'` on
+ * a `DatabaseError`, so once the code was dropped the closed field set held one
+ * worthless member and a refusal read `{"code":"unexpected_error","error":
+ * {"name":"error"}}` — no class, no SQLSTATE, no remedy, on a failure whose
+ * remedies ("raise the connection limit", "create the database", "fix the
+ * password") could not be further apart. That is the shape an operator met when
+ * the raw `pg` session checkpoint.ts holds for the stage advisory lock could not
+ * reach the target, which is BEFORE any Prisma client exists to translate it.
+ *
+ * WHY THIS IS A SECOND PATTERN AND NOT A WIDER FIRST ONE. The comment above
+ * records that `src/utils/safeLogger.ts` keeps an identical copy of
+ * {@link ERROR_CODE_PATTERN} so the HTTP edge and the scripts answer "what may a
+ * log say about a failure" the same way, and that parity is worth more than
+ * tidiness: the server half speaks to PostgreSQL only through Prisma, whose
+ * `P####` codes pass the letter test already, so it has nothing to gain here and
+ * would only drift. The scripts half holds a raw `pg` session, so it needs this.
+ * A SQLSTATE is a five-character constant from a published table — it names a
+ * class of failure and can carry no statement text, value or identifier — so
+ * admitting it discloses nothing the closed field set exists to withhold.
+ */
+const SQL_STATE_PATTERN = /^[0-9A-Z]{5}$/;
+
 /** An error class name is a class name; 64 characters covers every class here and bounds a foreign one. */
 const MAX_ERROR_NAME_LENGTH = 64;
 
@@ -476,7 +597,12 @@ export interface SafeErrorFields {
 // A property read off a thrown value that cannot itself fail: `throw` accepts
 // any value, so a getter here may throw and the value may be a primitive or
 // null. A logging path must answer either way.
-const propertyOfThrown = (error: unknown, key: 'code' | 'status'): unknown => {
+// The key is a closed union rather than `string`, so this cannot become a
+// general-purpose reader that pulls an arbitrary property of a thrown value onto
+// a log line. `message` is a member because ONE caller may read it —
+// `firstPartyMessage`, under the narrowing obligation documented there — and
+// never because `safeError` reports it.
+const propertyOfThrown = (error: unknown, key: 'code' | 'status' | 'message'): unknown => {
     try {
         return (error as Record<string, unknown> | null | undefined)?.[key];
     } catch {
@@ -585,8 +711,39 @@ export const isThrownInstanceOf = <T>(
 
 const machineCodeOf = (error: unknown): string | undefined => {
     const code = propertyOfThrown(error, 'code');
+    if (typeof code !== 'string') {
+        return undefined;
+    }
 
-    return typeof code === 'string' && ERROR_CODE_PATTERN.test(code) ? code : undefined;
+    // Either shape is a machine code and both are reported under `code`, which
+    // is the field every consumer already reads and greps. Prisma's `P2002`
+    // satisfies both patterns and is unaffected; a digit-leading SQLSTATE
+    // satisfies only the second and used to be dropped.
+    return ERROR_CODE_PATTERN.test(code) || SQL_STATE_PATTERN.test(code) ? code : undefined;
+};
+
+/**
+ * The SQLSTATE a thrown value carries, or `undefined` — the same read
+ * {@link machineCodeOf} performs, narrowed to the database shape so a
+ * classifier can act on it without re-implementing the guard.
+ */
+const sqlStateOf = (error: unknown): string | undefined => {
+    const code = propertyOfThrown(error, 'code');
+
+    return typeof code === 'string' && SQL_STATE_PATTERN.test(code) ? code : undefined;
+};
+
+/**
+ * A Node system-call error code (`ECONNREFUSED`, `ETIMEDOUT`): the same `code`
+ * property again, recognised by the shape libuv gives it. Bounded and
+ * upper-case-only so a `code` that is really a message or a path cannot pass.
+ */
+const SYSTEM_ERRNO_PATTERN = /^E[A-Z0-9_]{1,15}$/;
+
+const systemErrnoOf = (error: unknown): string | undefined => {
+    const code = propertyOfThrown(error, 'code');
+
+    return typeof code === 'string' && SYSTEM_ERRNO_PATTERN.test(code) ? code : undefined;
 };
 
 // An HTTP status, and only an integer in the HTTP range: a `status` holding
@@ -686,6 +843,249 @@ export const formatSafeError = (error: unknown): string => {
     }
 
     return qualifiers.length === 0 ? described.name : `${described.name} (${qualifiers.join(', ')})`;
+};
+
+// THE INFRASTRUCTURE TAXONOMY.
+//
+// Every stage in `scripts/` ends in the same `describeFailure(error): {code,
+// error, detail?}` and the same top-level catch, and every one of them mapped
+// anything outside its own error classes to `unexpected_error`. A database that
+// refuses a connection is not an unexpected error — it is the most ordinary
+// failure a pipeline stage has, it has four remedies that could not be further
+// apart, and reporting it without naming which one leaves an operator guessing
+// at a stage that ran for minutes before it stopped.
+//
+// So the classification lives HERE rather than five times over: one vocabulary
+// means `catalog-import-usda`, `catalog-load`, `catalog-release`, `recipes-seed`
+// and `search-benchmark` cannot disagree about the same SQLSTATE, and a stage
+// added later gets the taxonomy by calling one function. What it returns is a
+// CODE and a REMEDY — never a sentence built out of the failure, which is what
+// `safeError` and SCRUB_RULES exist to prevent.
+
+/** The named database failures a stage can act on, as opposed to `unexpected_error`. */
+export type InfrastructureFailureCode =
+    | 'database_unavailable'
+    | 'database_missing'
+    | 'database_authentication_failed'
+    | 'database_error';
+
+/**
+ * A recognised infrastructure failure: what it is, and what to do about it.
+ *
+ * `remedy` is FIXED prose written in this repository. It names `DATABASE_URL` as
+ * a variable name and nothing else — never its value, its host or its database,
+ * which is `opaqueDigest`'s job — and nothing in it is interpolated from the
+ * error, so no vendor or driver text can reach a log through this field. A
+ * stage that has more to say (a `--resume` flag, a `--confirm-target`) says it
+ * in its own field beside this one.
+ */
+export interface InfrastructureFailure {
+    readonly code: InfrastructureFailureCode;
+    readonly remedy: string;
+}
+
+// The SQLSTATEs worth distinguishing, from the PostgreSQL error-code table.
+// Class 08 is connection exception; 53xxx is insufficient resources — 53300
+// too_many_connections is what a role capped at zero or a saturated server
+// answers; 57P0x is operator intervention.
+const UNAVAILABLE_SQL_STATES: ReadonlySet<string> = new Set([
+    '08000',
+    '08001',
+    '08003',
+    '08004',
+    '08006',
+    '08007',
+    '08P01',
+    '53000',
+    '53100',
+    '53200',
+    '53300',
+    '53400',
+    '57P01',
+    '57P02',
+    '57P03',
+    '57P04',
+]);
+
+/** 3D000 invalid_catalog_name: the database named in the connection string does not exist. */
+const MISSING_DATABASE_SQL_STATE = '3D000';
+
+/**
+ * Prisma's own error-code namespace, which shares the five-character shape with
+ * SQLSTATE and has to be told apart from it: `P1001` is a connection failure
+ * and `P2002` is a unique-constraint violation, and only the first kind is
+ * infrastructure.
+ */
+const PRISMA_CODE_PATTERN = /^P[0-9]{4}$/;
+
+/** Class 28: the server was reached and rejected who we said we were. */
+const AUTHENTICATION_SQL_STATES: ReadonlySet<string> = new Set(['28000', '28P01']);
+
+// Prisma's own initialization and connection codes, mapped to the same four
+// names so a failure reads identically whether it arrived through Prisma or
+// through the raw `pg` session checkpoint.ts holds for the stage advisory lock.
+const PRISMA_INFRASTRUCTURE_CODES: Readonly<Record<string, InfrastructureFailureCode>> = {
+    P1000: 'database_authentication_failed',
+    P1001: 'database_unavailable',
+    P1002: 'database_unavailable',
+    P1003: 'database_missing',
+    P1008: 'database_unavailable',
+    P1010: 'database_authentication_failed',
+    P1017: 'database_unavailable',
+};
+
+// libuv and DNS codes for a target that could not be reached at all. A
+// connection refused, reset, timed out or unresolvable is the same operator
+// answer as SQLSTATE class 08, so it carries the same name.
+const UNAVAILABLE_ERRNOS: ReadonlySet<string> = new Set([
+    'ECONNREFUSED',
+    'ECONNRESET',
+    'ETIMEDOUT',
+    'ENOTFOUND',
+    'EHOSTUNREACH',
+    'ENETUNREACH',
+    'ENETDOWN',
+    'EPIPE',
+    'EAI_AGAIN',
+]);
+
+const INFRASTRUCTURE_REMEDIES: Readonly<Record<InfrastructureFailureCode, string>> = {
+    database_unavailable:
+        'The database did not accept a connection. Confirm the PostgreSQL service DATABASE_URL points at is running and reachable from this host, and that neither the server nor the role it names is at its connection limit, then run the stage again.',
+    database_missing:
+        'DATABASE_URL names a database that does not exist on that host. Create it, or point DATABASE_URL at the development database, then run the stage again.',
+    database_authentication_failed:
+        'The database refused the credentials in DATABASE_URL. Correct the role or password it carries, then run the stage again.',
+    database_error:
+        'The database refused the statement. Look up the reported SQLSTATE in the PostgreSQL error-code table, correct the condition it names, then run the stage again.',
+};
+
+/**
+ * The remedy for a failure no stage classifies — the honest one, which is to
+ * say what is known and what to do next rather than to guess.
+ *
+ * Exported so all five stages give the same answer for `unexpected_error`
+ * instead of each leaving the field out.
+ */
+export const UNEXPECTED_FAILURE_REMEDY =
+    'This failure is not one the stage recognises. Read the reported error name and code, re-run the stage with the same arguments to see whether it repeats, and report both together with the stage name if it does.';
+
+/**
+ * Classifies a thrown value as a recognised database-infrastructure failure, or
+ * returns `null` when it is not one.
+ *
+ * `null` is the answer for everything a stage owns — its own typed errors, a
+ * manifest refusal, a vendor failure, a programming mistake — so a caller puts
+ * this branch immediately BEFORE its `unexpected_error` fallback and leaves
+ * every arm above it untouched.
+ *
+ * Reads only the `code` property, through the same guarded accessor
+ * `safeError` uses, so it is total on any thrown value (a getter that throws, a
+ * proxy, a string, `undefined`) and cannot replace the failure being reported
+ * with one of its own. A value that carries a SQLSTATE this module does not
+ * enumerate is still `database_error` rather than `null`: the SQLSTATE itself
+ * proves a database answered, and reporting that with the code beside it is
+ * strictly better than reporting `unexpected_error`.
+ */
+export const classifyInfrastructureFailure = (error: unknown): InfrastructureFailure | null => {
+    const describe = (code: InfrastructureFailureCode): InfrastructureFailure => ({
+        code,
+        remedy: INFRASTRUCTURE_REMEDIES[code],
+    });
+
+    // One read serves both namespaces: Prisma's `P1001` and PostgreSQL's
+    // `53300` are both five characters of digits and upper case, so they arrive
+    // through the same accessor and are told apart by the tables below rather
+    // than by shape. `hasOwnProperty`, not `in`, so a code named `constructor`
+    // cannot resolve through Object's prototype.
+    const code = sqlStateOf(error);
+    if (code !== undefined) {
+        if (Object.prototype.hasOwnProperty.call(PRISMA_INFRASTRUCTURE_CODES, code)) {
+            return describe(PRISMA_INFRASTRUCTURE_CODES[code]);
+        }
+        if (UNAVAILABLE_SQL_STATES.has(code)) {
+            return describe('database_unavailable');
+        }
+        if (code === MISSING_DATABASE_SQL_STATE) {
+            return describe('database_missing');
+        }
+        if (AUTHENTICATION_SQL_STATES.has(code)) {
+            return describe('database_authentication_failed');
+        }
+
+        // A code in neither table, where the two namespaces part company.
+        //
+        // A genuine SQLSTATE proves a PostgreSQL server answered and refused
+        // the statement — `42P01` undefined_table on an unmigrated target,
+        // `42501` insufficient_privilege for an under-granted role — and the
+        // code plus the published table is a real remedy, so it is reported as
+        // `database_error`.
+        //
+        // A Prisma `P####` outside the initialization range is NOT an
+        // infrastructure failure: `P2002` is a unique-constraint violation, and
+        // calling that a database problem would file a stage's own data or
+        // logic defect under the one heading an operator reads as "not your
+        // code". Those return `null` and stay with the caller's
+        // `unexpected_error`, where the code is still reported because
+        // `safeError` carries it.
+        return PRISMA_CODE_PATTERN.test(code) ? null : describe('database_error');
+    }
+
+    const errno = systemErrnoOf(error);
+    if (errno !== undefined && UNAVAILABLE_ERRNOS.has(errno)) {
+        return describe('database_unavailable');
+    }
+
+    return null;
+};
+
+/**
+ * How much of a first-party sentence reaches the log. Long enough for every
+ * refusal this pipeline writes — the longest run past 500 characters, naming a
+ * file, a source key and both sides of a mismatch — and short enough that one
+ * line stays a line.
+ */
+const MAX_FIRST_PARTY_MESSAGE_LENGTH = 1000;
+
+/**
+ * The scrubbed message of an error THIS REPOSITORY WROTE, for the one case in
+ * which reporting a message is legitimate.
+ *
+ * {@link safeError} deliberately carries no `message`, and that is not a gap to
+ * work around: an arbitrary `Error.message` on this pipeline can quote a Prisma
+ * statement with its values, an absolute path from `fs`, or a fragment of a
+ * vendor error document, and once a line is written it is in an operator's
+ * terminal and in `catalog_import_runs.log`.
+ *
+ * What makes this function safe is the CALLER's obligation, not anything it can
+ * check: call it only inside a branch that has already narrowed the value to
+ * one of this repository's own error classes — `if (isThrownInstanceOf(error,
+ * CatalogLoadError))` — where the sentence was composed here, against a typed
+ * context, and says what an operator must do. `scripts/seed-dev.ts` is the
+ * in-repo precedent and reports it under `firstPartyMessage` for exactly this
+ * reason. Never call it on a vendor error, a driver error, a `DatabaseOriginError`
+ * (whose message names the host and database on purpose) or an unclassified
+ * value.
+ *
+ * Returns `undefined` rather than a placeholder when there is no usable
+ * message, so an absent member stays absent in the line — the same convention
+ * `safeError` follows. The message is scrubbed on the way out regardless, which
+ * is belt-and-braces for a string this repository already controls.
+ */
+export const firstPartyMessage = (error: unknown): string | undefined => {
+    const message = propertyOfThrown(error, 'message');
+    if (typeof message !== 'string' || message.length === 0) {
+        return undefined;
+    }
+
+    const scrubbed = scrubSecrets(message);
+    if (scrubbed.length === 0) {
+        return undefined;
+    }
+
+    return scrubbed.length > MAX_FIRST_PARTY_MESSAGE_LENGTH
+        ? `${scrubbed.slice(0, MAX_FIRST_PARTY_MESSAGE_LENGTH)}…`
+        : scrubbed;
 };
 
 /**

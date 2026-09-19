@@ -1,0 +1,106 @@
+{
+  "slug": "chicken-quinoa-dinner-plate",
+  "name": "Chicken and quinoa dinner plate",
+  "description": "Chicken breast strips seared with garlic and cauliflower, brightened with lemon and served over quinoa.",
+  "iconKey": "fork_knife",
+  "instructions": [
+    "Cut the chicken breast into strips and season them with the salt.",
+    "Break the cauliflower into small florets and halve the lemon.",
+    "Warm the olive oil in a skillet over medium-high heat, add the garlic and the cauliflower and cook for 6 minutes, until the edges colour.",
+    "Add the chicken strips and cook for 8 minutes, turning once, until they are cooked through.",
+    "Fold the spinach through the pan off the heat, then squeeze the lemon over everything.",
+    "Spoon the cooked quinoa onto two plates and pile the chicken and cauliflower on top."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 plate",
+  "prepMinutes": 10,
+  "cookMinutes": 20,
+  "mealSlots": [
+    "dinner"
+  ],
+  "dietTags": [
+    "gluten_free"
+  ],
+  "allergenTags": [],
+  "allergenStatus": "known",
+  "budgetTier": 2,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "dairy_free"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:171077",
+      "quantity": 9,
+      "unit": "oz",
+      "gramWeight": 254.25,
+      "displayText": "9 oz",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168917",
+      "quantity": 2.25,
+      "unit": "cup",
+      "gramWeight": 416.25,
+      "displayText": "2¼ cups",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169986",
+      "quantity": 1.5,
+      "unit": "cup",
+      "gramWeight": 160.5,
+      "displayText": "1½ cups",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168462",
+      "quantity": 2,
+      "unit": "cup",
+      "gramWeight": 60.0,
+      "displayText": "2 cups",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:167746",
+      "quantity": 0.5,
+      "unit": "each",
+      "gramWeight": 42.0,
+      "displayText": "½",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 1,
+      "unit": "tbsp",
+      "gramWeight": 13.5,
+      "displayText": "1 tbsp",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169230",
+      "quantity": 3,
+      "unit": "clove",
+      "gramWeight": 9.0,
+      "displayText": "3 cloves",
+      "sortOrder": 6,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 3.0,
+      "displayText": "½ tsp",
+      "sortOrder": 7,
+      "isOptional": false
+    }
+  ]
+}

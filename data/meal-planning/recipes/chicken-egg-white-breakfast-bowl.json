@@ -1,0 +1,107 @@
+{
+  "slug": "chicken-egg-white-breakfast-bowl",
+  "name": "Chicken and egg white breakfast bowl",
+  "description": "Crisped potato with cooked chicken breast, soft-set egg whites and wilted spinach — a savoury breakfast bowl in twenty minutes.",
+  "iconKey": "bowl_dash",
+  "instructions": [
+    "Scrub the potato and dice it small, then chop the bell pepper.",
+    "Warm the olive oil in a skillet over medium-high heat, add the potato in a single layer and cook it undisturbed for 6 minutes.",
+    "Stir in the bell pepper and the diced cooked chicken breast and cook for 3 minutes, until warmed through.",
+    "Push everything to one side of the pan, pour the egg whites into the clear half and stir them gently until they set in soft curds.",
+    "Fold the spinach through the pan until it wilts, season with the salt and the black pepper, and divide between two bowls."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 bowl",
+  "prepMinutes": 8,
+  "cookMinutes": 12,
+  "mealSlots": [
+    "breakfast"
+  ],
+  "dietTags": [
+    "gluten_free"
+  ],
+  "allergenTags": [
+    "eggs"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "dairy_free"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:171477",
+      "quantity": 1,
+      "unit": "cup",
+      "gramWeight": 140.0,
+      "displayText": "1 cup, diced",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:172183",
+      "quantity": 4,
+      "unit": "each",
+      "gramWeight": 132.0,
+      "displayText": "4",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170027",
+      "quantity": 2,
+      "unit": "each",
+      "gramWeight": 426.0,
+      "displayText": "2",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170108",
+      "quantity": 0.5,
+      "unit": "cup",
+      "gramWeight": 74.5,
+      "displayText": "½ cup",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168462",
+      "quantity": 2,
+      "unit": "cup",
+      "gramWeight": 60.0,
+      "displayText": "2 cups",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 1.25,
+      "unit": "tbsp",
+      "gramWeight": 16.875,
+      "displayText": "1¼ tbsp",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 3.0,
+      "displayText": "½ tsp",
+      "sortOrder": 6,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170931",
+      "quantity": 0.25,
+      "unit": "tsp",
+      "gramWeight": 0.575,
+      "displayText": "¼ tsp",
+      "sortOrder": 7,
+      "isOptional": false
+    }
+  ]
+}

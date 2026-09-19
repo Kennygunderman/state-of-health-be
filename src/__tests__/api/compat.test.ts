@@ -1623,12 +1623,19 @@ describe('migration ledgers', () => {
 // gates, so what is asserted here is what an existing client and a new one may
 // each rely on:
 //
-//   * a malformed path id is answered `400 invalid_request` with `invalid_id`,
+//   * an UNPARSABLE path id is answered `400 invalid_request` with `invalid_id`,
 //     for BOTH body shapes, instead of reaching a @db.Uuid predicate and
 //     returning a 500 — while a malformed BODY still earns the frozen 400
 //     message shipped clients read, and a well-formed id that is absent or
 //     someone else's still earns the 404 that keeps those two cases
 //     indistinguishable;
+//   * where "unparsable" falls is itself part of the contract, so the four
+//     forms the data layer CAN read — hyphenated (any version), unhyphenated,
+//     brace-wrapped and `urn:uuid:`-prefixed — are driven separately and must
+//     still answer the original 404. Each of them reached the query before this
+//     release and answered "no such row", which a shipped client reads as "the
+//     entry is gone, drop it from the cache"; only the forms that used to answer
+//     500 may earn the 400 (§0.5.2, existing contracts change additively only);
 //   * a client-supplied snapshot is stored as `user_entered` and a row written
 //     before the column existed keeps `null`, and neither carries a source
 //     label;
@@ -1738,8 +1745,10 @@ describe('the diary entries endpoint', () => {
         it.each([
             ['a string that is not a UUID', 'not-a-uuid'],
             ['a SQL fragment', "'%20OR%201=1--"],
-            ['a UUID missing its hyphens', '9b2fbd4c7c214a178b361d5a2d4f9c10'],
-            ['a v1 UUID', '9b2fbd4c-7c21-1a17-8b36-1d5a2d4f9c10'],
+            ['31 hex digits', '9b2fbd4c7c214a178b361d5a2d4f9c1'],
+            ['a truncated UUID', '9b2fbd4c-7c21-4a17-8b36'],
+            ['braces around the unhyphenated form', '%7B9b2fbd4c7c214a178b361d5a2d4f9c10%7D'],
+            ['an upper-case URN prefix', 'URN:UUID:9b2fbd4c-7c21-4a17-8b36-1d5a2d4f9c10'],
         ])('is refused with invalid_id for a legacy body: %s', async (_case, mealId) => {
             const response = await asUser(
                 request.post(`/api/macros/meal/${mealId}/entries`).send(legacyBody()),
@@ -1802,6 +1811,97 @@ describe('the diary entries endpoint', () => {
                 error: 'invalid_request',
                 details: [{ field: 'id', code: 'invalid_id' }],
             });
+        });
+    });
+
+    describe('every id form the data layer can read', () => {
+        // The four forms the ORM's UUID parser accepts. Each one reached the
+        // query before this release and answered 404 for an id naming no row —
+        // the branch a shipped client acts on — so each one must still do so.
+        // Refusing them with a typed 400 is the non-additive change §0.5.2
+        // forbids, and it is one regex edit away, which is why the forms are
+        // driven here over HTTP rather than only in the parser's unit suite.
+        const parsableForms: [string, (id: string) => string][] = [
+            ['hyphenated', (id) => id],
+            ['upper-case hyphenated', (id) => id.toUpperCase()],
+            ['unhyphenated', (id) => id.replace(/-/g, '')],
+            ['brace-wrapped', (id) => `{${id}}`],
+            ['urn:uuid:-prefixed', (id) => `urn:uuid:${id}`],
+        ];
+
+        it.each(parsableForms)('answers the original 404 for an absent meal id written %s', async (_case, spell) => {
+            const response = await asUser(
+                request.post(`/api/macros/meal/${encodeURIComponent(spell(ABSENT_UUID))}/entries`).send(legacyBody()),
+                owner,
+            ).expect(404);
+
+            expect(response.body).toStrictEqual({ error: 'Meal not found' });
+        });
+
+        it.each(parsableForms)('answers the original 404 for an absent entry id written %s', async (_case, spell) => {
+            const id = encodeURIComponent(spell(ABSENT_UUID));
+
+            const updateResponse = await asUser(
+                request.put(`/api/macros/entry/${id}`).send({ servings: 2 }),
+                owner,
+            ).expect(404);
+            const deleteResponse = await asUser(request.delete(`/api/macros/entry/${id}`), owner).expect(404);
+
+            expect(updateResponse.body).toStrictEqual({ error: 'Entry not found' });
+            expect(deleteResponse.body).toStrictEqual({ error: 'Entry not found' });
+        });
+
+        it.each(parsableForms)('reaches the row itself for an id written %s', async (_case, spell) => {
+            // Not merely "does not 400": the alternative spellings address the
+            // same row, so the 404s above are the answer of a query that ran
+            // rather than of a predicate that matched nothing structurally.
+            const response = await asUser(
+                request
+                    .post(`/api/macros/meal/${encodeURIComponent(spell(breakfastId))}/entries`)
+                    .send(legacyBody()),
+                owner,
+            ).expect(201);
+
+            expect((await storedEntry(response.body.id)).name).toBe('Scrambled eggs');
+        });
+
+        it('answers 404 for a v1 UUID, which the parser reads and no row can hold', async () => {
+            // `gen_random_uuid()` only ever produces v4, so a v1 id could only
+            // ever have been a 404 — but it EARNED that 404 by reaching the
+            // query, and that is the distinction this case exists to hold.
+            const v1 = '9b2fbd4c-7c21-1a17-8b36-1d5a2d4f9c10';
+
+            const postResponse = await asUser(
+                request.post(`/api/macros/meal/${v1}/entries`).send(legacyBody()),
+                owner,
+            ).expect(404);
+            const deleteResponse = await asUser(request.delete(`/api/macros/entry/${v1}`), owner).expect(404);
+
+            expect(postResponse.body).toStrictEqual({ error: 'Meal not found' });
+            expect(deleteResponse.body).toStrictEqual({ error: 'Entry not found' });
+        });
+
+        it('still refuses the parser´s near-misses, which have no 404 to preserve', async () => {
+            // The three forms the parser's length-dispatched grammar rejects.
+            // Every one of them answered 500 before this release, so the typed
+            // 400 is the improvement this checkpoint keeps.
+            const nearMisses = [
+                `{${ABSENT_UUID.replace(/-/g, '')}}`,
+                `urn:uuid:${ABSENT_UUID.replace(/-/g, '')}`,
+                `urn:uuid:{${ABSENT_UUID}}`,
+            ];
+
+            for (const id of nearMisses) {
+                const response = await asUser(
+                    request.post(`/api/macros/meal/${encodeURIComponent(id)}/entries`).send(legacyBody()),
+                    owner,
+                ).expect(400);
+
+                expect(response.body).toStrictEqual({
+                    error: 'invalid_request',
+                    details: [{ field: 'mealId', code: 'invalid_id' }],
+                });
+            }
         });
     });
 
@@ -2771,6 +2871,53 @@ describe('the frozen diary responses', () => {
 
             expect(sortedKeys(created.body)).toEqual(MEAL_ENTRY_DTO_KEYS);
         });
+
+        it.each([
+            ['an empty object', {}],
+            ['an array', [1, 2, 3]],
+            ['a body whose only key is unknown', { somethingElse: 1 }],
+            ['a body carrying only the shared fields', { servings: 2 }],
+        ])('keeps the frozen sentence for %s and carries the machine code beside it', async (_case, body) => {
+            // A body naming NEITHER shape. The shipped guard answered exactly
+            // this sentence for it long before the catalog shape existed, and it
+            // is the one refusal on this route a client that has never heard of
+            // `catalogFoodId` can still produce — so `error` stays the sentence
+            // (§0.5.2) while §0.3.1's machine code and the per-field detail
+            // travel alongside it. Asserted with toStrictEqual, so moving the
+            // code back into `error` fails here.
+            const response = await asUser(
+                request.post(`/api/macros/meal/${breakfastId}/entries`).send(body),
+                owner,
+            ).expect(400);
+
+            expect(response.body).toStrictEqual({
+                error: LEGACY_REQUIRED_MESSAGE,
+                code: 'invalid_payload',
+                details: [{ field: 'body', code: 'unrecognized_payload' }],
+            });
+            expect(await prisma.meal_entries.count({ where: { meal_id: breakfastId } })).toBe(0);
+        });
+
+        it('answers the two-food conflict with the machine code, which has no frozen sentence to keep', async () => {
+            // The boundary: this body cannot come from a shipped client —
+            // `catalogFoodId` is new in this release — and it carries all five
+            // legacy fields, so the frozen sentence would be false. §0.3.1's
+            // code is the whole contract for it.
+            const response = await asUser(
+                request
+                    .post(`/api/macros/meal/${breakfastId}/entries`)
+                    .send({ ...legacyBody(), foodId: ABSENT_UUID, catalogFoodId: ABSENT_UUID }),
+                owner,
+            ).expect(400);
+
+            expect(response.body).toStrictEqual({
+                error: 'invalid_payload',
+                details: [
+                    { field: 'foodId', code: 'conflicting_food_reference' },
+                    { field: 'catalogFoodId', code: 'conflicting_food_reference' },
+                ],
+            });
+        });
     });
 
     describe('the two 404 strings on the entry routes', () => {
@@ -2920,9 +3067,10 @@ describe('the diary history read', () => {
             meals: { name: string; sortOrder: number; calories: number }[];
         }[];
 
-        // ORDER BY date DESC, and the totals are `SUM(ROUND(value * servings))`
-        // — the 2-serving oats count twice, which is what makes these the
-        // as-eaten figures rather than the snapshots.
+        // ORDER BY date DESC, and the totals are
+        // `SUM(FLOOR((value * servings)::numeric + 0.5))` — the 2-serving oats
+        // count twice, which is what makes these the as-eaten figures rather
+        // than the snapshots.
         expect(days.map((day) => day.date)).toEqual([NEWEST_DAY, OLDEST_DAY]);
         expect(days[0]).toMatchObject({
             date: NEWEST_DAY,
@@ -2946,9 +3094,11 @@ describe('the diary history read', () => {
         const response = await asUser(request.get('/api/macros/history'), owner).expect(200);
         const days = response.body.days as { date: string }[];
 
-        // `HAVING SUM(ROUND(calories * servings)) > 0` — the old app's
-        // behaviour, and the reason the day is absent from both the page and
-        // the total rather than present with a zero.
+        // `HAVING SUM(FLOOR((calories * servings)::numeric + 0.5)) > 0` — the
+        // old app's behaviour, and the reason the day is absent from both the
+        // page and the total rather than present with a zero. The clause
+        // rounds exactly as the selected columns do, so a day can never be
+        // listed with a total the filter disagreed with.
         expect(days.map((day) => day.date)).not.toContain(ZERO_CALORIE_DAY);
         expect(response.body.pagination.total).toBe(2);
     });
@@ -2982,6 +3132,110 @@ describe('the diary history read', () => {
         // Math.ceil(0 / 30) is 0, which is what this endpoint has always
         // reported for an empty history.
         expect(response.body.pagination).toStrictEqual({ page: 1, limit: 30, total: 0, totalPages: 0 });
+    });
+});
+
+// ==========================================================================
+// One rounding contract across three readers.
+//
+// §0.7.3 fixes the consumed total at `Math.round(storedSnapshot × servings)`
+// per value, and three separate readers compute it: `GET /macros/:date` sums it
+// in JavaScript, while `GET /macros/history` computes the day total and the
+// per-meal breakdown in SQL. The two modes PostgreSQL offers are both wrong for
+// this contract — `round(double precision)` rounds half to EVEN and
+// `round(numeric)` rounds half AWAY FROM ZERO — so the aggregates use
+// `FLOOR(x::numeric + 0.5)`, which is what `Math.round` does.
+//
+// Driven over HTTP because that is the only place the three readers meet: the
+// rounding lives inside `$queryRaw`, so no unit test can reach it, and the
+// symptom is user-visible — `DayBreakdownCard` prints these numbers verbatim,
+// so a divergence shows the same day with different figures in Diary and in
+// History.
+// ==========================================================================
+
+describe('the rounding contract shared by the day read and the history reads', () => {
+    const owner = { uid: '' };
+
+    // Snapshots chosen so every product lands exactly on .5 at servings 0.5:
+    // 72.5 / 72.5 / 76.5 / 28.5. Under half-to-even these read 72/72/76/28 from
+    // SQL and 73/73/77/29 from the day read — the four-field divergence this
+    // case exists to prevent.
+    const HALF_DAY = '2026-03-11';
+    const NEGATIVE_DAY = '2026-03-09';
+    const HALF_TOTALS = { calories: 73, protein: 73, carbs: 77, fat: 29 };
+    // Math.round(-72.5) is -72, not -73: it rounds half toward +Infinity rather
+    // than away from zero. `round(numeric)` would answer -73/-77/-29 here,
+    // which is why the aggregates do not use it — negative macros are storable,
+    // the legacy guard only requiring a finite number.
+    const NEGATIVE_TOTALS = { calories: 73, protein: -72, carbs: -76, fat: -28 };
+
+    const macroFields = (totals: Record<string, number>) => ({
+        calories: totals.calories,
+        protein: totals.protein,
+        carbs: totals.carbs,
+        fat: totals.fat,
+    });
+
+    beforeAll(async () => {
+        await truncateFeatureTables();
+
+        const user = await makeUser();
+        owner.uid = user.id;
+
+        const log = async (dayKey: string, body: Record<string, unknown>) => {
+            const mealId = await diaryMealId(owner, dayKey, 'Breakfast');
+
+            await asUser(request.post(`/api/macros/meal/${mealId}/entries`).send(body), owner).expect(201);
+        };
+
+        await log(HALF_DAY, {
+            name: 'Half serving',
+            calories: 145,
+            protein: 145,
+            carbs: 153,
+            fat: 57,
+            servings: 0.5,
+        });
+        await log(NEGATIVE_DAY, {
+            name: 'Negative half',
+            calories: 145,
+            protein: -145,
+            carbs: -153,
+            fat: -57,
+            servings: 0.5,
+        });
+    }, 60_000);
+
+    afterAll(async () => {
+        await truncateFeatureTables();
+    });
+
+    it.each([
+        ['a product landing exactly on .5', HALF_DAY, HALF_TOTALS],
+        ['a negative product landing exactly on .5', NEGATIVE_DAY, NEGATIVE_TOTALS],
+    ])('reports the same totals from all three readers for %s', async (_case, dayKey, expected) => {
+        const day = await asUser(request.get(`/api/macros/${dayKey}`), owner).expect(200);
+        const history = await asUser(request.get('/api/macros/history'), owner).expect(200);
+        const historyDay = (history.body.days as { date: string }[]).find(
+            (entry) => entry.date === dayKey,
+        ) as unknown as Record<string, number> & {
+            meals: Record<string, number>[];
+        };
+
+        expect(macroFields(day.body.totals as Record<string, number>)).toStrictEqual(expected);
+        expect(macroFields(historyDay)).toStrictEqual(expected);
+        expect(macroFields(historyDay.meals[0])).toStrictEqual(expected);
+    });
+
+    it('agrees with the day read´s own per-meal totals too', async () => {
+        // The fourth reader of the same rule: the day read sums each bucket in
+        // JavaScript, and the history breakdown sums the same rows in SQL.
+        const day = await asUser(request.get(`/api/macros/${HALF_DAY}`), owner).expect(200);
+        const breakfast = (day.body.meals as { name: string; totals: Record<string, number> }[]).find(
+            (meal) => meal.name === 'Breakfast',
+        );
+
+        expect(macroFields(breakfast?.totals ?? {})).toStrictEqual(HALF_TOTALS);
     });
 });
 
@@ -3345,3 +3599,99 @@ describe('the neighbours this feature did not touch', () => {
     });
 });
 
+
+// ==========================================================================
+// The two legacy reads that lazily WRITE, for a principal with no users row.
+//
+// `GET /api/macros/:date` backfills the four meal buckets and `GET /api/foods`
+// seeds the four starter foods, so both are writes the first time a caller
+// reaches them — and both inserted a `user_id`-keyed row with no existence
+// check. A Firebase identity that never completed `POST /api/user` (a sign-up
+// abandoned between the two calls) therefore hit the foreign key to `users`,
+// which surfaced as an unmapped Prisma P2003 and answered `500` for a permanent
+// condition that wrote nothing, while `PUT /api/user/targets` has always
+// answered `404 {"error":"User not found"}` for exactly that caller.
+//
+// These cases pin the three things that decision consists of: the status and the
+// body are the ones the shipped sibling route already returns (not a new coded
+// envelope — this is the legacy human-message family), nothing is written for
+// the refused caller, and a provisioned caller's responses are untouched,
+// because the guard sits on the insert path and not in front of the read.
+// ==========================================================================
+
+describe('the legacy reads that lazily write, for an unprovisioned principal', () => {
+    const ORPHAN = { uid: 'compat-orphan-principal' };
+    const USER_NOT_FOUND_BODY = { error: 'User not found' };
+
+    beforeEach(async () => {
+        await truncateFeatureTables();
+    });
+
+    afterAll(async () => {
+        await truncateFeatureTables();
+    });
+
+    it.each([
+        ['the day read', `/api/macros/${DAY_KEY}`],
+        ['the food library read', '/api/foods'],
+    ])('answers %s with the sibling route´s 404, byte for byte', async (_case, path) => {
+        expect(await prisma.users.count({ where: { id: ORPHAN.uid } })).toBe(0);
+
+        const response = await asUser(request.get(path), ORPHAN).expect(404);
+
+        expect(response.body).toStrictEqual(USER_NOT_FOUND_BODY);
+    });
+
+    it('agrees with PUT /api/user/targets, which has always answered that', async () => {
+        // The control: the route that was already graceful for this caller. The
+        // two reads above now answer what it answers, so the API no longer
+        // contradicts itself route by route for one condition.
+        const response = await asUser(request.put('/api/user/targets').send({ calories: 2000 }), ORPHAN).expect(404);
+
+        expect(response.body).toStrictEqual(USER_NOT_FOUND_BODY);
+    });
+
+    it('writes nothing for the refused caller', async () => {
+        await asUser(request.get(`/api/macros/${DAY_KEY}`), ORPHAN).expect(404);
+        await asUser(request.get('/api/foods'), ORPHAN).expect(404);
+
+        // The guard runs BEFORE each insert, so the refusal is not a partially
+        // applied write: no buckets, no starter foods, and no user row invented
+        // to make the insert legal.
+        expect(await prisma.users.count({ where: { id: ORPHAN.uid } })).toBe(0);
+        expect(await prisma.meals.count({ where: { user_id: ORPHAN.uid } })).toBe(0);
+        expect(await prisma.foods.count({ where: { user_id: ORPHAN.uid } })).toBe(0);
+    });
+
+    it('leaves a provisioned caller´s responses exactly as they were', async () => {
+        const user = await makeUser();
+        const owner = { uid: user.id };
+
+        const day = await asUser(request.get(`/api/macros/${DAY_KEY}`), owner).expect(200);
+        const foods = await asUser(request.get('/api/foods'), owner).expect(200);
+        const secondDay = await asUser(request.get(`/api/macros/${DAY_KEY}`), owner).expect(200);
+
+        expect((day.body.meals as { name: string }[]).map((meal) => meal.name)).toEqual([
+            'Breakfast',
+            'Lunch',
+            'Dinner',
+            'Snack',
+        ]);
+        // Sorted, because the four starter rows are written by one `createMany`
+        // and share a `created_at`, so the library's `created_at DESC` order
+        // does not distinguish them. The contract here is that all four are
+        // still seeded, which is what the guard must not have changed.
+        expect((foods.body.foods as { name: string }[]).map((food) => food.name).sort()).toEqual([
+            'Apple',
+            'Chicken Breast',
+            'Egg',
+            'Peanut Butter',
+        ]);
+        expect(foods.body.pagination).toStrictEqual({ page: 1, limit: 25, total: 4, totalPages: 1 });
+        // The backfill stays idempotent: the second read asks the guard nothing
+        // because nothing is missing, and returns the same four bucket ids.
+        expect((secondDay.body.meals as { id: string }[]).map((meal) => meal.id)).toEqual(
+            (day.body.meals as { id: string }[]).map((meal) => meal.id),
+        );
+    });
+});

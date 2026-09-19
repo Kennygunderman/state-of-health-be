@@ -108,6 +108,7 @@ import readline from 'readline';
 
 import {
     CatalogLoadError,
+    catalogLoadErrorFields,
     describeFailure,
     parseArgs,
     preflight,
@@ -132,7 +133,7 @@ import {
     entryScriptName,
     evaluateScriptDatabase,
 } from '../../../scripts/lib/dbGuard';
-import { createLogger } from '../../../scripts/lib/logger';
+import { UNEXPECTED_FAILURE_REMEDY, classifyInfrastructureFailure, createLogger } from '../../../scripts/lib/logger';
 import type { ScriptLogger } from '../../../scripts/lib/logger';
 import {
     ManifestError,
@@ -811,6 +812,24 @@ describe('a tampered release is refused with nothing written', () => {
         const refusal = failure as CatalogLoadError;
         expect(refusal.code).toBe('release_file_digest_mismatch');
         expect(refusal.context.file).toBe(member);
+
+        // What the OPERATOR is shown for this same real refusal, from the same
+        // reporter `main`'s catch spreads onto the `stage_failed` line. The
+        // assertions above prove the thrown error knows which member is wrong;
+        // this one proves the line says so, which is the half that used to be
+        // missing — the report was the code and the class and nothing else, on
+        // a refusal whose repair is to re-cut one named file.
+        const reported = describeFailure(refusal);
+        expect(reported.code).toBe('release_file_digest_mismatch');
+        expect(reported.detail).toMatchObject({
+            file: member,
+            // The digests are reported as the same 12-character prefix the
+            // refusal's own sentence shows: the logger redacts any opaque run
+            // of 40 or more, so a full SHA-256 forwarded verbatim would reach
+            // the operator as `***`. The full values stay on `context`.
+            expected: `${(refusal.context.expected as string).slice(0, 12)}…`,
+            observed: `${(refusal.context.observed as string).slice(0, 12)}…`,
+        });
 
         // The whole claim: verification runs before the first write, so a
         // tampered release leaves the target database exactly as it was —
@@ -3890,6 +3909,346 @@ describe('the command line', () => {
         expect(described.code).toBe('release_file_digest_mismatch');
         expect(described.error.name).toBe('CatalogLoadError');
         expect(describeFailure(new TypeError('something else')).code).toBe('unexpected_error');
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * What a failure tells the operator
+ *
+ * `describeFailure` is the whole of what an operator sees when this stage
+ * stops: `main`'s catch prints its `code`, its `error` and spreads its
+ * `detail`, and that line is also what reaches `catalog_import_runs.log`. Two
+ * halves of it were empty.
+ *
+ * A REFUSAL reported its code and its class and nothing else, while the
+ * `CatalogLoadError` it came from already carried the member, the line, the key
+ * and both sides of whatever disagreed — so the operator was told a release was
+ * wrong and not which line to repair, on the one failure class whose repair is
+ * editing exactly one line.
+ *
+ * An INFRASTRUCTURE failure was reported as `unexpected_error` with a `name` of
+ * the literal lower-case `'error'`, because the load takes its stage lock
+ * through a raw `pg` session before Prisma exists to translate anything, so
+ * what arrives carries a SQLSTATE and no class this file knows. Four failures
+ * whose remedies could not be further apart — a connection limit, a missing
+ * database, a rejected password, a refused statement — arrived identically and
+ * remedy-less.
+ *
+ * Both are asserted here against `describeFailure` directly, because the defect
+ * was in how the reporter composed what it was given; the refusal arm is
+ * additionally asserted against a REAL thrown error in "a tampered release is
+ * refused with nothing written" above, and against the CLI in the evidence for
+ * this change.
+ * ------------------------------------------------------------------------- */
+
+describe('what a failure tells the operator', () => {
+    // A DSN whose password itself contains an `@`, so the redaction boundary
+    // being asserted is the LAST `@` of the authority rather than the first.
+    // Not any credential that opens anything — least of all the one this suite
+    // connects with.
+    const DSN_WITH_AT_IN_PASSWORD = 'postgresql://user:pa@ss@localhost:5433/db';
+    const DSN_REDACTED = 'postgresql://***@localhost:5433/db';
+
+    // Every fragment of that credential. Two of them are two characters long,
+    // so this list is aimed at a forwarded VALUE and never at a rendered
+    // document: `ss` occurs in the field name `firstPartyMessage`, and applying
+    // it to `JSON.stringify(described)` would assert about the member's name
+    // rather than about the credential.
+    const CREDENTIAL_FRAGMENTS: readonly string[] = ['pa@ss', 'pa', 'ss', 'user:', 'user'];
+
+    const expectNoCredentialFragment = (value: string): void => {
+        for (const fragment of CREDENTIAL_FRAGMENTS) {
+            expect(value).not.toContain(fragment);
+        }
+    };
+
+    describe('a refusal raised during the release walk', () => {
+        it('names the member, the line and both keys a composition refusal is about', () => {
+            // The shape `release_components_not_closed` really throws: the
+            // release states a composition whose component it does not publish,
+            // and the repair is to publish that component or cut the release
+            // again — which requires knowing both keys and the line.
+            const described = describeFailure(
+                new CatalogLoadError(
+                    'release_components_not_closed',
+                    'components.jsonl line 3 names a component foods.jsonl does not publish',
+                    {
+                        file: COMPONENTS_FILE,
+                        line: 3,
+                        sourceKey: 'qa:derived:garlic-onion-blend:prepared',
+                        componentSourceKey: 'usda:999999999',
+                    },
+                ),
+            );
+
+            expect(described.code).toBe('release_components_not_closed');
+            expect(described.error.name).toBe('CatalogLoadError');
+            expect(described.detail).toEqual({
+                file: COMPONENTS_FILE,
+                line: 3,
+                sourceKey: 'qa:derived:garlic-onion-blend:prepared',
+                componentSourceKey: 'usda:999999999',
+                firstPartyMessage: 'components.jsonl line 3 names a component foods.jsonl does not publish',
+            });
+        });
+
+        it('carries both sides of a count that disagrees, as the numbers they are', () => {
+            // `count_verification_failed` is the refusal AFTER the writes, and
+            // the two numbers are the whole of it: an operator compares them to
+            // the manifest to see whether the release or the database is wrong.
+            // They travel as numbers rather than inside a sentence, so a reader
+            // of `catalog_import_runs.log` can index on them.
+            const described = describeFailure(
+                new CatalogLoadError('count_verification_failed', 'published_foods disagrees with the manifest', {
+                    expected: 10928,
+                    observed: 10927,
+                }),
+            );
+
+            expect(described.detail?.expected).toBe(10928);
+            expect(described.detail?.observed).toBe(10927);
+        });
+
+        it('reports a digest as a prefix, because the logger redacts a full one', () => {
+            // MEASURED AT THE CLI, not reasoned about: forwarding the 64
+            // characters verbatim printed `"expected":"***"`, because the last
+            // rule in SCRUB_RULES redacts any opaque run of 40 or more — the
+            // reported value lost a second time, on the field the operator
+            // compares against the manifest. Twelve characters plus an ellipsis
+            // is what the refusal's own sentence already shows and survives the
+            // rule intact; the full digests stay on the error's `context`.
+            const expected = '25e4f8233c83a5166dbd494f60a52e6a920a4284e8e515c1c634a0f142c4dc2e';
+            const observed = '43dfec62537b9e1a4e0e9b1ec7a0eb44e0e4ba4e6c3a2cfe9ad9e1cbb9f5e0d1';
+            const described = describeFailure(
+                new CatalogLoadError('release_file_digest_mismatch', 'aliases.jsonl does not match the manifest', {
+                    file: ALIASES_FILE,
+                    expected,
+                    observed,
+                }),
+            );
+
+            expect(described.detail?.expected).toBe('25e4f8233c83…');
+            expect(described.detail?.observed).toBe('43dfec62537b…');
+
+            // And asserted where it actually matters: through the logger that
+            // writes the line, which is the component that applies the rule.
+            const lines: string[] = [];
+            const recorder = createLogger('catalog-load', {
+                level: 'debug',
+                write: (line: string): void => {
+                    lines.push(line);
+                },
+                now: () => NOW,
+            });
+            recorder.error('stage_failed', { stage: 'catalog-load', code: described.code, ...described.detail });
+            const entry = JSON.parse(lines[0]) as Record<string, unknown>;
+
+            expect(entry.expected).toBe('25e4f8233c83…');
+            expect(entry.observed).toBe('43dfec62537b…');
+            expect(lines[0]).not.toContain('***');
+        });
+
+        it('omits the members a refusal does not have, rather than reporting them as undefined', () => {
+            // These fields are spread onto a log line and into a JSONB column,
+            // where `"line":undefined` reads as a line number that was lost
+            // rather than one that never applied — the same convention
+            // `safeError` and `checkpointErrorFields` follow.
+            const described = describeFailure(
+                new CatalogLoadError('release_line_invalid_json', 'foods.jsonl line 10 is not JSON', {
+                    file: FOODS_FILE,
+                    line: 10,
+                }),
+            );
+
+            expect(Object.keys(described.detail ?? {}).sort()).toEqual(['file', 'firstPartyMessage', 'line']);
+            expect(JSON.stringify(described)).not.toContain('undefined');
+        });
+
+        it('reports no context at all for a refusal that carries none', () => {
+            // The codes fail at different granularities, so an empty context is
+            // a legitimate state — and it must produce an empty field set, not
+            // six absent ones.
+            expect(catalogLoadErrorFields(new CatalogLoadError('release_id_mismatch', 'the manifest names v2'))).toEqual(
+                {},
+            );
+        });
+
+        it('forwards the sentence this file composed, which is the half that says what to do', () => {
+            // `safeError` carries no `message`, and that rule is about text this
+            // repository did not author. A load refusal is the opposite case:
+            // the sentence was composed here against a typed context and names
+            // the repair, so it travels under a member named for its provenance.
+            const described = describeFailure(
+                new CatalogLoadError(
+                    'release_duplicate_food',
+                    'foods.jsonl line 10 repeats source_key usda:2708869; re-cut the release',
+                    { file: FOODS_FILE, line: 10, sourceKey: 'usda:2708869' },
+                ),
+            );
+
+            expect(described.detail?.firstPartyMessage).toBe(
+                'foods.jsonl line 10 repeats source_key usda:2708869; re-cut the release',
+            );
+            expect(described.error).not.toHaveProperty('message');
+        });
+
+        it('scrubs that sentence even though this repository wrote it', () => {
+            // The narrowing obligation is not the only defence: a first-party
+            // message can still interpolate a DSN, and a refusal that mentions
+            // the target would.
+            const described = describeFailure(
+                new CatalogLoadError('release_file_unreadable', `reading through ${DSN_WITH_AT_IN_PASSWORD} failed`),
+            );
+
+            expect(described.detail?.firstPartyMessage).toBe(`reading through ${DSN_REDACTED} failed`);
+            expectNoCredentialFragment(String(described.detail?.firstPartyMessage));
+            // The whole reported document, checked for the fragments that cannot
+            // occur in a field name — see CREDENTIAL_FRAGMENTS for why the
+            // stricter list is aimed at the value instead.
+            for (const fragment of ['pa@ss', 'user:', ':pa']) {
+                expect(JSON.stringify(described)).not.toContain(fragment);
+            }
+        });
+
+        it('withholds a database-origin refusal’s sentence, because it names the target', () => {
+            const described = describeFailure(
+                new DatabaseOriginError(
+                    'DATABASE_URL names database "state_of_health" on host "db.example.com"',
+                    'unrecognised_origin',
+                    classifyDatabaseOrigin('postgresql://svc:secret@db.example.com:5432/state_of_health'),
+                ),
+            );
+
+            expect(described.code).toBe('unrecognised_origin');
+            expect(described.detail).toBeUndefined();
+            // dbGuard reports this refusal itself, with the target reduced to a
+            // digest. Forwarding the sentence would publish the topology that
+            // line takes care to withhold.
+            expect(JSON.stringify(described)).not.toContain('db.example.com');
+            expect(JSON.stringify(described)).not.toContain('state_of_health');
+        });
+    });
+
+    describe('a database that will not serve the load', () => {
+        const driverFailure = (sqlState: string): Error => {
+            // The shape node-postgres really throws: `name` is the literal
+            // lower-case `'error'`, the SQLSTATE is on `code`, and the sentence
+            // quotes the connection target. A real one is driven against
+            // PostgreSQL at the CLI; what matters here is that this stage's
+            // reporter answers it, and that is decided by these two members.
+            const error = new Error(`connection failure to database "soh_example_dev" (${sqlState})`);
+            error.name = 'error';
+            (error as unknown as { code: string }).code = sqlState;
+
+            return error;
+        };
+
+        it('names a refused connection rather than reporting a surprise', () => {
+            const described = describeFailure(driverFailure('53300'));
+
+            expect(described.code).toBe('database_unavailable');
+            // The SQLSTATE survives beside the name, which is the one
+            // machine-readable fact the driver supplied — and the whole of what
+            // `{"name":"error"}` used to be.
+            expect(described.error).toEqual({ name: 'error', code: '53300' });
+            expect(String(described.detail?.remedy)).toContain('DATABASE_URL');
+        });
+
+        it('adds what the shared remedy cannot know: this load is repaired by re-running it', () => {
+            // The taxonomy lives in logger.ts so every stage answers alike; the
+            // clause is appended here because only this file knows that a failed
+            // load leaves the pointer where it was and that its rerun continues
+            // from the checkpoint.
+            const remedy = String(describeFailure(driverFailure('08006')).detail?.remedy);
+
+            expect(remedy).toContain('active release pointer');
+            expect(remedy).toContain('re-running the same command is the repair');
+            // And it names NO FLAG: the import stage's clause tells an operator
+            // to re-run with `--resume`, and this stage has no such flag. A
+            // remedy naming a flag the stage would reject is worse than none.
+            expect(remedy).not.toContain('--resume');
+        });
+
+        it.each([
+            ['3D000', 'database_missing', 'a database that does not exist'],
+            ['28P01', 'database_authentication_failed', 'a rejected password'],
+            ['42P01', 'database_error', 'a target that was never migrated'],
+        ])('reports SQLSTATE %s as %s — %s', (sqlState, expected) => {
+            const described = describeFailure(driverFailure(sqlState));
+
+            expect(described.code).toBe(expected);
+            expect(described.error.code).toBe(sqlState);
+            expect(String(described.detail?.remedy).length).toBeGreaterThan(0);
+        });
+
+        it('gives the same answer when Prisma is the client that failed', () => {
+            // Two clients reach the same database during a load — the raw `pg`
+            // session that holds the stage lock and the Prisma client that
+            // writes — and an operator's fix does not depend on which noticed.
+            const prismaFailure = new Error('cannot reach database server');
+            prismaFailure.name = 'PrismaClientInitializationError';
+            (prismaFailure as unknown as { code: string }).code = 'P1001';
+
+            expect(describeFailure(prismaFailure).code).toBe('database_unavailable');
+        });
+
+        it('does not file a Prisma query error as infrastructure', () => {
+            // P2002 is a unique-constraint violation: a defect in this stage's
+            // own data or logic wearing a database code. Reporting it under the
+            // one heading an operator reads as "not your code" would send them
+            // to the wrong place, so it stays unclassified — with the code still
+            // reported, because `safeError` carries it.
+            const violation = new Error('unique constraint failed');
+            violation.name = 'PrismaClientKnownRequestError';
+            (violation as unknown as { code: string }).code = 'P2002';
+
+            const described = describeFailure(violation);
+
+            expect(described.code).toBe('unexpected_error');
+            expect(described.error.code).toBe('P2002');
+            expect(described.detail?.remedy).toBe(UNEXPECTED_FAILURE_REMEDY);
+        });
+
+        it('reports no driver sentence on any of them, so the widening cost nothing', () => {
+            // The remedy is fixed prose from this repository and the SQLSTATE is
+            // five characters the driver assigned. Neither is vendor text, and
+            // the driver's own sentence — which quotes the database it could not
+            // reach — is still absent.
+            const described = describeFailure(driverFailure('3D000'));
+
+            expect(described.error).not.toHaveProperty('message');
+            expect(JSON.stringify(described)).not.toContain('connection failure');
+            expect(JSON.stringify(described)).not.toContain('soh_example_dev');
+        });
+
+        it('leaves both the taxonomy branch and the fallback reachable', () => {
+            // Anti-vacuity, asserted through the classifier itself rather than
+            // through a neutralised constant: the branch is only meaningful if
+            // it answers for a driver failure and declines for everything else,
+            // and the fallback is only reachable because it declines.
+            expect(classifyInfrastructureFailure(driverFailure('53300'))).not.toBeNull();
+            expect(classifyInfrastructureFailure(new TypeError('cannot read properties of undefined'))).toBeNull();
+
+            const unclassified = describeFailure(new TypeError('cannot read properties of undefined'));
+            expect(unclassified.code).toBe('unexpected_error');
+            expect(unclassified.detail?.remedy).toBe(UNEXPECTED_FAILURE_REMEDY);
+        });
+
+        it('does not shadow this stage’s own refusals, which carry no SQLSTATE', () => {
+            // The branch sits immediately before the fallback for this reason:
+            // a `CatalogLoadError` must keep reporting its own code and context
+            // even though the failure it describes happened while a database
+            // connection was open.
+            const described = describeFailure(
+                new CatalogLoadError('component_reference_unresolved', 'the composition cannot be resolved', {
+                    sourceKey: 'ai:prepared_meal:herbed yogurt dip:prepared',
+                    componentSourceKey: 'usda:1104705',
+                }),
+            );
+
+            expect(described.code).toBe('component_reference_unresolved');
+            expect(described.detail?.sourceKey).toBe('ai:prepared_meal:herbed yogurt dip:prepared');
+        });
     });
 });
 

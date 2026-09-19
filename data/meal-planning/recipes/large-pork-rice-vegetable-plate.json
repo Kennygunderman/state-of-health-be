@@ -1,0 +1,107 @@
+{
+  "slug": "large-pork-rice-vegetable-plate",
+  "name": "Large pork, rice and vegetable plate",
+  "description": "Thin slices of pork tenderloin seared with garlic, cauliflower and red bell pepper, served over warm brown rice on one large plate in fifteen minutes.",
+  "iconKey": "fork_knife",
+  "instructions": [
+    "Slice the pork tenderloin thinly and chop the cauliflower and the bell pepper.",
+    "Warm the olive oil in a large skillet over medium-high heat, add the garlic and cook it for 30 seconds, until fragrant.",
+    "Add the pork tenderloin in a single layer and cook for 4 minutes, turning once, until it is cooked through.",
+    "Add the cauliflower and the bell pepper with the salt and the black pepper and cook for 5 minutes, until they are just tender.",
+    "Spread the warm brown rice over one large plate and spoon the pork and vegetables on top."
+  ],
+  "yieldServings": 1,
+  "servingDescription": "1 large plate",
+  "prepMinutes": 5,
+  "cookMinutes": 10,
+  "mealSlots": [
+    "lunch",
+    "dinner"
+  ],
+  "dietTags": [
+    "gluten_free"
+  ],
+  "allergenTags": [],
+  "allergenStatus": "known",
+  "budgetTier": 2,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "dairy_free",
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:168249",
+      "quantity": 9.5,
+      "unit": "oz",
+      "gramWeight": 268.375,
+      "displayText": "9½ oz",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169704",
+      "quantity": 1.25,
+      "unit": "cup",
+      "gramWeight": 252.5,
+      "displayText": "1¼ cups",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169986",
+      "quantity": 1,
+      "unit": "cup",
+      "gramWeight": 107.0,
+      "displayText": "1 cup, chopped",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170108",
+      "quantity": 0.5,
+      "unit": "cup",
+      "gramWeight": 74.5,
+      "displayText": "½ cup, chopped",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169230",
+      "quantity": 2,
+      "unit": "clove",
+      "gramWeight": 6.0,
+      "displayText": "2 cloves",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 1.25,
+      "unit": "tbsp",
+      "gramWeight": 16.875,
+      "displayText": "1¼ tbsp",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170931",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 1.15,
+      "displayText": "½ tsp",
+      "sortOrder": 6,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 3.0,
+      "displayText": "½ tsp",
+      "sortOrder": 7,
+      "isOptional": false
+    }
+  ]
+}

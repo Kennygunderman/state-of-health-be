@@ -179,7 +179,16 @@ export const MAX_RECIPE_USES_PER_WEEK = 2;
  */
 export const MIN_ELIGIBLE_RECIPES_PER_SLOT = 4;
 
-/** Evaluation budgets. Placing one candidate in one slot is one evaluation. */
+/**
+ * Evaluation budgets, in units of search work.
+ *
+ * Placing one candidate in one slot is one evaluation, and so is proving a
+ * whole day unfillable before any candidate is placed — the two things the
+ * search can spend time on. Charging both is what makes these two numbers bound
+ * the search rather than merely bound its placements; see `solveDay`. Work that
+ * proves nothing about arithmetic is free: a slot with no candidate at all, and
+ * a branch the bounds discard before it is placed.
+ */
 export const MAX_EVALUATIONS_PER_DAY = 2000;
 export const MAX_EVALUATIONS_PER_PLAN = 14000;
 
@@ -1259,6 +1268,15 @@ const EMPTY_RECIPE_IDS: ReadonlySet<string> = new Set<string>();
  * reason, and the price of it was a feasible week answered with
  * `422 no_matching_meals`.
  *
+ * Its ABSENCE here is not indifference to the same dish twice in one day.
+ * Leaving the rule as §0.7.3 writes it had every third planned week serving one
+ * recipe at two of its slots — legal, and still poor. The preference is
+ * expressed where a preference belongs: in the MOVE ORDER, and in the two
+ * passes `searchPlanWeek`'s `solveDay` runs, which offer a day's distinct
+ * assignments first and reopen the legal pair only for a day that cannot be
+ * filled any other way. A rule refuses weeks; an order only chooses between
+ * them, and only the second can prefer variety without ever costing a week.
+ *
  * A HARD eligibility test for the slot, deliberately NOT a soft score penalty.
  * A penalty would let a sufficiently attractive recipe appear five times, and
  * the whole point is that it cannot.
@@ -1476,6 +1494,69 @@ export interface DayToleranceVerdict {
     breaches: DayToleranceBreach[];
 }
 
+/** The inclusive interval one of a day's four values must land in. */
+export interface DayToleranceBand {
+    low: number;
+    high: number;
+}
+
+/** The four bands of §3.6, in `calories, protein, carbs, fat` order. */
+export interface DayToleranceBands {
+    calories: DayToleranceBand;
+    protein: DayToleranceBand;
+    carbs: DayToleranceBand;
+    fat: DayToleranceBand;
+}
+
+/**
+ * The four accepted intervals, derived once from the targets.
+ *
+ * ONE derivation, TWO readers, and that is the whole point of extracting it.
+ * {@link evaluateDayTolerance} judges a completed day against these bands, and
+ * the search's admissibility bound asks whether a partial day can still REACH
+ * them. Written twice, the two would drift, and a drifted bound is the worst
+ * kind: it would prune branches the tolerance would have accepted and the
+ * failure would surface as a refusal for a week that fits.
+ *
+ * `TOLERANCE_EPSILON` is folded INTO the bounds rather than left to each
+ * comparison, so every reader compares strictly (`< low`, `> high`) and none
+ * can forget the slack. The bands are therefore inclusive of the policy bound
+ * in §3.6's sense: a day landing exactly on it is inside.
+ *
+ * Each target is guarded in `calories, protein, carbs, fat` order, so an
+ * unusable target is named the same way whichever reader reached it first.
+ */
+export const dayToleranceBands = (targets: MealPlanMacroTotals): DayToleranceBands => {
+    const calorieTarget = requirePositiveTarget(targets.calories, 'targets.calories');
+    const proteinTarget = requirePositiveTarget(targets.protein, 'targets.protein');
+    const carbsTarget = requirePositiveTarget(targets.carbs, 'targets.carbs');
+    const fatTarget = requirePositiveTarget(targets.fat, 'targets.fat');
+
+    const calorieBand = CALORIE_TOLERANCE_RATIO * calorieTarget;
+    const carbsBand = Math.max(MACRO_TOLERANCE_ABSOLUTE_G, MACRO_TOLERANCE_RATIO * carbsTarget);
+    const fatBand = Math.max(MACRO_TOLERANCE_ABSOLUTE_G, MACRO_TOLERANCE_RATIO * fatTarget);
+
+    return {
+        calories: {
+            low: calorieTarget - calorieBand - TOLERANCE_EPSILON,
+            high: calorieTarget + calorieBand + TOLERANCE_EPSILON,
+        },
+        // Asymmetric on purpose — see `evaluateDayTolerance`.
+        protein: {
+            low: proteinTarget - PROTEIN_TOLERANCE_UNDER_G - TOLERANCE_EPSILON,
+            high: proteinTarget + PROTEIN_TOLERANCE_OVER_G + TOLERANCE_EPSILON,
+        },
+        carbs: {
+            low: carbsTarget - carbsBand - TOLERANCE_EPSILON,
+            high: carbsTarget + carbsBand + TOLERANCE_EPSILON,
+        },
+        fat: {
+            low: fatTarget - fatBand - TOLERANCE_EPSILON,
+            high: fatTarget + fatBand + TOLERANCE_EPSILON,
+        },
+    };
+};
+
 /**
  * Whether a COMPLETED day's totals are acceptable.
  *
@@ -1490,18 +1571,22 @@ export interface DayToleranceVerdict {
  *    impossible to hit with whole recipes, and the relative band keeps a large
  *    one from being trivial.
  *
- * Applied only to a finished day. Nothing here judges a partial day — that is
- * what the guidance shares are for — and no candidate is ever refused by this
- * function.
+ * Applied only to a finished day, and the ONLY acceptance test there is. No
+ * candidate is ever refused by this function.
+ *
+ * A partial day is judged in one narrower sense and no other: {@link
+ * canReachDayBands} asks whether the slots still to be filled could carry the
+ * day into these same bands, and cuts the branch when they provably cannot.
+ * That is a REACHABILITY test over the identical intervals — see {@link
+ * dayToleranceBands}, which both read — never a verdict on the partial totals
+ * themselves. The guidance shares remain the only thing with an opinion about
+ * how a half-built day ought to look, and they only order moves.
  */
 export const evaluateDayTolerance = (
     totals: MealPlanMacroTotals,
     targets: MealPlanMacroTotals,
 ): DayToleranceVerdict => {
-    const calorieTarget = requirePositiveTarget(targets.calories, 'targets.calories');
-    const proteinTarget = requirePositiveTarget(targets.protein, 'targets.protein');
-    const carbsTarget = requirePositiveTarget(targets.carbs, 'targets.carbs');
-    const fatTarget = requirePositiveTarget(targets.fat, 'targets.fat');
+    const bands = dayToleranceBands(targets);
 
     // Targets are judged first and on stricter terms — a target must be a
     // usable number to plan against, where a total need only be a number. Both
@@ -1515,24 +1600,22 @@ export const evaluateDayTolerance = (
 
     const breaches: DayToleranceBreach[] = [];
 
-    if (Math.abs(calories - calorieTarget) > CALORIE_TOLERANCE_RATIO * calorieTarget + TOLERANCE_EPSILON) {
+    // Each comparison is strict because `dayToleranceBands` has already folded
+    // `TOLERANCE_EPSILON` into the bounds; the bands stay inclusive of the
+    // policy bound and no reader has to remember the slack.
+    if (calories < bands.calories.low || calories > bands.calories.high) {
         breaches.push('calories');
     }
 
-    if (
-        protein < proteinTarget - PROTEIN_TOLERANCE_UNDER_G - TOLERANCE_EPSILON ||
-        protein > proteinTarget + PROTEIN_TOLERANCE_OVER_G + TOLERANCE_EPSILON
-    ) {
+    if (protein < bands.protein.low || protein > bands.protein.high) {
         breaches.push('protein');
     }
 
-    const carbsBand = Math.max(MACRO_TOLERANCE_ABSOLUTE_G, MACRO_TOLERANCE_RATIO * carbsTarget);
-    if (Math.abs(carbs - carbsTarget) > carbsBand + TOLERANCE_EPSILON) {
+    if (carbs < bands.carbs.low || carbs > bands.carbs.high) {
         breaches.push('carbs');
     }
 
-    const fatBand = Math.max(MACRO_TOLERANCE_ABSOLUTE_G, MACRO_TOLERANCE_RATIO * fatTarget);
-    if (Math.abs(fat - fatTarget) > fatBand + TOLERANCE_EPSILON) {
+    if (fat < bands.fat.low || fat > bands.fat.high) {
         breaches.push('fat');
     }
 
@@ -1725,6 +1808,447 @@ const resolveEvaluationBudget = (supplied: number | undefined, fallback: number,
 };
 
 /**
+ * What the slots a day has not filled yet can still contribute to its totals.
+ *
+ * `min` and `max` are per-nutrient sums over the remaining slots, each taken
+ * across that slot's WHOLE candidate pool. The two flags say whether the sums
+ * mean anything:
+ *  - `reachable` is false when some remaining slot has no candidate at all, so
+ *    the day cannot be completed however the earlier slots are filled;
+ *  - `bounded` is false when some remaining contribution is not a finite
+ *    number, so the sums cannot be trusted and no arithmetic conclusion may be
+ *    drawn from them.
+ */
+export interface RemainingContributionBounds {
+    reachable: boolean;
+    bounded: boolean;
+    min: MealPlanMacroTotals;
+    max: MealPlanMacroTotals;
+}
+
+const MACRO_KEYS = ['calories', 'protein', 'carbs', 'fat'] as const;
+
+/** The widest and narrowest each nutrient can be across one slot's pool. */
+export const slotContributionBounds = (
+    pool: readonly PlanCandidate[],
+): RemainingContributionBounds => {
+    if (pool.length === 0) {
+        return {
+            reachable: false,
+            bounded: true,
+            min: { calories: 0, protein: 0, carbs: 0, fat: 0 },
+            max: { calories: 0, protein: 0, carbs: 0, fat: 0 },
+        };
+    }
+
+    const min: MealPlanMacroTotals = {
+        calories: Number.POSITIVE_INFINITY,
+        protein: Number.POSITIVE_INFINITY,
+        carbs: Number.POSITIVE_INFINITY,
+        fat: Number.POSITIVE_INFINITY,
+    };
+    const max: MealPlanMacroTotals = {
+        calories: Number.NEGATIVE_INFINITY,
+        protein: Number.NEGATIVE_INFINITY,
+        carbs: Number.NEGATIVE_INFINITY,
+        fat: Number.NEGATIVE_INFINITY,
+    };
+    let bounded = true;
+
+    for (const candidate of pool) {
+        for (const key of MACRO_KEYS) {
+            const value = candidate.nutrition[key];
+
+            if (!Number.isFinite(value)) {
+                // Left to the day-total guard to name, exactly as before this
+                // bound existed: a corrupt candidate is a data fault for
+                // `evaluateDayTolerance`'s reader to report, and pruning on a
+                // NaN would turn that fault into a silent refusal.
+                bounded = false;
+                continue;
+            }
+
+            min[key] = Math.min(min[key], value);
+            max[key] = Math.max(max[key], value);
+        }
+    }
+
+    return { reachable: true, bounded, min, max };
+};
+
+/**
+ * The per-slot bounds accumulated from the END of the day forwards.
+ *
+ * Entry `i` describes slots `i` onwards, so entry `slots.length` is the empty
+ * tail: nothing left to add, trivially reachable and bounded. Computed once per
+ * search rather than per visit — the pools do not change while a week is being
+ * built, so this is seven days' worth of arithmetic done once.
+ */
+export const remainingContributionBounds = (
+    perSlot: readonly RemainingContributionBounds[],
+): RemainingContributionBounds[] => {
+    const suffixes: RemainingContributionBounds[] = new Array(perSlot.length + 1);
+
+    suffixes[perSlot.length] = {
+        reachable: true,
+        bounded: true,
+        min: { calories: 0, protein: 0, carbs: 0, fat: 0 },
+        max: { calories: 0, protein: 0, carbs: 0, fat: 0 },
+    };
+
+    for (let index = perSlot.length - 1; index >= 0; index -= 1) {
+        const slot = perSlot[index];
+        const next = suffixes[index + 1];
+        const min: MealPlanMacroTotals = { calories: 0, protein: 0, carbs: 0, fat: 0 };
+        const max: MealPlanMacroTotals = { calories: 0, protein: 0, carbs: 0, fat: 0 };
+
+        for (const key of MACRO_KEYS) {
+            min[key] = slot.min[key] + next.min[key];
+            max[key] = slot.max[key] + next.max[key];
+        }
+
+        suffixes[index] = {
+            reachable: slot.reachable && next.reachable,
+            bounded: slot.bounded && next.bounded,
+            min,
+            max,
+        };
+    }
+
+    return suffixes;
+};
+
+/**
+ * Whether a day standing at `total` can still finish inside its bands.
+ *
+ * THE ADMISSIBILITY ARGUMENT, because the whole correctness of the search
+ * rests on it. The bounds are taken over each remaining slot's WHOLE pool,
+ * which is a SUPERSET of the candidates actually available on any given day
+ * (the repetition rule removes more as the week fills). A superset can only
+ * widen the reachable interval, so this predicate is OPTIMISTIC: whenever it
+ * answers false, no assignment of the remaining slots — under this pool or any
+ * subset of it — could have landed the day inside its bands. Cutting such a
+ * branch therefore removes only completions that do not exist. The move order,
+ * the scoring and "first feasible wins" are untouched, so the week this search
+ * returns is the week it would have returned without the bound; what changes is
+ * only how much work it does to get there.
+ *
+ * The converse is deliberately NOT claimed. A true answer means "not provably
+ * impossible", never "completable" — {@link evaluateDayTolerance} on the
+ * finished day remains the only acceptance test, and it is what refuses a day
+ * this predicate let through.
+ *
+ * Unsound inputs decline to conclude rather than guess: an unbounded remainder
+ * returns true and leaves the branch to be explored as it was before.
+ */
+export const canReachDayBands = (
+    total: MealPlanMacroTotals,
+    remaining: RemainingContributionBounds,
+    bands: DayToleranceBands,
+): boolean => {
+    if (!remaining.reachable) {
+        return false;
+    }
+
+    if (!remaining.bounded) {
+        return true;
+    }
+
+    for (const key of MACRO_KEYS) {
+        const value = total[key];
+
+        if (!Number.isFinite(value)) {
+            return true;
+        }
+
+        // The least this nutrient can still become already overshoots, or the
+        // most it can become still undershoots. Either way the band is out of
+        // reach for every completion of this branch.
+        if (value + remaining.min[key] > bands[key].high) {
+            return false;
+        }
+
+        if (value + remaining.max[key] < bands[key].low) {
+            return false;
+        }
+    }
+
+    return true;
+};
+
+/**
+ * Whether a COMPLETE day's four totals all sit inside their bands.
+ *
+ * The same judgement {@link evaluateDayTolerance} makes, reduced to a boolean
+ * and taken against bands already derived — which is what the two predicates
+ * below need, since both ask it of hypothetical days thousands of times and
+ * neither has any use for the breach list.
+ *
+ * Non-finite input returns TRUE, and that is deliberate rather than lax: these
+ * predicates exist to PRUNE, so declining to conclude has to mean "explore it",
+ * leaving a corrupt candidate to be named by `computeDayTotals` and
+ * `evaluateDayTolerance` on the real day. Pruning on a NaN would turn a data
+ * fault into a silent refusal with no row to point at.
+ */
+const isTotalWithinBands = (total: MealPlanMacroTotals, bands: DayToleranceBands): boolean => {
+    for (const key of MACRO_KEYS) {
+        const value = total[key];
+
+        if (!Number.isFinite(value)) {
+            return true;
+        }
+
+        if (value < bands[key].low || value > bands[key].high) {
+            return false;
+        }
+    }
+
+    return true;
+};
+
+/**
+ * Whether any single candidate in a day's LAST slot would land the day inside
+ * its bands.
+ *
+ * WHY THIS EXISTS BESIDE {@link canReachDayBands}. That predicate bounds each
+ * nutrient independently, so it admits a remainder no candidate actually has:
+ * "some dinner supplies between 300 and 900 kcal, and some dinner supplies
+ * between 20 and 60 g of fat" does not mean one dinner supplies both at once.
+ * On the penultimate slot that relaxation is the search's dominant cost — every
+ * lunch it lets through is PLACED, and therefore charged an evaluation, before
+ * the exact test one slot later finds nothing to follow it. With a dozen
+ * breakfasts and a hundred-odd lunches over a portion grid, a day can spend its
+ * whole allowance on prefixes that were never completable, and report the wall
+ * it hit as though the week were infeasible.
+ *
+ * The last slot needs no relaxation, because there is nothing after it to
+ * bound: the day's final total is `total` plus exactly one candidate's
+ * nutrition, so asking whether ANY candidate closes the day is an exact
+ * question over a finite pool, and answering it costs one pass over that pool.
+ *
+ * ADMISSIBILITY, on the same terms as {@link canReachDayBands}: `pool` is the
+ * slot's entry-time pool, a SUPERSET of what the repetition rule leaves
+ * available once the day's earlier slots are filled. A superset can only add
+ * candidates that might close the day, so a false answer means no completion
+ * exists under that pool or any subset of it — nothing reachable is cut. The
+ * converse is not claimed and not needed: a true answer only means this branch
+ * is not provably dead, and {@link evaluateDayTolerance} on the finished day
+ * remains the single acceptance test.
+ *
+ * Unsound inputs decline to conclude, exactly as the interval bound does: a
+ * candidate carrying a non-finite nutrient is treated as closing the day, so a
+ * corrupt row stays a data fault for {@link evaluateDayTolerance}'s reader to
+ * name rather than becoming a silent refusal here.
+ */
+export const someCandidateClosesDay = (
+    total: MealPlanMacroTotals,
+    pool: readonly PlanCandidate[],
+    bands: DayToleranceBands,
+): boolean => {
+    for (const key of MACRO_KEYS) {
+        if (!Number.isFinite(total[key])) {
+            return true;
+        }
+    }
+
+    for (const candidate of pool) {
+        if (
+            isTotalWithinBands(
+                {
+                    calories: total.calories + candidate.nutrition.calories,
+                    protein: total.protein + candidate.nutrition.protein,
+                    carbs: total.carbs + candidate.nutrition.carbs,
+                    fat: total.fat + candidate.nutrition.fat,
+                },
+                bands,
+            )
+        ) {
+            return true;
+        }
+    }
+
+    return false;
+};
+
+/**
+ * Whether ANY assignment of a day's slots, drawn from the pools given, lands
+ * the day inside its bands.
+ *
+ * WHY A WHOLE-DAY TEST EARNS ITS KEEP, when the two bounds above already prune
+ * inside the day. A day's allowance is spent one placement at a time, and a day
+ * that cannot be closed at all spends the whole allowance discovering it.
+ * That is not merely slow: running an allowance out ends the SEARCH (§0.7.3),
+ * so the one doomed day takes the week with it — and the days before it are
+ * never revisited, even though changing one of them is precisely what would
+ * have freed the recipes this day needed. A week that exists is then refused,
+ * and the refusal names `nutrition_tolerance` as though the targets were at
+ * fault.
+ *
+ * Asking the question ONCE, before the first placement, converts that
+ * catastrophe into an ordinary dead end: the day returns false for the price of
+ * a single evaluation rather than an allowance, the recursion unwinds into the
+ * previous day's next candidate, and the week-level allowance goes on buying
+ * week-level alternatives instead of being burned on a single impossible day.
+ * The budgets are untouched; what changes is that they are spent on days that
+ * can close.
+ *
+ * The caller charges that one evaluation — see `solveDay` — and charges it for
+ * a reason worth stating here, because it looks like bookkeeping and is not:
+ * every other dead end in the search costs at least one evaluation, and that is
+ * what makes the two allowances bound the search at all. A dead end answered
+ * for free would let the search re-enter a doomed day once per candidate of
+ * every day above it, with nothing but the wall clock to stop it. The one
+ * exception is a day with a structurally EMPTY slot, which is charged nothing
+ * because no search was possible: that is coverage rather than arithmetic, and
+ * `analyzeLimitingConstraints` answers it with `slot_coverage` alone.
+ *
+ * It is a SEARCH, not a formula, because feasibility couples the nutrients:
+ * this walks the slots in order, prunes each prefix with
+ * {@link canReachDayBands}, and settles the final slot exactly with
+ * {@link someCandidateClosesDay} — so it returns as soon as one witness exists
+ * and, in the common case, long before the pools are enumerated. No score is
+ * computed and no order is imposed: it answers only "does a witness exist",
+ * which is why it cannot influence WHICH week the search returns.
+ *
+ * ADMISSIBILITY, the same argument a third time: `pools` are the day's
+ * entry-time pools, a superset of what remains available as the day fills. A
+ * false answer therefore means no assignment exists under those pools or any
+ * subset, so the day is genuinely unfillable and cutting it removes nothing
+ * reachable. Unsound inputs decline to conclude — an unbounded or non-finite
+ * remainder makes the prunes answer true, and the walk then finds a witness or
+ * not on the arithmetic alone, exactly as the search itself would.
+ *
+ * The walk is bounded, and the bound is not merely a speed knob: stopping keeps
+ * the predicate sound but costs the shortcut, so a doomed day it declines to
+ * judge is discovered the expensive way instead. The reasoning and the
+ * measurements behind the figure are in the body, at its declaration.
+ *
+ * @param pools   Each slot's entry-time candidates, in slot order.
+ * @param bands   The day's tolerance bands, already derived from the targets.
+ * @param weekUsesByRecipeId How many times each recipe the WEEK has already
+ *   planned; the walk serves no recipe more often than §0.7.3's remaining
+ *   allowance permits, so a "witness" is never a day the search could not
+ *   actually build. Defaulted empty for callers testing a day in isolation.
+ */
+export const dayHasFeasibleAssignment = (
+    pools: readonly (readonly PlanCandidate[])[],
+    bands: DayToleranceBands,
+    weekUsesByRecipeId: ReadonlyMap<string, number> = new Map<string, number>(),
+): boolean => {
+    if (pools.length === 0) {
+        return false;
+    }
+
+    // Work this walk may do before it stops and says "explore it".
+    //
+    // Why a bound is needed: this walk is itself a search. On a pool where no
+    // assignment closes the day it enumerates prefixes to prove that, and the
+    // measured cost of one such proof on the shipped corpus runs to ~150,000
+    // steps. Unbounded, a few hundred of them spend the request's whole
+    // `PLAN_GENERATION_DEADLINE_MS` — and that deadline is a `502`, where the
+    // truthful answer is the `422` this predicate exists to make reachable.
+    //
+    // What the bound trades, stated plainly rather than waved away. Stopping
+    // keeps the predicate SOUND — it never answers `false` for a day that has a
+    // feasible assignment, so no week legal under §0.7.3 is made unreachable by
+    // it. What it can cost is the shortcut: a doomed day it declines to judge is
+    // discovered the expensive way instead, by the search spending evaluations
+    // on it, and a search that then runs out of allowance refuses. So the cap is
+    // outcome-relevant through the budget, not merely a speed knob, and it is
+    // set from measurement in both directions: the pools that need the proof to
+    // plan at all conclude within ~13,400 steps, while the pools that cost
+    // ~150,000 are refusals whatever is done with them.
+    //
+    // It is not a policy threshold and is deliberately not published as one: it
+    // names an amount of work, changes no rule, and appears in no response.
+    const MAX_FEASIBILITY_WALK_STEPS = 25000;
+    let steps = 0;
+
+    const suffixes = remainingContributionBounds(pools.map((pool) => slotContributionBounds(pool)));
+
+    if (!suffixes[0].reachable) {
+        return false;
+    }
+
+    const lastIndex = pools.length - 1;
+    // How many more times each recipe may be served THIS day, spent as the walk
+    // places and refunded as it unwinds. Without this the witness is allowed to
+    // serve one dish in every slot, which §0.7.3's two-use cap forbids — and
+    // that is not a hypothetical looseness but the exact case this check exists
+    // for: a week whose earlier days have spent the high-calorie recipes leaves
+    // a day that can only be "filled" by reusing one of them a third time, so a
+    // walk without accounting calls the day feasible and the search then pays
+    // its whole allowance discovering otherwise.
+    const remainingUses = new Map<string, number>();
+    const allowanceFor = (recipeId: string): number => {
+        const known = remainingUses.get(recipeId);
+
+        if (known !== undefined) {
+            return known;
+        }
+
+        const spent = weekUsesByRecipeId.get(recipeId) ?? 0;
+        const allowance = Math.max(0, MAX_RECIPE_USES_PER_WEEK - spent);
+
+        remainingUses.set(recipeId, allowance);
+
+        return allowance;
+    };
+
+    const walk = (slotIndex: number, total: MealPlanMacroTotals): boolean => {
+        for (const candidate of pools[slotIndex]) {
+            steps += 1;
+
+            if (steps > MAX_FEASIBILITY_WALK_STEPS) {
+                // Out of work, so the honest answer is "I do not know", and the
+                // only safe way to say that here is `true` — the day is handed
+                // to the search to settle the ordinary way. Every caller reads
+                // this as "explore", never as "a day exists".
+                return true;
+            }
+
+            const recipeId = candidate.recipe.recipe_id;
+
+            if (allowanceFor(recipeId) <= 0) {
+                continue;
+            }
+
+            const next: MealPlanMacroTotals = {
+                calories: total.calories + candidate.nutrition.calories,
+                protein: total.protein + candidate.nutrition.protein,
+                carbs: total.carbs + candidate.nutrition.carbs,
+                fat: total.fat + candidate.nutrition.fat,
+            };
+
+            if (slotIndex === lastIndex) {
+                // The final slot judged exactly: `next` IS a complete day.
+                if (isTotalWithinBands(next, bands)) {
+                    return true;
+                }
+
+                continue;
+            }
+
+            if (!canReachDayBands(next, suffixes[slotIndex + 1], bands)) {
+                continue;
+            }
+
+            remainingUses.set(recipeId, allowanceFor(recipeId) - 1);
+
+            if (walk(slotIndex + 1, next)) {
+                return true;
+            }
+
+            remainingUses.set(recipeId, allowanceFor(recipeId) + 1);
+        }
+
+        return false;
+    };
+
+    return walk(0, { calories: 0, protein: 0, carbs: 0, fat: 0 });
+};
+
+/**
  * Assigns every day of the week, or reports how it failed.
  *
  * THE OBJECTIVE IS "BEST-FIRST MOVE ORDER, FIRST FEASIBLE" — not a global
@@ -1740,9 +2264,17 @@ const resolveEvaluationBudget = (supplied: number | undefined, fallback: number,
  * The shape of the recursion, and why each piece is there:
  *  - days in DATE order, slots in SCHEDULE order, candidates in move order;
  *  - one *evaluation* is one candidate placed in one slot;
+ *  - a candidate whose branch PROVABLY cannot finish inside the day's bands is
+ *    not placed at all — see {@link canReachDayBands} for why cutting it
+ *    removes no completion that exists. It costs no evaluation, because
+ *    nothing was placed;
  *  - a day is accepted only when its LAST slot is filled AND the completed
  *    day passes {@link evaluateDayTolerance} — the guidance shares never
- *    accept or reject anything;
+ *    accept or reject anything, and neither does the bound above;
+ *  - within one slot, a recipe NOT yet used earlier today is tried before one
+ *    that has been. This is move ORDER and not a rule: §0.7.3's two clauses
+ *    stay the only hard ones, and a same-day pair is still reached by
+ *    backtracking when the day cannot close without it;
  *  - a slot with no candidate left backtracks to the previous slot's next
  *    candidate;
  *  - A DAY THAT DEAD-ENDS BACKTRACKS INTO THE PREVIOUS DAY, which is what
@@ -1777,6 +2309,9 @@ export const searchPlanWeek = (input: PlanSearchInput): PlanSearchOutcome => {
         'budget.perPlan',
     );
 
+    // The day's acceptance interval, derived once for the whole search.
+    const bands = dayToleranceBands(targets);
+
     const placed: PlannedMealAssignment[][] = dates.map(() => []);
     // Reference counts beside the per-day sets, for the same reason the
     // ingredient bookkeeping below has them: §0.7.3 permits a recipe in two
@@ -1791,6 +2326,38 @@ export const searchPlanWeek = (input: PlanSearchInput): PlanSearchOutcome => {
     const plannedFoodCounts = new Map<string, number>();
     const plannedFoodIds = new Set<string>();
     const evaluationsPerDay: number[] = dates.map(() => 0);
+
+    /**
+     * What each unfilled tail of slots can still contribute, as of the moment
+     * the day was entered — one entry per day, indexed by slot.
+     *
+     * Recomputed on ENTRY TO EACH DAY rather than once for the search, and that
+     * is what makes the bound bite where it matters. By day five the week has
+     * spent most recipes' two permitted uses, so a slot's genuinely available
+     * pool is a fraction of its whole one; a bound taken over the whole pool
+     * would promise calories the day cannot actually reach and prune almost
+     * nothing on exactly the days the search spends its budget on.
+     *
+     * Still a SUPERSET of what is available deeper in the day, so still
+     * admissible: within a day the only further exclusions come from the day's
+     * own placements, which can only remove candidates. A bound computed at
+     * entry therefore over-promises, never under-promises — see
+     * {@link canReachDayBands}. The same reasoning covers re-entry by
+     * backtracking: unwinding a later day only returns uses, so the entry-time
+     * bound of an earlier day stays a superset of its state on every revisit.
+     */
+    const dayRemainingBounds: RemainingContributionBounds[][] = dates.map(() => []);
+
+    /**
+     * The day's LAST slot pool as of the moment the day was entered — the pool
+     * {@link someCandidateClosesDay} asks its exact question over.
+     *
+     * Captured alongside {@link dayRemainingBounds} and from the same filtered
+     * lists, for the same reason and with the same admissibility: it is a
+     * superset of what is available once the day's earlier slots are placed, so
+     * the exact test over it is optimistic exactly as the interval bound is.
+     */
+    const dayFinalSlotPool: PlanCandidate[][] = dates.map(() => []);
 
     let evaluations = 0;
     let frontierDayIndex = 0;
@@ -1882,17 +2449,84 @@ export const searchPlanWeek = (input: PlanSearchInput): PlanSearchOutcome => {
         removeFoods(candidate);
     };
 
+    /**
+     * A move plus the only thing ordered ahead of its score: whether taking it
+     * would put a recipe on this day for the second time.
+     */
+    interface TieredMove {
+        repeatsToday: boolean;
+        repeatsThisWeek: boolean;
+        move: ScoredCandidate;
+    }
+
+    /**
+     * Variety first — today's, then the week's — and then the scored order.
+     *
+     * A candidate already on today's plate sorts behind every candidate that is
+     * not, whatever the two score. That makes same-day variety a PREFERENCE
+     * expressed in the order rather than a third repetition clause: the repeat
+     * is still in the list, still reached by backtracking, and still taken when
+     * the day cannot close without it — which is exactly what §0.7.3 permits
+     * and what the removed same-day ban used to refuse.
+     *
+     * THE WEEK TIER IS NOT COSMETIC, and it is the difference between finding a
+     * week and refusing one. §0.7.3 makes a recipe's two weekly uses a SCARCE
+     * RESOURCE, and `reuseBonus` actively rewards spending it: a recipe already
+     * on the list scores better, so the day that scored best is scored best
+     * again tomorrow. The result was a week whose third day was a copy of its
+     * first and whose fourth was a copy of its second — four days spending the
+     * two permitted uses of every recipe that could carry a large target — after
+     * which the remaining days had nothing left to reach the band with and the
+     * week was refused as though the targets were impossible. Trying an unused
+     * recipe before a used one defers that spending instead of front-loading
+     * it, which is the least-constraining choice and keeps the later days
+     * solvable.
+     *
+     * It cannot refuse a week, for the same reason the day tier cannot: a used
+     * recipe is still offered, still reached by backtracking, and still taken
+     * when nothing else closes the day. Only the order in which equally legal
+     * weeks are discovered changes. Inside a tier the comparison is the shipped
+     * one, so the scored order and its shuffle tie-break are untouched.
+     */
+    const compareTieredMoves = (left: TieredMove, right: TieredMove): number => {
+        if (left.repeatsToday !== right.repeatsToday) {
+            return left.repeatsToday ? 1 : -1;
+        }
+
+        if (left.repeatsThisWeek !== right.repeatsThisWeek) {
+            return left.repeatsThisWeek ? 1 : -1;
+        }
+
+        return compareCandidateMoves(left.move, right.move);
+    };
+
     const orderedMoves = (
         dayIndex: number,
-        slot: SlotSchedule,
+        slotIndex: number,
         cumulative: MealPlanMacroTotals,
+        allowSameDayRepeat: boolean,
     ): ScoredCandidate[] => {
+        const slot = slots[slotIndex];
         const previousDayRecipeIds = dayIndex > 0 ? dayRecipeIds[dayIndex - 1] : EMPTY_RECIPE_IDS;
+        const todaysRecipeIds = dayRecipeIds[dayIndex];
+        const remaining = dayRemainingBounds[dayIndex][slotIndex + 1];
         const pool = candidatesBySlot.get(slot.slot) ?? [];
-        const moves: ScoredCandidate[] = [];
+        // True when filling THIS slot leaves exactly the last one unfilled —
+        // the single case in which the day's remainder is one candidate's
+        // nutrition and can therefore be tested exactly rather than bounded.
+        const isPenultimateSlot = slotIndex + 1 === slots.length - 1;
+        const moves: TieredMove[] = [];
 
         for (const candidate of pool) {
             const recipeId = candidate.recipe.recipe_id;
+
+            // The variety pass, and the ONLY thing it does differently: a dish
+            // already on today's plate is not offered at all. `solveDay` runs
+            // this pass first and the permissive one after, so the exclusion
+            // can never refuse a week — see the two-pass note there.
+            if (!allowSameDayRepeat && todaysRecipeIds.has(recipeId)) {
+                continue;
+            }
 
             // Three arguments, not four: the week is held to §0.7.3's two
             // clauses and to no exclusion of this module's own. `swap.logic.ts`
@@ -1906,28 +2540,66 @@ export const searchPlanWeek = (input: PlanSearchInput): PlanSearchOutcome => {
                 continue;
             }
 
+            const wouldTotal: MealPlanMacroTotals = {
+                calories: cumulative.calories + candidate.nutrition.calories,
+                protein: cumulative.protein + candidate.nutrition.protein,
+                carbs: cumulative.carbs + candidate.nutrition.carbs,
+                fat: cumulative.fat + candidate.nutrition.fat,
+            };
+
+            // The admissibility bound, applied where it costs nothing: a
+            // candidate whose branch cannot finish inside the day's bands never
+            // enters the move list, so it is never placed and never charged an
+            // evaluation. At the LAST slot the remaining bounds are zero and
+            // this is precisely the day tolerance, asked one step before the
+            // placement that would have had to be undone.
+            if (!canReachDayBands(wouldTotal, remaining, bands)) {
+                continue;
+            }
+
+            // ONE SLOT LEFT AFTER THIS ONE, so the interval bound above is a
+            // relaxation that can be replaced by the exact question — does any
+            // candidate in the final slot's pool actually close this day? —
+            // and that is where the search's budget was going. A prefix the
+            // intervals admit but no single final meal completes would
+            // otherwise be placed and charged, only for the exact test one slot
+            // later to find an empty move list. See
+            // {@link someCandidateClosesDay} for why this cuts nothing
+            // reachable.
+            if (
+                isPenultimateSlot &&
+                !someCandidateClosesDay(wouldTotal, dayFinalSlotPool[dayIndex], bands)
+            ) {
+                continue;
+            }
+
             moves.push({
-                candidate,
-                score: scoreCandidate(
+                repeatsToday: todaysRecipeIds.has(recipeId),
+                repeatsThisWeek: (usesByRecipeId.get(recipeId) ?? 0) > 0,
+                move: {
                     candidate,
-                    cumulative,
-                    slot.cumulativeShare,
-                    targets,
-                    userBudgetTier,
-                    plannedFoodIds,
-                ),
+                    score: scoreCandidate(
+                        candidate,
+                        cumulative,
+                        slot.cumulativeShare,
+                        targets,
+                        userBudgetTier,
+                        plannedFoodIds,
+                    ),
+                },
             });
         }
 
-        moves.sort(compareCandidateMoves);
+        moves.sort(compareTieredMoves);
 
-        return moves;
+        return moves.map((entry) => entry.move);
     };
 
     const solveSlot = (
         dayIndex: number,
         slotIndex: number,
         cumulative: MealPlanMacroTotals,
+        allowSameDayRepeat: boolean,
     ): boolean => {
         // No stop check on entry: `exhausted` and `aborted` are only ever set
         // inside the move loop below, and the guard that follows each recursive
@@ -1943,7 +2615,7 @@ export const searchPlanWeek = (input: PlanSearchInput): PlanSearchOutcome => {
 
         const slot = slots[slotIndex];
 
-        for (const move of orderedMoves(dayIndex, slot, cumulative)) {
+        for (const move of orderedMoves(dayIndex, slotIndex, cumulative, allowSameDayRepeat)) {
             if (shouldAbort?.() === true) {
                 aborted = true;
                 return false;
@@ -1977,7 +2649,7 @@ export const searchPlanWeek = (input: PlanSearchInput): PlanSearchOutcome => {
                 fat: cumulative.fat + move.candidate.nutrition.fat,
             };
 
-            if (solveSlot(dayIndex, slotIndex + 1, next)) {
+            if (solveSlot(dayIndex, slotIndex + 1, next, allowSameDayRepeat)) {
                 return true;
             }
 
@@ -1991,21 +2663,147 @@ export const searchPlanWeek = (input: PlanSearchInput): PlanSearchOutcome => {
         return false;
     };
 
+    /**
+     * Takes this day's admissibility bound from the week as it stands.
+     *
+     * The filter is §0.7.3's own test, asked of each slot's whole pool: a
+     * recipe at its weekly cap, or sitting on yesterday's plate, cannot appear
+     * today whatever else happens, so its nutrition must not count towards what
+     * today can still reach. Reusing `violatesRepetitionRule` rather than
+     * restating its clauses is deliberate — a bound that disagreed with the
+     * rule it models would prune branches the search would have accepted.
+     */
+    const captureDayRemainingBounds = (dayIndex: number): PlanCandidate[][] => {
+        const previousDayRecipeIds = dayIndex > 0 ? dayRecipeIds[dayIndex - 1] : EMPTY_RECIPE_IDS;
+        const availableForSlot = (slot: SlotSchedule): PlanCandidate[] =>
+            (candidatesBySlot.get(slot.slot) ?? []).filter(
+                (candidate) =>
+                    !violatesRepetitionRule(
+                        candidate.recipe.recipe_id,
+                        usesByRecipeId.get(candidate.recipe.recipe_id) ?? 0,
+                        previousDayRecipeIds,
+                    ),
+            );
+        const perSlot = slots.map(availableForSlot);
+
+        dayRemainingBounds[dayIndex] = remainingContributionBounds(
+            perSlot.map((pool) => slotContributionBounds(pool)),
+        );
+        // The same entry-time pools the interval bounds are taken over, kept for
+        // the exact last-slot test. Sharing the one filtered list is what keeps
+        // the two bounds from ever disagreeing about what a day may still use.
+        dayFinalSlotPool[dayIndex] = perSlot.length === 0 ? [] : perSlot[perSlot.length - 1];
+
+        return perSlot;
+    };
+
+    /**
+     * Fills one day, preferring a day whose dishes are all different.
+     *
+     * TWO PASSES OVER ONE DAY, and the order is the whole guarantee: the first
+     * pass offers no dish already on today's plate, so a day that CAN be filled
+     * from distinct recipes is. Only once that pass has been explored to
+     * exhaustion — every distinct assignment of this day tried, and the rest of
+     * the week tried on top of each — does the second pass reopen §0.7.3's
+     * legal same-day pair. The property this buys is statable and testable: a
+     * day serves one dish twice ONLY when, given the days before it, it cannot
+     * be filled any other way.
+     *
+     * It cannot refuse a week. The second pass offers exactly what the rule
+     * permits, so every week reachable under §0.7.3 is still reachable; the
+     * first pass only changes which of them is found first. And it cannot run
+     * away with the budget: both passes spend the same accumulating per-day
+     * counter, so a day still costs at most its own allowance however it is
+     * filled and however often it is re-entered.
+     *
+     * The passes are per DAY, not per week, because the recursion is: a later
+     * day that dead-ends unwinds into this day's next candidate within the pass
+     * it is in, and this day goes permissive only when its distinct pass has
+     * nothing left anywhere below it.
+     */
     const solveDay = (dayIndex: number): boolean => {
         if (dayIndex === dates.length) {
             return true;
         }
 
+        const availablePools = captureDayRemainingBounds(dayIndex);
+
+        // THE DAY'S OWN DEAD END, recognised before it is paid for. Days before
+        // this one have already spent recipes' two permitted uses, so a day late
+        // in a tightly-constrained week can be genuinely unfillable; without
+        // this it would spend its entire allowance proving that, and running an
+        // allowance out ENDS THE SEARCH rather than unwinding — taking with it
+        // every week reachable by changing an earlier day. Answered here it is
+        // an ordinary dead end costing ONE evaluation rather than an allowance:
+        // the frontier still records this as the day that could not close, and
+        // the recursion unwinds into the previous day's next candidate exactly
+        // as a day that ran out of candidates would. See
+        // {@link dayHasFeasibleAssignment}, and the two notes below for what is
+        // charged and what is not.
+        if (!dayHasFeasibleAssignment(availablePools, bands, usesByRecipeId)) {
+            frontierDayIndex = Math.max(frontierDayIndex, dayIndex);
+
+            // A SLOT WITH NOTHING IN IT IS FREE. There was no search to charge
+            // for: the day is impossible because a slot has no candidate at all,
+            // which is coverage, not arithmetic, and `analyzeLimitingConstraints`
+            // answers it with `slot_coverage` alone. A week impossible for that
+            // reason still refuses at zero cost, as it always has.
+            if (availablePools.some((pool) => pool.length === 0)) {
+                return false;
+            }
+
+            // THE PROOF IS WORK, SO IT IS CHARGED — one evaluation, to this day
+            // and to the week, on the same guard-then-charge order `solveSlot`
+            // uses.
+            //
+            // Not bookkeeping for its own sake. Every other dead end costs at
+            // least one evaluation, which is what makes the two allowances bound
+            // the whole search; a dead end that cost nothing would let the
+            // search re-enter this day once per candidate of every day above it,
+            // unbounded, with only the five-second wall to stop it — and that
+            // wall is a `502`, where the truthful answer is a `422`. Charged,
+            // the day can prove itself unfillable at most its own allowance
+            // times and the week at most its own, so the refusal arrives inside
+            // the budget that was always meant to bound it.
+            if (evaluationsPerDay[dayIndex] >= perDayBudget) {
+                exhausted = true;
+                exhaustedBy = 'day';
+
+                return false;
+            }
+
+            if (evaluations >= perPlanBudget) {
+                exhausted = true;
+                exhaustedBy = 'plan';
+
+                return false;
+            }
+
+            evaluationsPerDay[dayIndex] += 1;
+            evaluations += 1;
+
+            return false;
+        }
+
         // Reached only from `solveSlot`'s day-complete branch or as the search's
         // own entry point, both of which run with the stop flags false — see the
         // note in `solveSlot`.
-        const solved = solveSlot(dayIndex, 0, { calories: 0, protein: 0, carbs: 0, fat: 0 });
+        for (const allowSameDayRepeat of [false, true]) {
+            if (solveSlot(dayIndex, 0, { calories: 0, protein: 0, carbs: 0, fat: 0 }, allowSameDayRepeat)) {
+                return true;
+            }
 
-        if (!solved) {
-            frontierDayIndex = Math.max(frontierDayIndex, dayIndex);
+            // A budget wall or an abort is not a pass that came up empty: the
+            // day was cut short, so reopening the repeat would spend a second
+            // pass on a search that has already been stopped.
+            if (exhausted || aborted) {
+                break;
+            }
         }
 
-        return solved;
+        frontierDayIndex = Math.max(frontierDayIndex, dayIndex);
+
+        return false;
     };
 
     const solved = solveDay(0);
@@ -2263,7 +3061,11 @@ const dislikeSelectionCount = (preferences: PlanGenerationPreferences): number =
 export const analyzeLimitingConstraints = (
     input: LimitingConstraintInput,
 ): LimitingConstraintVerdict => {
-    const { seedInputs, preferences, targets, recipes, shouldAbort, diagnostics } = input;
+    // `diagnostics` is read through `input` by `probeBudgetFor` rather than
+    // destructured here: since the admissibility bound made a settled search
+    // the normal outcome, no ROW is conditioned on how the search ended — only
+    // the probes' remaining allowance is.
+    const { seedInputs, preferences, targets, recipes, shouldAbort } = input;
 
     const seed = derivePlanSeed(seedInputs);
     const dates = planDatesFrom(seedInputs.startDate);
@@ -2500,24 +3302,33 @@ export const analyzeLimitingConstraints = (
         editStep: 'goal',
     };
 
-    // Two ways to earn this row, and the second is why the search's diagnostics
-    // travel here at all. Eligibility HOLDING is the condition the row claims,
-    // so with a slot thin the numbers were not the demonstrated reason the week
-    // failed and saying they were would send the user to change a target that
-    // would not have helped. But an EXHAUSTED search never settled that
-    // question: it stopped mid-answer, so the day bands are still an open
-    // reason even where a slot is thin, and §0.7.3 requires the exhausted case
-    // to report the tolerance for the day the search could not close. The
-    // frontier day itself cannot ride in this row — `slots` is a list of slots,
-    // never a day — so it travels on the error beside the rows.
+    // The row is earned whenever every slot has something to put in it, and the
+    // two routes to it are why the search's diagnostics travel here at all.
+    // A SETTLED search that found no week has DEMONSTRATED the bands as the
+    // reason: it explored every assignment the rule allows — the admissibility
+    // bound cuts only branches that provably could not have closed the day — so
+    // "no combination met the day bands" is a proved statement rather than a
+    // guess. An EXHAUSTED search never settled the question: it stopped
+    // mid-answer, so the bands remain an OPEN reason, and §0.7.3 requires that
+    // case to report the tolerance for the day the search could not close.
+    // Either way the row belongs. The frontier day itself cannot ride in it —
+    // `slots` is a list of slots, never a day — so it travels on the error
+    // beside the rows.
     //
-    // A SLOT AT ZERO IS THE ONE CASE EXHAUSTION DOES NOT REOPEN, and it is
-    // reachable: a slot with no recipes still lets the other slots spend the
-    // whole per-day allowance being placed and unplaced, so the search reports
-    // exhaustion for a week that no target would ever have closed. The bands
-    // cannot be "an open reason" for a slot nothing can fill, so the honest
-    // answer there is `slot_coverage` alone.
-    if (emptySlots.length === 0 && (thinSlots.length === 0 || diagnostics?.exhausted === true)) {
+    // A SLOT AT ZERO IS THE ONE CASE THAT EARNS NO ROW, whichever way the
+    // search ended: the bands cannot be a reason, open or demonstrated, for a
+    // week that no target would ever have closed because one meal of the day
+    // has nothing to fill it. The honest answer there is `slot_coverage` alone.
+    //
+    // A THIN SLOT IS ITS OWN EXPLANATION, and a settled search over one reports
+    // that alone: §0.7.3 asks for the tolerance when eligibility holds and no
+    // combination meets the bands, and a shelf below
+    // MIN_ELIGIBLE_RECIPES_PER_SLOT is precisely the case where it does not.
+    // Adding the band there would offer a user with two dinners a target to
+    // edit instead of the shelf that actually stopped the week. An exhausted
+    // search is the exception the clause above already covers: nothing was
+    // settled, so the band stays open and is reported beside the thin shelf.
+    if (emptySlots.length === 0 && (thinSlots.length === 0 || input.diagnostics?.exhausted === true)) {
         constraints.push(nutritionToleranceRow);
     }
 

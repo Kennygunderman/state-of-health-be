@@ -1,0 +1,120 @@
+{
+  "slug": "loaded-tofu-bean-breakfast-bowl",
+  "name": "Loaded tofu and black bean breakfast bowl",
+  "description": "Crumbled firm tofu scrambled with cumin over warmed black beans, red bell pepper and onion, finished with salsa and lime — a loaded breakfast bowl large enough for a high morning target.",
+  "iconKey": "bowl_dash",
+  "instructions": [
+    "Warm the olive oil in a large pan and soften the chopped onion and the red bell pepper over medium-high heat for 3 minutes.",
+    "Crumble the tofu into the pan, add the ground cumin and the salt, and scramble for 4 minutes until hot and lightly golden.",
+    "Stir the drained black beans through and heat for 2 minutes more.",
+    "Tip everything into a large bowl, spoon the salsa over and squeeze the lime on top."
+  ],
+  "yieldServings": 1,
+  "servingDescription": "1 large bowl",
+  "prepMinutes": 5,
+  "cookMinutes": 9,
+  "mealSlots": [
+    "breakfast"
+  ],
+  "dietTags": [
+    "gluten_free",
+    "pescatarian",
+    "vegan",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "soy"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 2,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "dairy_free",
+    "vegan",
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:172448",
+      "quantity": 2,
+      "unit": "cup",
+      "gramWeight": 504,
+      "displayText": "2 cups, crumbled",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:175238",
+      "quantity": 1.25,
+      "unit": "cup",
+      "gramWeight": 300,
+      "displayText": "1¼ cups, drained",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170108",
+      "quantity": 0.75,
+      "unit": "cup",
+      "gramWeight": 112,
+      "displayText": "¾ cup, chopped",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170000",
+      "quantity": 0.5,
+      "unit": "cup",
+      "gramWeight": 80,
+      "displayText": "½ cup, chopped",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:174524",
+      "quantity": 3,
+      "unit": "tbsp",
+      "gramWeight": 54,
+      "displayText": "3 tbsp",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170923",
+      "quantity": 1,
+      "unit": "tsp",
+      "gramWeight": 2.1,
+      "displayText": "1 tsp",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168155",
+      "quantity": 0.25,
+      "unit": "each",
+      "gramWeight": 17,
+      "displayText": "¼ lime",
+      "sortOrder": 6,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 0.5,
+      "unit": "tbsp",
+      "gramWeight": 7,
+      "displayText": "½ tbsp",
+      "sortOrder": 7,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 3,
+      "displayText": "½ tsp",
+      "sortOrder": 8,
+      "isOptional": false
+    }
+  ]
+}

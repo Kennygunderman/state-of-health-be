@@ -75,13 +75,17 @@
 --
 -- WHAT THE PAYLOAD COVERS, AND WHAT IT CANNOT. AAP 0.5.1 expects this output to
 -- carry the three constructs the Prisma datamodel cannot express: the generated
--- search_vector expression, the alias expression index on
+-- search_vector expressions - there are now TWO, one on catalog_foods and one on
+-- catalog_food_aliases, the latter added by
+-- prisma/migrations/20260911000000_catalog_alias_search_vector_and_read_stats so
+-- the alias full-text branch is index-served - the alias expression index on
 -- catalog_food_aliases - delivered as the ASCII fold
 -- `translate(alias, 'ABC...', 'abc...')` rather than `lower(alias)`, for the
 -- portability reason
 -- prisma/migrations/20260910000000_catalog_prefix_fold_indexes sets out - and
 -- the partial indexes' predicates. Measured against
--- prisma 6.9.0 it carries only the first - the statement below. Prisma's schema
+-- prisma 6.9.0 it carries only the first class - the two statements below, one
+-- per generated column. Prisma's schema
 -- describer leaves expression indexes, index predicates and scalar-list NOT
 -- NULL out of both sides of its comparison, so deleting an expression index,
 -- changing a partial index's predicate, or dropping NOT NULL from a required
@@ -89,10 +93,13 @@
 -- recorded AAP-versus-tool divergence, and what closes the two classes the tool
 -- omits is the separate pg_catalog evidence in
 -- docs/meal-planning/schema-catalog-evidence.sql, whose header carries the
--- measurements behind it. The generated column is evidenced in both files on
--- purpose: here the exit-code requirement is what makes its loss loud, because
--- replacing it with a plain tsvector column makes the command print "This is an
--- empty migration." and exit 0.
+-- measurements behind it. The generated columns are evidenced in both files on
+-- purpose: here the exit-code requirement is what makes their loss loud, because
+-- replacing them with plain tsvector columns makes the command print "This is an
+-- empty migration." and exit 0. The CREATE STATISTICS objects that same
+-- migration adds are invisible to this output by design - the Prisma datamodel
+-- has no extended-statistics concept - so they are evidenced only in the
+-- pg_catalog file beside it.
 --
 -- A RED GATE is fixed in prisma/schema.prisma and the migration, never by
 -- editing this file to match - unless the DDL change was the intended one, in
@@ -108,7 +115,11 @@
 -- schema-catalog-evidence.sql beside it.
 --
 -- Captured against prisma and @prisma/client 6.9.0 on PostgreSQL 16.15, ledger
--- prisma/migrations through 20260908000000_meal_planning.
+-- prisma/migrations through
+-- 20260911000000_catalog_alias_search_vector_and_read_stats.
+
+-- AlterTable
+ALTER TABLE "catalog_food_aliases" ALTER COLUMN "search_vector" DROP DEFAULT;
 
 -- AlterTable
 ALTER TABLE "catalog_foods" ALTER COLUMN "search_vector" DROP DEFAULT;

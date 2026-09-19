@@ -324,8 +324,29 @@ interface SeedFoodInput {
      * and the one a resume case needs: a quarantined row leaves the considered
      * set on the next attempt (it needs `--revalidate-quarantined` to come
      * back) while its failed check still belongs to the run's figures.
+     *
+     * `per_serving` is the basis NO build stage writes — the importer reads
+     * USDA's per-100 g array and the generator asks the model for per-100 g
+     * values — so it only ever arrives on a row `catalog:load` brought in from
+     * a release, or one inserted by hand. It is spelled here for exactly that
+     * reason: the `missing_gram_weight` tier judges those rows, and this is the
+     * fixture that drives it.
      */
-    readonly nutritionBasis?: 'per_100g' | 'per_100ml';
+    readonly nutritionBasis?: 'per_100g' | 'per_100ml' | 'per_serving';
+    /**
+     * How many units of the stated basis the nutrient columns describe.
+     * Defaults to 100, which is what both per-100 bases mean; a `per_serving`
+     * row states `1`, because `basis_amount` counts SERVINGS on that basis.
+     */
+    readonly basisAmount?: number;
+    /**
+     * `none` leaves the food with NO portion row at all, which is the only way
+     * a stored row can state a serving nobody weighed: `gram_weight` is NOT
+     * NULL, so a weightless portion cannot be stored and the absence is what
+     * carries the fact (see `candidateFromRow`). Default `sourced_default` is
+     * the single 174 g default portion every other fixture carries.
+     */
+    readonly portions?: 'sourced_default' | 'none';
     /**
      * The stored name this row carries, for the prompt-injection cases.
      *
@@ -371,6 +392,7 @@ const seedFood = async (input: SeedFoodInput): Promise<{ id: string; sourceKey: 
     const sourceKey = sourceKeyOf(input.ordinal, generated ? 'ai_generated' : 'usda', input.canonicalName);
     const evidence: SeededEvidence = input.evidence ?? 'complete';
     const allergenStatus = input.allergenStatus ?? 'known';
+    const portions = input.portions ?? 'sourced_default';
 
     const row = await prisma.catalog_foods.create({
         data: {
@@ -385,7 +407,7 @@ const seedFood = async (input: SeedFoodInput): Promise<{ id: string; sourceKey: 
             nutrition_version: input.nutritionVersion ?? 1,
             metadata_version: 1,
             nutrition_basis: input.nutritionBasis ?? 'per_100g',
-            basis_amount: 100,
+            basis_amount: input.basisAmount ?? 100,
             calories: input.calories ?? 165,
             protein_g: input.proteinG ?? 31,
             carbs_g: input.carbsG ?? 0,
@@ -403,16 +425,23 @@ const seedFood = async (input: SeedFoodInput): Promise<{ id: string; sourceKey: 
             cost_class: 2,
             search_text: name,
             imported_at: FIXED_NOW,
-            catalog_food_portions: {
-                create: {
-                    description: '1 cut',
-                    amount: 1,
-                    unit: 'each',
-                    gram_weight: 174,
-                    source: 'usda_food_portion',
-                    is_default: true,
-                },
-            },
+            // `undefined` rather than an empty `create` list for the
+            // weightless case: the row must carry NO portion, and an empty
+            // nested write is the one spelling Prisma would accept while
+            // leaving the create semantically ambiguous.
+            catalog_food_portions:
+                portions === 'none'
+                    ? undefined
+                    : {
+                          create: {
+                              description: '1 cut',
+                              amount: 1,
+                              unit: 'each',
+                              gram_weight: 174,
+                              source: 'usda_food_portion',
+                              is_default: true,
+                          },
+                      },
             // Written in the same create as the parent, so a derived fixture is
             // never momentarily a derived row with no composition — a state the
             // component floor would read as `components_absent` if anything
@@ -456,16 +485,22 @@ const seedFood = async (input: SeedFoodInput): Promise<{ id: string; sourceKey: 
                 nutrition_provenance: input.nutritionProvenance ?? (generated ? 'ai_estimated' : 'source_backed'),
                 nutrition_method: 'read per 100 g from the harness fixture',
                 nutrition_assumptions: null,
-                portion_units: [
-                    {
-                        description: '1 cut',
-                        amount: 1,
-                        unit: 'each',
-                        gram_weight: 174,
-                        source: 'usda_food_portion',
-                        is_default: true,
-                    },
-                ],
+                // What the import RECORDED it read, so it agrees with the
+                // portions the food carries: a weightless serving is recorded
+                // as no portion unit at all, because there was none to read.
+                portion_units:
+                    portions === 'none'
+                        ? []
+                        : [
+                              {
+                                  description: '1 cut',
+                                  amount: 1,
+                                  unit: 'each',
+                                  gram_weight: 174,
+                                  source: 'usda_food_portion',
+                                  is_default: true,
+                              },
+                          ],
                 identity_evidence: [
                     identityEvidenceRecord(
                         sourceKey,
@@ -2155,6 +2190,155 @@ describe('nothing publishes on evidence nobody can verify', () => {
         // And it wrote nothing: the row keeps the status it had.
         expect(await publicationStatusOf(food.id)).toBe('candidate');
         expect(harness.traced.writes).toEqual([]);
+    });
+});
+
+/* -------------------------------------------------------------------------- *
+ * The serving nobody weighed
+ * -------------------------------------------------------------------------- */
+
+/**
+ * The `missing_gram_weight` quarantine tier, driven end to end
+ * (CATIMP-missing-gram-weight-unreachable).
+ *
+ * WHY THIS CASE EXISTS. The tier is real — `catalog.logic.ts` names the check
+ * and maps it to `quarantine`, and `docs/meal-planning/catalog-policy.md`
+ * § nutrition-basis-rule argues it — but it had never been observed firing
+ * against a database, because NO build CLI can produce the row that fires it:
+ * the importer reads USDA's per-100 g `foodNutrients` array and the generator
+ * asks the model for per-100 g values, so the only `nutrition_basis` either
+ * writes is `per_100g`. A `per_serving` row reaches the table through
+ * `catalog:load` reading a release JSONL, or through a hand-inserted row, and
+ * is then judged by THIS stage — which reads every `candidate` and `published`
+ * row, so a release-loaded one is re-judged on the next pass whatever status
+ * the release asserted for it.
+ *
+ * WHAT MAKES THE ROW WEIGHTLESS. `catalog_food_portions.gram_weight` is NOT
+ * NULL, so a serving nobody weighed cannot be stored as a portion carrying no
+ * weight — it is stored as NO portion at all, and `candidateFromRow` turns that
+ * absence back into one synthetic default portion with `gram_weight: null` so
+ * the check is evaluable rather than silently absent. The fixture therefore
+ * omits the portion write rather than nulling a column it cannot null.
+ *
+ * WHY AGAINST POSTGRESQL RATHER THAN OVER `validateCatalogCandidate`. The unit
+ * test for the rule already exists in `catalog.logic.test.ts`; what was never
+ * exercised is the PATH — a stored row, read through the stage's own
+ * `selection`, rebuilt by `candidateFromRow`, judged, and written back as a
+ * `publication_status` and a validation record an operator reads. Every link in
+ * that chain is where the tier was unreachable, so every link is in the case.
+ */
+describe('a serving nobody weighed is quarantined rather than published', () => {
+    beforeEach(async () => {
+        await truncateFeatureTables();
+    });
+
+    /**
+     * A row on the loader-only basis whose serving has no stored weight: one
+     * serving of food, and nothing saying what a serving weighs.
+     *
+     * `basisAmount: 1` because `basis_amount` counts SERVINGS on this basis —
+     * the stated nutrients describe one serving, not 100 of them.
+     */
+    const seedWeightlessServingFood = (
+        ordinal: number,
+        overrides: Partial<SeedFoodInput> = {},
+    ): Promise<{ id: string; sourceKey: string }> =>
+        seedFood({
+            ordinal,
+            nutritionBasis: 'per_serving',
+            basisAmount: 1,
+            portions: 'none',
+            ...overrides,
+        });
+
+    it('quarantines the row and records missing_gram_weight as the check that held it', async () => {
+        const food = await seedWeightlessServingFood(1);
+        const harness = createHarness();
+
+        const outcome = await runValidation(harness.deps);
+
+        // THE OBSERVATION THE FINDING ASKED FOR: the tier fires, against a real
+        // row, through the stage's own judgement path.
+        expect(await publicationStatusOf(food.id)).toBe('quarantined');
+        expect(outcome.counts).toMatchObject({ judged: 1, quarantined: 1, published: 0 });
+
+        const report = onlyReport(harness);
+        expect(report.failedChecks).toEqual({ [CATALOG_CHECK_NAMES.MISSING_GRAM_WEIGHT]: 1 });
+        // A quarantined row is a shortfall against the category's target rather
+        // than a published row with a caveat.
+        expect(report.coverage.byCategory[CATEGORY].published).toBe(0);
+        // No review flag: this is an unusable record, not an atypical one, so
+        // nothing about it is for a curator to weigh.
+        expect(report.reviewFlags).toEqual({});
+    });
+
+    it('records the check on the row, with the weight it found and the bound it needed', async () => {
+        const food = await seedWeightlessServingFood(1);
+
+        await runValidation(createHarness().deps);
+
+        const record = await prisma.catalog_validation_records.findUnique({
+            where: { catalog_food_id: food.id },
+            select: { outcome: true, publication_status: true, checks: true },
+        });
+        expect(record).not.toBeNull();
+        expect(record?.outcome).toBe('quarantined');
+        expect(record?.publication_status).toBe('quarantined');
+
+        const checks = record?.checks as unknown as CatalogValidationCheck[];
+        const failed = checks.filter((check) => !check.pass);
+        // ONE record of the fact, not two: the conversion reports it and
+        // `presenceChecks` stands down, which is the behaviour a report of
+        // failed checks per name depends on.
+        expect(failed.map((check) => check.name)).toEqual([CATALOG_CHECK_NAMES.MISSING_GRAM_WEIGHT]);
+        expect(failed[0].tier).toBe('quarantine');
+        // What it observed is the absence itself, and the bound says what would
+        // have satisfied it — enough for an operator to act on without reading
+        // the code.
+        expect(failed[0].observed).toBeNull();
+        expect(String(failed[0].bound)).toContain('sourced serving gram weight');
+    });
+
+    it('takes a release-loaded row of that shape back out of the published set', async () => {
+        // The realistic arrival: a release produced by an older or a foreign
+        // pipeline asserted `published` for the row, `catalog:load` restored
+        // that status rather than re-deciding it, and this pass is what decides
+        // it. The row is re-judged because the considered set includes
+        // published rows.
+        const food = await seedWeightlessServingFood(1, { publicationStatus: 'published' });
+
+        const outcome = await runValidation(createHarness().deps);
+
+        expect(await publicationStatusOf(food.id)).toBe('quarantined');
+        expect(outcome.counts).toMatchObject({ judged: 1, quarantined: 1, published: 0 });
+        // The demotion is recorded as a transition rather than only as a new
+        // status, so the row's own history says a published row lost the status.
+        expect(await historyOf(food.id)).toEqual([
+            expect.objectContaining({ from: 'published', to: 'quarantined' }),
+        ]);
+    });
+
+    it('publishes the same row once its serving carries a sourced weight', async () => {
+        // The other side of the rule, so the case pins the CHECK and not the
+        // basis: 174 g per serving, with the nutrients scaled to it, converts to
+        // exactly the per-100 g values every passing fixture carries.
+        const food = await seedFood({
+            ordinal: 1,
+            nutritionBasis: 'per_serving',
+            basisAmount: 1,
+            portions: 'sourced_default',
+            calories: 165 * 1.74,
+            proteinG: 31 * 1.74,
+            carbsG: 0,
+            fatG: 3.6 * 1.74,
+        });
+        const harness = createHarness();
+
+        const outcome = await runValidation(harness.deps);
+
+        expect(await publicationStatusOf(food.id)).toBe('published');
+        expect(outcome.counts).toMatchObject({ judged: 1, published: 1, quarantined: 0 });
+        expect(onlyReport(harness).failedChecks).toEqual({});
     });
 });
 

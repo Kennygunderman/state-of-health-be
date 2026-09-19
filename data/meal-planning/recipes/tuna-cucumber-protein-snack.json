@@ -1,0 +1,108 @@
+{
+  "slug": "tuna-cucumber-protein-snack",
+  "name": "Tuna and cucumber protein plate",
+  "description": "A cold afternoon plate: drained tuna dressed with lemon, dill and olive oil, with cucumber rounds, carrot sticks and a spoonful of beans alongside.",
+  "iconKey": "bowl_dash",
+  "instructions": [
+    "Drain the tuna, flake it into a small bowl and dress it with the olive oil, the black pepper and the chopped dill.",
+    "Drain and rinse the kidney beans, then fold them through the tuna.",
+    "Slice the cucumber into rounds and cut the carrot into sticks.",
+    "Squeeze the lemon over the tuna and divide everything between two plates."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 plate",
+  "prepMinutes": 10,
+  "cookMinutes": 0,
+  "mealSlots": [
+    "snack"
+  ],
+  "dietTags": [
+    "gluten_free",
+    "pescatarian"
+  ],
+  "allergenTags": [
+    "fish"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "dairy_free",
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:171986",
+      "quantity": 2.5,
+      "unit": "oz",
+      "gramWeight": 70.8,
+      "displayText": "2½ oz, drained",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168409",
+      "quantity": 1,
+      "unit": "cup",
+      "gramWeight": 104,
+      "displayText": "1 cup, sliced",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170393",
+      "quantity": 2,
+      "unit": "each",
+      "gramWeight": 122,
+      "displayText": "2 medium",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:174285",
+      "quantity": 100,
+      "unit": "g",
+      "gramWeight": 100,
+      "displayText": "100 g, drained",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:167746",
+      "quantity": 0.25,
+      "unit": "each",
+      "gramWeight": 21,
+      "displayText": "¼",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 0.5,
+      "unit": "tbsp",
+      "gramWeight": 6.75,
+      "displayText": "½ tbsp",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:172233",
+      "quantity": 4,
+      "unit": "g",
+      "gramWeight": 4,
+      "displayText": "4 g",
+      "sortOrder": 6,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170931",
+      "quantity": 0.25,
+      "unit": "tsp",
+      "gramWeight": 0.575,
+      "displayText": "¼ tsp",
+      "sortOrder": 7,
+      "isOptional": false
+    }
+  ]
+}

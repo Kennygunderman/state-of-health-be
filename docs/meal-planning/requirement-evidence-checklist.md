@@ -335,7 +335,12 @@ went unrun. That list's first step, the host `npm ci`, has no row here on
 purpose: it is how the environment was prepared rather than something this work
 verifies, and what it produced is the dependency tree every row below then ran
 against. A check that could not be run here is **not** listed as passed; it is
-in [the next section](#what-is-unrun-or-unverified) instead.
+in [the next section](#what-is-unrun-or-unverified) instead. Two records below
+the table are neither a run nor a gap of this environment's own: read figures
+measured by **sibling QA boundaries in other clones**, kept here because no
+artefact holds them — [read figures measured
+elsewhere](#read-figures-measured-elsewhere-and-what-they-exclude) names whose
+runs they were and what they do not cover.
 
 **This table is the run index for this folder, and one level of detail is
 deliberately not in it.** `README.md` and the two policy documents state what a
@@ -491,6 +496,154 @@ utilities. Service and mapper modules are absent from this table by design —
 Rule 7 §11 covers them by integration, which is what the `src/__tests__/api/*`
 suites are.
 
+### Read figures measured elsewhere, and what they exclude
+
+**Why these two records sit here rather than in an artefact.** This section's
+own rule — a run's headline outcome in the index above, its full measurement in
+the artefact that produced it — cannot be followed for the figures below,
+because **no artefact exists for them.** The only generated report in this
+folder's data directory that carries latencies is the search benchmark's, and
+it measures catalogue search rather than any of the reads below; nothing in
+this repository publishes a read-latency artefact that a later measurement
+could read or compare itself against. This subsection is the only durable
+surface these figures have — and that absence is not an oversight, it is
+precisely what the second record is about.
+
+**Whose measurements these are, and why their conditions travel with them.**
+Neither record is this delivery's own work. Both were produced by sibling QA
+boundaries, each working in an independent clone against its own disposable
+`*_test` database — created, migrated, catalogue-loaded and seeded by that
+boundary alone — under its own host load and with its own harness. No run in
+the index above measured any of it, and nothing here should be read as this
+delivery's evidence. Every figure is printed with the conditions that produced
+it because those conditions are load-bearing: the host is a 12 vCPU machine
+shared with roughly 64 concurrent agents at load averages between about 8.6 and
+25, so **every absolute timing below is an upper bound** rather than a clean
+number. What is contention-invariant — statement counts, query plans, response
+shapes and status codes — is what carries a verdict; the milliseconds only
+bound it. Both records are gaps as much as they are figures, and each is placed
+with its numbers rather than under [What is unrun or
+unverified](#what-is-unrun-or-unverified) because the numbers are the substance
+of what was achievable instead of the check that could not be run.
+
+#### The six plan-facing reads, and the auth cost their figures exclude
+
+**Conditions.** A read-performance boundary measured the six plan-facing reads
+over HTTP against its own `*_test` database, loaded with catalogue release v1 —
+10,928 published foods, 42 recipe versions, 269 ingredient rows — plus a
+synthetic scale load of roughly 100× that data volume, on PostgreSQL 16.15
+reached over loopback, with `ANALYZE` run after every load. Its protocol was
+one untimed warm-up request, then at least five timed requests per case, with
+the statement count captured per request. Across two full re-runs the statement
+counts showed **zero variance** while p50 latency moved by about **±20 %**,
+which is the accuracy these figures have.
+
+| Read | Statements per request | p50 | p95 | Response bytes |
+| --- | --- | --- | --- | --- |
+| `GET /meal-planning/plans/current` | 26 | 32.51 ms | 33.92 ms | 90,334 |
+| `GET /meal-planning/plans/:planId/days/:date` | 12 | 6.99 ms | 7.99 ms | 5,676 |
+| `GET /meal-planning/plans/:planId/affected-meals` | 4 | 5.78 ms | 7.75 ms | 3,838 |
+| `GET /meal-planning/plans/:planId/groceries` | 5 | 25.11 ms | 27.10 ms | 101,964 |
+| `GET …/meals/:mealId/alternatives` | 16 | 25.50 ms | 28.28 ms | 2,231 |
+| `GET …/alternatives/:recipeVersionId/preview` | 12 | 20.28 ms | 26.33 ms | 2,104 |
+
+**The cold path is a different number, recorded because it answers a different
+question.** The first request after process start cost **89.94 ms on the day
+read against 6.99 ms warm** — 12.9× — with the statement count identical cold
+and warm, so what it measures is Prisma engine and connection initialisation
+rather than extra queries. The other reads' cold multiples were 1.3× to 1.4×.
+That figure bears on the first request after a deploy or a restart, which is
+the same question the one-time key fetch below lands on.
+
+**What every figure above excludes, exactly.** That boundary had no development
+Firebase identity token — the reason, and what it leaves unverified, are under
+[What is unrun or unverified](#what-is-unrun-or-unverified) — and its harness
+replaced exactly one thing to get past the middleware: `verifyIdToken`, the
+same identity channel this repository's own `src/__tests__/setup/jestSetup.ts`
+mock replaces. Everything else ran untouched — the real Express application,
+`authenticateFirebaseToken` itself, the routes, the controllers, the services
+and the Prisma client — and an unauthenticated request still returned **401**.
+So the consequence is stated rather than left to be inferred: **every latency
+figure above excludes Firebase token verification**, and none of them is an
+end-to-end production figure.
+
+**What that substitution does not reach.** Statement counts, `EXPLAIN` plans,
+N+1 verdicts, index verdicts and the concurrency statement counts do not
+involve the auth path at all, so the exclusion does not qualify them; it
+qualifies the latencies and nothing else. The distinction is worth drawing in
+both directions — a disclosure that quietly withdrew the structural verdicts
+too would over-claim as surely as one that hid the exclusion.
+
+**How large the excluded cost is — measured, not estimated.** A sibling
+write-performance boundary measured it on the same host against the same real
+middleware: one RS256 verification with no network costs about **3.0 ms warm**,
+and the one-time public-key fetch costs about **60 ms once** after process
+start. A real-token deployment therefore adds roughly 3 ms to each warm figure
+above, and roughly 60 ms once to the first authenticated request after a
+restart. Those two numbers are what make the disclosure usable rather than
+merely cautious: the exclusion is bounded, and bounded by a measurement rather
+than by a guess.
+
+#### The forward read baseline, and the comparison an isolated clone cannot make
+
+**Why the comparison was unperformable rather than skipped.** A checkpoint item
+asked a later measurement to confirm that the earlier boundaries' read figures
+were unchanged on the database it worked against. From an isolated per-agent
+clone that cannot be executed as a comparison at all: each boundary works in
+its own clone against its own `*_test` database, which that boundary creates,
+migrates, catalogue-loads and seeds itself, so **there is no prior read
+measurement on that database to compare against** — no sibling has ever touched
+it, and every sibling figure was taken on its own database under its own host
+load. Nor is there anywhere to look them up: nothing in this repository layout
+publishes earlier read figures where a later boundary could read them, which is
+the same absence stated at the head of this subsection.
+
+**What was executed instead, and what it is for.** A write-performance
+boundary, working on a different `*_test` database, ran all six read endpoints
+again **after its entire write campaign** — 10,928 catalogue foods loaded, and
+1,131 grocery rows, 644 plan meals and 39 action rows written — and every one
+still answered **200 with the correct shape at stable low latency**. That is a
+forward baseline rather than a comparison, and it is published in the form that
+makes a comparison possible later: the endpoint, its p50 and its max, beside
+the dataset counts above and the conditions it was taken under — the same
+shared 12 vCPU host at load averages of 8.7 to 25.3, one untimed warm-up
+request then at least five timed ones per endpoint, durations from
+`process.hrtime`.
+
+| Read | p50 | max |
+| --- | --- | --- |
+| `GET /api/macros/:date` (the legacy diary read) | 2.51 ms | 3.17 ms |
+| `GET /meal-planning/targets` | 1.15 ms | 1.46 ms |
+| `GET /meal-planning/plans/current` | 13.25 ms | 13.75 ms |
+| `GET /meal-planning/plans/:planId/days/:date` | 6.15 ms | 6.52 ms |
+| `GET /meal-planning/plans/:planId/groceries` | 7.27 ms | 10.47 ms |
+| `GET /catalog/foods?q=chicken&limit=25` | 120.97 ms | 136.18 ms |
+
+**One row there is the one a later reader should notice.** The catalogue search
+answered in **120.97 ms at p50**, returning 25 of 672 matches — an order of
+magnitude above every other read in the table. The boundary that measured it
+placed catalogue-search latency **outside its own scope** and raised no finding
+on it, so it is recorded here as a figure to compare against and not as a
+verdict. It is also not the same measurement as the benchmark's: check 15's p95
+of 62.735 ms is the whole query set timed in process against
+`catalog.service.searchPublishedFoods`, while this is one query over HTTP under
+the load conditions above, so neither figure disposes of the other and they
+must not be read as a pair.
+
+**What this record closes, and what it leaves open.** The gap came with two
+possible resolutions. This is the second of them — restate the item as *record
+read-path figures on this database as a forward baseline* — and that is
+**closed** by the table above, published in the comparable form the boundary
+supplied it in. The first — publish the earlier read boundaries' figures into a
+shared artefact that later boundaries in the same batch can read, so the
+comparison becomes performable — **remains open**, and not by choice: nothing
+in this repository layout provides such an artefact. The three generated
+reports under `data/meal-planning/reports/latest/` cover the catalogue import,
+its validation and the search benchmark; none of them records an endpoint
+latency, and each clone's own figures exist only in that clone. Closing it
+needs a durable shared location for read measurements, which is a decision for
+whoever owns the batch rather than something this document can take.
+
 ## The seven user-specified rules, clause by clause
 
 Seven rules govern this work — six for the app and one for the API. The table
@@ -550,19 +703,71 @@ presented as a near-miss.
   renderer or component-testing library installed, and adding one was out of
   scope, so screen behaviour is covered through pure functions and mutation
   option factories rather than by rendering a tree. Every visual and interaction
-  claim therefore rests on the device checklist.
+  claim therefore rests on the device checklist. The app repository records the
+  same absence from the side the screens live on, and in more detail than
+  belongs here: `app: docs/meal-planning.md` § 10 names **six** measurement
+  passes as unrun in the strong sense — measured geometry per device class,
+  which is the one it marks blocking; the six dynamic-type combinations; the
+  VoiceOver and TalkBack passes; native confirmation of the recipe and swap
+  states; pixel comparison with the interactive states, gestures and console
+  cleanliness; and a regression pass over the shipped screens beside a
+  pre-feature build — each with what was run instead and the steps that close
+  it. The walkthrough below is deliberately the shorter, API-facing form of the
+  same run; where the two describe one step, that section carries the detail.
 - **The supplied production database host was unreachable from here**, which is
   correct — development and tests must never touch production data. Schema, API
   and catalogue verification used a local PostgreSQL 16.15 instead, and the
   exact patch version is recorded in the generated benchmark report so the
   evidence stays reproducible. Nothing in this work connected to production.
-- **Authenticated endpoint calls were not exercised against a running server.**
-  No development Firebase account or identity token was available; the
-  unauthenticated request in check 18 returned 401, which is the correct
-  behaviour and also the reason. What this leaves unverified is only the live
-  token-verification path, since every handler behind it is exercised in process
-  by the `src/__tests__/api/*` suites with the auth middleware mocked. Closing
-  it needs a development Firebase project account and an identity token from it.
+- **Authenticated endpoint calls were not exercised against a running server,
+  and the gap is wider than the token-verification step.** No development
+  Firebase account or identity token was available. The boundary itself is
+  proven rather than assumed: check 18's unauthenticated request returned 401,
+  and a sibling legacy-regression pass then drove that boundary adversarially
+  from its own clone — **48 read probes and 8 write probes, every one 401, with
+  nothing persisted by any of them**. Every legacy read and write was exercised
+  instead **through the real service layer the controllers serialize** rather
+  than over HTTP — 22 of 22 response-shape probes plus 40 create, read, update
+  and delete steps against a live development database — so the handlers'
+  behaviour is evidenced while their HTTP surface, reached with a real
+  identity, is not. An earlier revision of this bullet said the gap was "only
+  the live token-verification path"; that was too narrow, and it is corrected
+  here rather than quietly widened, because every legacy response shape this
+  work relies on was recorded one layer below the wire.
+
+  **Why no identity token exists here, in the order the chain fails.** The auth
+  path itself runs. A real custom token **mints successfully** through
+  `firebase-admin`, and `verifyIdToken` then **refuses it by design**,
+  reporting `auth/argument-error` — it expects an ID token and was given a
+  custom token — so the middleware genuinely executes and discriminates token
+  types, and there is no library incompatibility to chase. Turning that custom
+  token into an ID token takes one exchange through Google Identity Toolkit,
+  and that exchange needs **the development project's Firebase Web API key,
+  which this environment does not hold**: `FIREBASE_API_KEY`,
+  `FIREBASE_WEB_API_KEY` and `EXPO_PUBLIC_FIREBASE_API_KEY` are all unset, and
+  the platform's `GOOGLE_API_KEY` is a platform credential rather than this
+  project's Web API key. The exchange would also **auto-provision a uid in the
+  development project's live Firebase directory**, which holds real user
+  records and which the environment instructions forbid touching — so it was
+  never attempted. That last step is a **policy refusal rather than a
+  capability gap**, and no Firebase user was created at any point.
+
+  **What this leaves unverified** is the live token-verification path **and**
+  the legacy read and write endpoints' behaviour over real HTTP with a real
+  identity — twelve reads and four writes whose shapes are recorded only from
+  the service layer, since every handler behind the middleware is exercised in
+  process by the `src/__tests__/api/*` suites with the auth middleware mocked.
+  **Closing it, precisely:** obtain the development project's Firebase Web API
+  key and a development test account; mint a custom token for that account's
+  uid and exchange it for an ID token by posting to Google Identity Toolkit's
+  `/v1/accounts:signInWithCustomToken` endpoint with that Web API key as its
+  `key` query parameter — the parameter is named here and no key value appears
+  in this document; then replay those 12 legacy reads and 4 legacy writes with
+  the resulting ID token against the running API and compare each response body
+  **field by field** against the service-layer shapes recorded above. What
+  token verification costs, measured rather than estimated, is recorded with
+  [the read figures measured
+  elsewhere](#read-figures-measured-elsewhere-and-what-they-exclude).
 - **Reaching the published catalogue counts depends on conditions outside this
   checkout** — the vendor's hourly rate limit, model availability during offline
   seeding, and identity evidence passing its checks. The aggregate requirement

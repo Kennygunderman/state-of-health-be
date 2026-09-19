@@ -140,14 +140,38 @@ moved:
   architecture guide's §12 describes that client as committed build output while
   the repository ignores it; the repository's practice is the one followed here,
   so no generated file appears in a pull request.)
-- `npx prisma migrate deploy` applies `prisma/migrations/` —
-  `20260706000000_init` and `20260908000000_meal_planning`. The meal-planning
-  migration is **additive**: it creates new tables and adds nullable columns, and
-  changes no existing column or constraint. The identical command also runs at
-  container boot from the `Dockerfile` `CMD`, which is why `prisma/migrations/`
-  is the executed, authoritative ledger and
-  `prisma/manual-migrations/meal-planning/` is a reference copy for operators
-  rather than something to run — [`release-and-recovery.md`](./release-and-recovery.md)
+- `npx prisma migrate deploy` applies every entry in `prisma/migrations/`, in
+  filename order, and that folder in its entirety is the ledger — four entries
+  today, which are the four rows a reader reconciling `_prisma_migrations`
+  against this document will find, and a later entry joins the same ledger and
+  is applied by the same command without any change to this order:
+  - `20260706000000_init` — the pre-feature schema, introspected from the
+    Firestore migration.
+  - `20260908000000_meal_planning` — the feature's sixteen new tables and the
+    four nullable columns on `meal_entries`. It is **additive**: it creates new
+    tables and adds nullable columns, and changes no existing column or
+    constraint.
+  - `20260909000000_usda_cache_http_status` — one nullable
+    `usda_api_cache.http_status` column, with no default and no backfill, so a
+    response recorded before the column existed keeps `NULL` rather than being
+    stamped with a status nobody observed.
+  - `20260910000000_catalog_prefix_fold_indexes` — index-only, and only on
+    indexes the meal-planning migration itself created: it adds the three
+    ASCII-fold `text_pattern_ops` indexes the catalog search's prefix branches
+    need to fold the same way in the database as in JavaScript, and drops the
+    `lower(alias)` index nothing compares any more.
+
+  So no entry in the ledger rewrites pre-feature data, and the two entries after
+  the meal-planning one are follow-ups rather than edits to it — a migration
+  already applied has its checksum recorded in `_prisma_migrations`, and editing
+  the file would break every database already brought up to it instead of
+  migrating it. The identical command also runs at container boot from the
+  `Dockerfile` `CMD`, which is why `prisma/migrations/` is the executed,
+  authoritative ledger and `prisma/manual-migrations/meal-planning/` is a
+  reference copy for operators rather than something to run — it mirrors
+  `20260908000000_meal_planning` alone, and an operator who applies it by hand
+  then records that one migration as applied and lets `migrate deploy` apply the
+  rest the ordinary way. [`release-and-recovery.md`](./release-and-recovery.md)
   carries that reasoning and the `migrate resolve` step anyone running the copy
   by hand owes afterwards.
 - `npm run catalog:load -- --release v1` loads the reviewed, checksummed release
@@ -183,7 +207,23 @@ moved:
   global average. It needs its own database and two acknowledgements; see
   [Running the test suite](#running-the-test-suite) for the exact invocation.
 - `npm run dev` serves the API with `ts-node-dev`; `npm run build` then
-  `npm start` is the compiled form. Verify either the same way:
+  `npm start` is the compiled form. `build` is `tsc` **and** a copy, for a
+  reason that is not visible from the compiler configuration: `tsc` emits
+  `src/` into `dist/`, and it emits nothing at all for the generated Prisma
+  client, because that client is plain JavaScript the compiler only reads types
+  from. `dist/prisma/client.js` still requires it at `dist/generated/prisma`,
+  so the script mirrors `src/generated` into `dist/generated` after the
+  compile — which is why `prisma generate` has to have run before `build`, and
+  why the copy belongs to the build rather than to a step an operator has to
+  remember. Without it the compiled server exits before it listens, with
+  `Cannot find module '../generated/prisma'`. The image gets the client from
+  the same step: its build stage runs `npx prisma generate` and then this
+  `npm run build`, and `COPY --from=build /app/dist ./dist` carries
+  `dist/generated` along with the rest of the output. It used to carry a second
+  `COPY` of `src/generated` instead, which is what kept the image working while
+  `npm start` outside it did not — one mechanism now serves both, so a
+  regression here fails locally rather than only where nobody is looking.
+  Verify either form the same way:
 
   ```bash
   curl http://localhost:3000/health
@@ -506,8 +546,15 @@ The suite truncates the meal-planning tables plus `meal_entries`, `meals` and
 `src/__tests__/setup/testDb.ts` refuses to run at all unless all three of its
 conditions hold:
 
-> 1. `NODE_ENV === 'test'` — exactly, so `development` or an unset value
->    refuses rather than being coerced.
+> 1. `NODE_ENV === 'test'` — exactly, so `development` refuses rather than
+>    being taken as close enough, and so does an unset value. That second
+>    refusal is only observable where the guard is the program, though: Jest
+>    sets `NODE_ENV='test'` itself when the variable is undefined, and it does
+>    so before `setupFiles` run, so on the `npm test` path below the runner has
+>    already satisfied this condition by the time the guard reads it, and
+>    conditions 2 and 3 are the two that discriminate there. Run the guard
+>    directly — the invocation at the end of this section — to see an unset
+>    value refused.
 > 2. `ALLOW_DB_TRUNCATE === 'true'` — exactly, so `TRUE`, `1` and a blank
 >    value refuse. Truncation is not something to enable by accident.
 > 3. `DATABASE_URL` names a `_test` database (with or without a clone index)
@@ -615,7 +662,10 @@ What was not verified, recorded here rather than left to be assumed:
 - **What was exercised, and where its record is.** Every command in the ordered
   list above **from `prisma generate` onward** was run as written in that
   environment: `prisma generate`, `prisma migrate deploy`, the three typechecks,
-  the build, `check:test-db` and its refusals, the `--confirm-target` and
+  the build, the test-database guard
+  (`npx ts-node --project tsconfig.test.json src/__tests__/setup/testDb.ts`,
+  the invocation [Running the test suite](#running-the-test-suite) documents)
+  and its refusals, the `--confirm-target` and
   `development_only` refusals, `npm test`, and `npm run dev` with its `/health`
   response, together with `catalog:load` (twice, so the second run's no-op
   counts are the idempotency evidence), `recipes:seed` and `search:benchmark`

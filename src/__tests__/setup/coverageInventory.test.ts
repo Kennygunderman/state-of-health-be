@@ -2757,7 +2757,14 @@ const COVERAGE_MATRIX_CLAIMS: readonly GatedClaim[] = [
         pattern: /(\w+) of them are cross-listed across more than one slot/,
         source: COVERAGE_REPORT_PATH,
         expected: [coverageReport.crossListedRecipeCount],
-        kinds: ['word'],
+        // Read as a figure rather than a spelled word. `WORD_NUMBERS` is closed
+        // on purpose, and this count moves with the corpus — it was ten when the
+        // corpus was 42 recipes and is forty-six at 115 — so spelling it would
+        // make every corpus change also a change to that map, for a number whose
+        // only job is to be compared. The gate is no weaker: a digit is still
+        // compared exactly against the report, and a missing or non-numeric
+        // figure still fails.
+        kinds: ['number'],
     },
     {
         what: 'the dimensioning of the tabulated matrix',
@@ -5240,19 +5247,36 @@ describe('policy-document drift gate', () => {
                 deriveConsumedTotals(PLANNED_SNAPSHOT_SAMPLE, EATEN_SERVINGS_SAMPLE).calories,
             );
 
+            // The aggregate form is pinned to the character because the MODE is
+            // the contract, not just the presence of a rounding. The document
+                // named `SUM(ROUND(x * servings))::int` for two versions and that
+            // was false: `round(double precision)` is half-to-even while
+            // `Math.round` is half-up, so the SQL readers disagreed with the day
+            // read by 1 on every `.5`. `round(::numeric)` is not the fix either
+            // — it rounds negative halves away from zero. Only
+            // `FLOOR(x::numeric + 0.5)` IS `Math.round`, so a regression to
+            // either `ROUND` spelling must fail here rather than pass because
+            // "some rounding" is present.
             const [aggregateColumn, aggregateFactor] = statedGroups(
                 planningPolicy,
                 'recipe-rules',
                 'the SQL aggregate the diary already uses',
-                /aggregates do the same in SQL as `SUM\(ROUND\((\w+) \* (\w+)\)\)::int`/,
+                /aggregates do the same in SQL as `SUM\(FLOOR\(\((\w+) \* (\w+)\)::numeric \+ 0\.5\)\)::int`/,
             );
+            const nutritionService = readRepositoryFile(NUTRITION_SERVICE_PATH);
             const aggregates = claimMatches(
-                readRepositoryFile(NUTRITION_SERVICE_PATH),
-                new RegExp(`SUM\\(ROUND\\(([\\w.]+) \\* ${aggregateFactor}\\)\\)::int`),
+                nutritionService,
+                new RegExp(`SUM\\(FLOOR\\(\\(([\\w.]+) \\* ${aggregateFactor}\\)::numeric \\+ 0\\.5\\)\\)`),
             );
 
             expect(aggregateColumn.length).toBeGreaterThan(0);
             expect(aggregates.length).toBeGreaterThan(0);
+
+            // And the half-to-even spelling is gone, not merely outnumbered.
+            // Anchored on `SUM(ROUND(` because that pairing is only ever the SQL
+            // aggregate — an unanchored /round\(/i would also match the JS
+            // `Math.round(perServing * servings)` this file is supposed to keep.
+            expect(nutritionService).not.toMatch(/SUM\(ROUND\(/i);
         });
 
         it('§5.3 — tabulates the closed badge set types/recipe.ts declares', () => {

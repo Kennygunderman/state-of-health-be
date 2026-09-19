@@ -120,7 +120,16 @@ import fs from 'fs';
 import path from 'path';
 
 import { classifyDatabaseOrigin, DatabaseOriginError, originLogFields } from './lib/dbGuard';
-import { createFatalLogger, createLogger, isThrownInstanceOf, safeError, writeLineSync } from './lib/logger';
+import {
+    UNEXPECTED_FAILURE_REMEDY,
+    classifyInfrastructureFailure,
+    createFatalLogger,
+    createLogger,
+    firstPartyMessage,
+    isThrownInstanceOf,
+    safeError,
+    writeLineSync,
+} from './lib/logger';
 import type { LogFields, LogLevel, SafeErrorFields } from './lib/logger';
 import {
     ManifestError,
@@ -1888,6 +1897,16 @@ export const runRelease = async (deps: RunReleaseDeps): Promise<ReleaseOutcome> 
     /** Compositions naming a food this release does not export — see the walk. */
     const componentTargetOutsideRelease = new OffenderTally();
     /**
+     * The first such composition's PARENT key, held as a one-entry list for the
+     * same reason as `firstEvidenceOffender`: it is filled inside the
+     * transaction callback, and the refusal's `sourceKey` context has to be the
+     * food's own key rather than the tally's decorated `parent → target
+     * (status)` entry, which is a sentence rather than a key anyone can look a
+     * row up by. It matters now that the context reaches the operator's line
+     * and the run ledger instead of being dropped by `describeFailure`.
+     */
+    const firstComponentReferenceOffender: string[] = [];
+    /**
      * Published rows that CARRY a composition while claiming their nutrition
      * came from somewhere else — see the refusal after the walk. Each entry
      * names the provenance claimed and how many component rows contradict it,
@@ -2007,7 +2026,13 @@ export const runRelease = async (deps: RunReleaseDeps): Promise<ReleaseOutcome> 
                 );
                 const staleReason = releaseStalenessReason(pipelineRuns, expectedValidationKey, logger);
                 if (staleReason !== null) {
-                    throw new ReleaseIntegrityError(staleReason);
+                    // No `file` and no `sourceKey`: this refusal is about the
+                    // run ledger rather than about one exported member, which
+                    // is exactly the case CatalogReleaseErrorContext's optional
+                    // members exist for. The reason is what makes it
+                    // distinguishable, and `releaseStalenessReason` composed the
+                    // sentence that says which of its three cases fired.
+                    throw new ReleaseIntegrityError(staleReason, {}, 'release_validation_stale');
                 }
 
                 // The first path use of the run, and the first of the awaited
@@ -2166,12 +2191,18 @@ export const runRelease = async (deps: RunReleaseDeps): Promise<ReleaseOutcome> 
                                 // has lost a component and the release must say
                                 // so.
                                 componentTargetOutsideRelease.add(`${row.source_key} → (unlinked component)`);
+                                if (firstComponentReferenceOffender.length === 0) {
+                                    firstComponentReferenceOffender.push(row.source_key);
+                                }
                                 continue;
                             }
                             if (target.publication_status !== PUBLISHED_STATUS) {
                                 componentTargetOutsideRelease.add(
                                     `${row.source_key} → ${target.source_key} (${target.publication_status})`,
                                 );
+                                if (firstComponentReferenceOffender.length === 0) {
+                                    firstComponentReferenceOffender.push(row.source_key);
+                                }
                                 continue;
                             }
                             referencedComponentKeys.add(target.source_key);
@@ -2393,6 +2424,7 @@ export const runRelease = async (deps: RunReleaseDeps): Promise<ReleaseOutcome> 
         throw new ReleaseIntegrityError(
             `${withoutValidationRecord.total} published food(s) carry no validation record, so the release would ship unevidenced rows: ${withoutValidationRecord.describe()}. Run catalog:validate before catalog:release.`,
             { file: 'validation-records.jsonl', sourceKey: withoutValidationRecord.first },
+            'release_validation_unrecorded',
         );
     }
 
@@ -2434,6 +2466,7 @@ export const runRelease = async (deps: RunReleaseDeps): Promise<ReleaseOutcome> 
                 file: 'validation-records.jsonl',
                 sourceKey: firstEvidenceOffender.length === 0 ? undefined : firstEvidenceOffender[0].sourceKey,
             },
+            'release_evidence_incomplete',
         );
     }
 
@@ -2463,6 +2496,7 @@ export const runRelease = async (deps: RunReleaseDeps): Promise<ReleaseOutcome> 
                 sourceKey:
                     firstCacheBindingOffender.length === 0 ? undefined : firstCacheBindingOffender[0].sourceKey,
             },
+            'release_source_cache_unresolved',
         );
     }
 
@@ -2488,6 +2522,7 @@ export const runRelease = async (deps: RunReleaseDeps): Promise<ReleaseOutcome> 
         throw new ReleaseIntegrityError(
             `${withoutUsableDefaultPortion.total} published food(s) do not carry exactly one default portion with a known, positive gram weight, so their amounts cannot be converted to grams by anything that loads this release: ${withoutUsableDefaultPortion.describe()}. Run catalog:validate before catalog:release.`,
             { file: 'portions.jsonl', sourceKey: withoutUsableDefaultPortion.first },
+            'release_default_portion_unusable',
         );
     }
 
@@ -2500,7 +2535,8 @@ export const runRelease = async (deps: RunReleaseDeps): Promise<ReleaseOutcome> 
     if (componentTargetOutsideRelease.total > 0) {
         throw new ReleaseIntegrityError(
             `${componentTargetOutsideRelease.total} composition row(s) name a food this release does not carry, so components.jsonl would reference keys absent from foods.jsonl and catalog:load would refuse the release with component_reference_unresolved: ${componentTargetOutsideRelease.describe()}. Publish those foods, or remove the composition, before cutting a release.`,
-            { file: 'components.jsonl', sourceKey: componentTargetOutsideRelease.first },
+            { file: 'components.jsonl', sourceKey: firstComponentReferenceOffender[0] },
+            'release_component_unresolved',
         );
     }
 
@@ -2525,6 +2561,10 @@ export const runRelease = async (deps: RunReleaseDeps): Promise<ReleaseOutcome> 
                 .slice(0, NAMED_OFFENDERS)
                 .join(', ')}${unresolvedComponentKeys.length > NAMED_OFFENDERS ? ', …' : ''}.`,
             { file: 'components.jsonl', sourceKey: unresolvedComponentKeys[0] },
+            // The same code as the refusal above: a reference that does not
+            // resolve is one operator action — publish the food or remove the
+            // composition — whichever of the two checks noticed it first.
+            'release_component_unresolved',
         );
     }
 
@@ -2563,6 +2603,7 @@ export const runRelease = async (deps: RunReleaseDeps): Promise<ReleaseOutcome> 
                 .slice(0, NAMED_OFFENDERS)
                 .join(', ')}${missing.length > NAMED_OFFENDERS ? ', …' : ''}. Run catalog:validate before catalog:release.`,
             { file: 'components.jsonl', sourceKey: missing[0] },
+            'release_component_set_empty',
         );
     }
     // AND THE DUAL OF THAT RULE: A COMPOSITION WHOSE PARENT DENIES DERIVING
@@ -2589,6 +2630,7 @@ export const runRelease = async (deps: RunReleaseDeps): Promise<ReleaseOutcome> 
         throw new ReleaseIntegrityError(
             `${componentBearingWithoutDerivedProvenance.total} published food(s) carry component rows while declaring a nutrition_provenance other than '${COMPONENT_DERIVED_PROVENANCE}', so the release would state two incompatible things about where their nutrition came from and catalog:load would refuse it with release_component_inconsistent (parent_provenance_disagrees): ${componentBearingWithoutDerivedProvenance.describe()}. A composition's totals are the output of deriveComponentNutrition, which calls them '${COMPONENT_DERIVED_PROVENANCE}': re-derive those foods with "npm run catalog:validate", or remove the composition from a food whose numbers really are its source's statement, before cutting a release. Editing foods.jsonl is not the repair — a parent's nutrition moving has to move its nutrition_version.`,
             { file: 'components.jsonl', sourceKey: firstComponentProvenanceOffender[0] },
+            'release_provenance_disagrees',
         );
     }
 
@@ -2611,6 +2653,7 @@ export const runRelease = async (deps: RunReleaseDeps): Promise<ReleaseOutcome> 
         throw new ReleaseIntegrityError(
             `${withoutGenerationBatch.total} published AI-generated food(s) carry no generation batch, so the release cannot attribute the model and prompt that produced them: ${withoutGenerationBatch.describe()}. Re-run catalog:generate for those rows, or unpublish them, before cutting a release.`,
             { file: 'foods.jsonl', sourceKey: withoutGenerationBatch.first },
+            'release_generation_batch_missing',
         );
     }
 
@@ -3042,6 +3085,12 @@ const assertMeasuredEvidence = (evidence: ReleaseEvidenceSummary): void => {
                 `release carries: ${JSON.stringify(evidence)}. Every number in that block is counted while the ` +
                 'published rows are walked; a release is not cut from one that cannot be reconciled with itself.',
             { file: RELEASE_MANIFEST_FILE_NAME },
+            // Not an upstream data problem, so not an upstream remedy: the
+            // counters this block is built from disagree with each other, which
+            // no re-run of import, generation or validation changes. Coded with
+            // assertMeasuredModelVersions for that reason — both mean "this
+            // export cannot state what it measured".
+            'release_manifest_not_measured',
         );
     };
 
@@ -3131,6 +3180,7 @@ const assertMeasuredModelVersions = (versions: CatalogReleaseModelVersions): voi
                     value,
                 )}. model_versions is measured from the exported rows' generation batches and llm_review records; configuration is never written there.`,
                 { file: RELEASE_MANIFEST_FILE_NAME },
+                'release_manifest_not_measured',
             );
         }
     }
@@ -3620,6 +3670,77 @@ export class CatalogReleaseError extends Error {
 }
 
 /**
+ * WHICH integrity floor refused, as a code an operator can grep and a reviewer
+ * can count.
+ *
+ * WHY THE SPLIT EXISTS. Every integrity refusal in this stage reported the one
+ * code `release_integrity_failed`, and there are twelve of them with remedies
+ * that could not be further apart: one wants `catalog:validate` re-run, one
+ * wants `catalog:import` re-run so a retrieval is OBSERVED again, one wants a
+ * composition removed, one wants a row unpublished, and two are this exporter
+ * contradicting its own measurements. A single code made all of them look like
+ * one failure with one recovery path: a run refused for having no validation on
+ * record and a run refused for shipping an unattributable AI-generated row
+ * printed the same line, and an operator reading it could not tell which stage
+ * to re-run.
+ *
+ * WHY IT IS THIS GROUPING AND NOT TWELVE CODES. The vocabulary splits only
+ * where the OPERATOR ACTION differs, because a code that distinguishes two
+ * sites with the same remedy buys nothing and has to be maintained anyway. Two
+ * pairs of sites therefore share a member: the two component-reference checks
+ * (a composition naming an unpublished food, and the emitted-reference
+ * assertion behind it) both mean "publish that food or remove the composition",
+ * and the two manifest-measurement assertions (`assertMeasuredEvidence`,
+ * `assertMeasuredModelVersions`) both mean "this export measured something it
+ * cannot state coherently — report it, because no re-run of an upstream stage
+ * changes it".
+ *
+ * Each member is the `code` of the reported failure, so `catalog:load`'s own
+ * refusal codes and these read out of one namespace: an operator greps the code
+ * and finds the check, not twelve checks.
+ *
+ * WHY THE NAMES ARE TERSE. Every one is at most 32 characters, which is
+ * `ERROR_CODE_PATTERN`'s bound in scripts/lib/logger.ts: a code longer than
+ * that is dropped from the `error.code` `safeError` mirrors beside the
+ * reported `code`, so `release_identity_evidence_incomplete` would have printed
+ * under one field on one line and two on the next. The bound is the logger's
+ * rule about what a log may say, so the vocabulary is written to fit it rather
+ * than around it.
+ */
+export type ReleaseIntegrityReason =
+    /** The published set was not the last thing `catalog:validate` judged (or was never judged). */
+    | 'release_validation_stale'
+    /** A published food carries no validation record at all. */
+    | 'release_validation_unrecorded'
+    /** A validation record exists and states no usable retrieval evidence. */
+    | 'release_evidence_incomplete'
+    /** The evidence's digests do not resolve against the `usda_api_cache` payload they cite. */
+    | 'release_source_cache_unresolved'
+    /** A published food has no single default portion with a positive gram weight. */
+    | 'release_default_portion_unusable'
+    /** A composition names a food this release does not carry. */
+    | 'release_component_unresolved'
+    /** A published `ingredient_derived` food carries no composition to have derived from. */
+    | 'release_component_set_empty'
+    /** A composition's parent declares a provenance other than `ingredient_derived`. */
+    | 'release_provenance_disagrees'
+    /** A published `ai_generated` food carries no generation batch to attribute it to. */
+    | 'release_generation_batch_missing'
+    /** The manifest block this export measured cannot be reconciled with itself. */
+    | 'release_manifest_not_measured';
+
+/**
+ * The code an integrity refusal reports when it names no reason.
+ *
+ * The RESIDUAL, kept deliberately: a refusal added later, or raised by a caller
+ * that constructs this class itself, still reports a code that says what kind
+ * of failure it is rather than falling through to `unexpected_error`. Nothing
+ * silently loses a code because the vocabulary above does not yet have a member
+ * for it.
+ */
+export const RELEASE_INTEGRITY_FALLBACK_CODE = 'release_integrity_failed';
+
+/**
  * The release would have shipped rows it cannot vouch for — an unevidenced
  * food, a derived food with no composition, a food with no usable default
  * portion, or a catalog whose judgement is stale.
@@ -3627,13 +3748,20 @@ export class CatalogReleaseError extends Error {
  * A subclass rather than a second unrelated class so `main()` maps one base
  * type while each refusal still reports its own `code`, and so the existing
  * suites that import this name keep working.
+ *
+ * `reason` is the LAST parameter and optional, which is the one way this class
+ * differs from `ReleasePublicationError` (whose code is its first argument):
+ * that class has no refusal that does not name one, and this class keeps
+ * {@link RELEASE_INTEGRITY_FALLBACK_CODE} for the refusal that does not, so the
+ * naming parameter cannot come first without making the fallback unreachable.
  */
 export class ReleaseIntegrityError extends CatalogReleaseError {
-    public readonly code = 'release_integrity_failed';
+    public readonly code: string;
 
-    public constructor(message: string, context: CatalogReleaseErrorContext = {}) {
+    public constructor(message: string, context: CatalogReleaseErrorContext = {}, reason?: ReleaseIntegrityReason) {
         super(message, context);
         this.name = 'ReleaseIntegrityError';
+        this.code = reason ?? RELEASE_INTEGRITY_FALLBACK_CODE;
     }
 }
 
@@ -4379,7 +4507,7 @@ const closeReleaseLedgerRow = async (
         readonly startedAt: Date;
         readonly event: string;
         readonly counts?: Readonly<Record<string, number>>;
-        readonly detail?: { readonly code: string; readonly error: SafeErrorFields };
+        readonly detail?: { readonly code: string; readonly error: SafeErrorFields; readonly detail?: LogFields };
     },
 ): Promise<void> => {
     const finishedAt = deps.now();
@@ -4392,6 +4520,13 @@ const closeReleaseLedgerRow = async (
     if (outcome.detail !== undefined) {
         entry.code = outcome.detail.code;
         entry.error = outcome.detail.error;
+        // And the fields the code alone does not carry — the member and the food
+        // key a refusal is about, the sentence this repository composed for it,
+        // the remedy for an infrastructure failure. Spread rather than nested,
+        // and written for the same reason the console line carries them: this
+        // column is what a committed run report is assembled from, and a reader
+        // of it has the same question as the operator who watched the run.
+        Object.assign(entry, outcome.detail.detail ?? {});
     }
 
     try {
@@ -4557,14 +4692,85 @@ const gapFields = (gaps: readonly PrerequisiteGap[]): LogFields => {
 // machine code and status, and deliberately no `message`: this value reaches the
 // durable run log and the operator console, where foreign prose can carry a
 // connection URL, a key or a fragment of the document that failed (CWE-532).
-const describeFailure = (error: unknown): { code: string; error: SafeErrorFields; detail?: LogFields } => {
+/**
+ * What a refusal FROM THIS STAGE is about, as typed fields rather than as its
+ * rendered sentence.
+ *
+ * `CatalogReleaseError` carries `file` and `sourceKey` precisely "so the one
+ * thing that must change is reported without re-deriving it from the message"
+ * (see the class), and both were being dropped: `describeFailure` mapped the
+ * base class to its code alone, so an operator got
+ * `{"code":"release_integrity_failed","error":{"name":"ReleaseIntegrityError"}}`
+ * for a refusal that knew which member and which food it was about.
+ *
+ * Both values are this repository's own: `file` is one of the six release
+ * member names written in this file, and `sourceKey` is a catalog food's
+ * PORTABLE identity — a key an operator greps for in the release and in the
+ * recipe seeds, never a local uuid and never a credential. Absent members stay
+ * ABSENT rather than `undefined`, for the reason `safeError` assembles itself
+ * that way: this object is serialised into `catalog_import_runs.log`, where
+ * `{file: undefined}` reads as a member that was lost rather than one the
+ * refusal never had.
+ */
+const releaseErrorFields = (error: CatalogReleaseError): LogFields => ({
+    ...(error.file === undefined ? {} : { file: error.file }),
+    ...(error.sourceKey === undefined ? {} : { sourceKey: error.sourceKey }),
+});
+
+/**
+ * The message of an error THIS REPOSITORY composed, as a log field.
+ *
+ * Only called from a branch that has already narrowed the value to a
+ * first-party class — that narrowing is what makes reading a message legitimate
+ * at all, and `firstPartyMessage` in scripts/lib/logger.ts documents the
+ * obligation. The field is named for its provenance, matching
+ * `scripts/catalog-import-usda.ts` and `scripts/seed-dev.ts`, so a reader of a
+ * line or of `catalog_import_runs.log` can tell at a glance that the sentence
+ * was written here rather than quoted from a driver or a vendor.
+ */
+const firstPartyMessageField = (error: unknown): LogFields => {
+    const message = firstPartyMessage(error);
+
+    return message === undefined ? {} : { firstPartyMessage: message };
+};
+
+/**
+ * What the infrastructure classifier's remedy leaves out for THIS stage.
+ *
+ * A release is staged and then moved into place, so a database that stops
+ * answering mid-export costs nothing but the time: the staging directory this
+ * run wrote is removed rather than promoted (see `runReleaseStage`'s catch), and
+ * the previously reviewed release is still exactly where it was. Fixed prose,
+ * interpolated from nothing.
+ */
+const RELEASE_DISCARDED_CLAUSE =
+    ' A run that stops this way publishes nothing: the staging directory it wrote is discarded and any previously reviewed release is untouched, so the stage is safe to run again once the database answers.';
+
+export const describeFailure = (error: unknown): { code: string; error: SafeErrorFields; detail?: LogFields } => {
     // The base type, not each subclass: every CatalogReleaseError reports its
     // own `code`, so a refusal added later is mapped here without this function
     // being touched — and none of them can fall through to `unexpected_error`.
+    //
+    // It is also the arm that most needs its own sentence. An integrity refusal
+    // names the count, the offending keys, and the command that repairs them —
+    // prose composed HERE against a typed context, which is the provenance
+    // `firstPartyMessage` requires of its callers — and none of that survives
+    // in a code. The code now says which floor refused, `file`/`sourceKey` say
+    // what it was about, and the sentence says what to do; before this, all
+    // three were one string an operator never saw.
     if (isThrownInstanceOf(error, CatalogReleaseError)) {
-        return { code: error.code, error: safeError(error) };
+        return {
+            code: error.code,
+            error: safeError(error),
+            detail: { ...releaseErrorFields(error), ...firstPartyMessageField(error) },
+        };
     }
     if (isThrownInstanceOf(error, DatabaseOriginError)) {
+        // Deliberately WITHOUT its message, unlike the first-party arm above: a
+        // DatabaseOriginError explains itself by naming the host and database it
+        // refused, and dbGuard reports that refusal itself with the target
+        // reduced to a digest. Forwarding the sentence here would publish the
+        // topology the guard's own line takes care to withhold.
         return { code: error.code, error: safeError(error) };
     }
     if (isThrownInstanceOf(error, ManifestError)) {
@@ -4573,7 +4779,7 @@ const describeFailure = (error: unknown): { code: string; error: SafeErrorFields
     if (isThrownInstanceOf(error, ModelBudgetError)) {
         return { code: error.code, error: safeError(error) };
     }
-    // The one branch that reports TYPED CONTEXT beside the code. A stage-lock
+    // The other branch that reports TYPED CONTEXT beside the code. A stage-lock
     // refusal names the stage holding the catalog graph and the mode it asked
     // for, and those are what an operator acts on — see checkpointErrorFields
     // for why they travel as data rather than inside the rendered sentence.
@@ -4583,7 +4789,25 @@ const describeFailure = (error: unknown): { code: string; error: SafeErrorFields
     if (isThrownInstanceOf(error, RateLimitConfigError)) {
         return { code: 'rate_limit_misconfigured', error: safeError(error) };
     }
-    return { code: 'unexpected_error', error: safeError(error) };
+    // THE DATABASE, immediately before the fallback and after every arm this
+    // stage owns. The export reads the published graph through Prisma and takes
+    // the catalog-graph lock through checkpoint.ts's own `pg` session, so a
+    // database that will not accept a connection fails as a driver error whose
+    // `name` is the literal `'error'` — it matched none of the classes above
+    // and was reported as `unexpected_error` with no SQLSTATE and no remedy.
+    // The taxonomy lives in logger.ts so every stage answers the same way, and
+    // `safeError` carries the SQLSTATE beside this code.
+    const infrastructure = classifyInfrastructureFailure(error);
+    if (infrastructure !== null) {
+        return {
+            code: infrastructure.code,
+            error: safeError(error),
+            detail: { remedy: `${infrastructure.remedy}${RELEASE_DISCARDED_CLAUSE}` },
+        };
+    }
+    // Genuinely unclassified, and it says so with something to do about it
+    // rather than with an empty hand.
+    return { code: 'unexpected_error', error: safeError(error), detail: { remedy: UNEXPECTED_FAILURE_REMEDY } };
 };
 
 const main = async (): Promise<number> => {
@@ -4698,11 +4922,13 @@ if (require.main === module) {
                 code: failure.code,
                 error: failure.error,
                 // Spread, not nested: these are typed facts about the failure
-                // (a run id, the stage holding the catalog graph, the mode it
-                // asked for), and they read as fields of the failure rather
-                // than as one opaque member. Absent for every failure that is
-                // not a stage-lock refusal, which is the only branch that
-                // supplies them.
+                // (the release member and the food key a refusal is about, the
+                // sentence this repository composed for it, a run id, the stage
+                // holding the catalog graph and the mode it asked for, or the
+                // remedy for a database that stopped answering), and they read
+                // as fields of the failure rather than as one opaque member.
+                // Every arm of describeFailure except the three that have
+                // nothing to add supplies them.
                 ...failure.detail,
             });
             process.exit(1);

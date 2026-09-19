@@ -151,6 +151,27 @@ export interface CatalogFoodRow {
 }
 
 /**
+ * One row of the search page, which carries the size of the whole match set
+ * alongside the food.
+ *
+ * `match_total` is a `COUNT(*) OVER ()` window over the de-duplicated ranked set
+ * the page is cut from, so every row of one page repeats the same value and
+ * `total` needs no second statement. It is a `bigint` because PostgreSQL's
+ * `count()` returns `int8` and Prisma maps that to `BigInt` — the caller narrows
+ * it once, the way it already narrowed the separate count's column.
+ *
+ * WHY THIS IS A DISTINCT TYPE rather than an optional field on
+ * {@link CatalogFoodRow}: the window column exists only in the paging statement.
+ * The suggestion query and the portion lookup read neither it nor a superset of
+ * it, and `mapCatalogFood` must keep accepting a row that has never heard of a
+ * match total, so widening the shared shape would make every other reader carry
+ * a field it cannot supply.
+ */
+export interface CatalogSearchPageRow extends CatalogFoodRow {
+    match_total: bigint;
+}
+
+/**
  * The three columns the dislike-suggestion chips need. Structurally a subset of
  * {@link CatalogFoodRow}, so a full row satisfies it without a second query.
  */

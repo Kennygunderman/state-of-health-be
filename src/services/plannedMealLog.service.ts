@@ -5,11 +5,16 @@
 // neighbour, and the delegation is what makes each of them testable without a
 // database (§7, §11):
 //
-//  * `plannedMealLog.logic.ts` owns the rules: `requireLoggableTarget` (the two
-//    independent 404 conditions — the diary bucket must be the caller's and
-//    filed under the date being logged, and the date must fall inside the plan's
-//    week) and `derivePlannedSnapshot` (what the `meal_entries` row claims the
-//    food IS, with each macro rounded exactly once).
+//  * `plannedMealLog.logic.ts` owns the rules: `requireDateInPlanWeek` (the
+//    logged date must fall inside the plan's own week — a REQUEST verdict,
+//    `400 invalid_request [{date, outside_plan_week}]`, §0.5.2),
+//    `requireLoggableTarget` (the diary-bucket conditions, which are one
+//    indistinguishable 404: the bucket must be the caller's, live, and filed
+//    under the date being logged) and `derivePlannedSnapshot` (what the
+//    `meal_entries` row claims the food IS, with each macro rounded exactly
+//    once). The date and the bucket are two rules and two answers because one of
+//    them judges the caller's own input against a plan already proven theirs,
+//    while the others would leak the existence of rows they do not own.
 //  * `mealPlan.logic.ts` owns `requireWritablePlan`: a superseded or ended plan
 //    cannot be logged against.
 //  * `mealPlan.mapper.ts` owns the SHAPE of the meal DTO this response carries
@@ -98,6 +103,7 @@ import {
     ParsedLogPlannedMealRequest,
     derivePlannedSnapshot,
     parseLogPlannedMealCall,
+    requireDateInPlanWeek,
     requireLoggableTarget,
 } from './plannedMealLog.logic';
 import { dayKeyInTimeZone, loadPreferencesRow } from './preferences.service';
@@ -359,11 +365,16 @@ export type LogPlannedMealResult = { kind: 'ok'; result: KeyedActionResult } | L
  *     retrying something already done.
  *  3. THE MEAL, in one owner-bearing predicate `{id, meal_plan_id, user_id}`
  *     (§5.1), joined to its recipe version.
- *  4. THE DIARY BUCKET, by `{id, user_id}`, then `requireLoggableTarget` — which
- *     answers `PlanNotFoundError` for a bucket that is not the caller's, one
- *     filed under another day, and a date outside the plan's week alike. One
- *     class for all four, because a response that distinguished them would be an
- *     oracle for what exists in another user's diary (§0.5.2's 404).
+ *  4. THE DIARY BUCKET, by `{id, user_id}`, then the two target rules in the
+ *     order the client experiences them: `requireDateInPlanWeek`, which answers
+ *     `OutsidePlanWeekError` (`400 invalid_request` naming `date`) for a
+ *     well-formed day key outside the plan's week — a verdict on the request,
+ *     reachable only because steps 1 and 3 have already proven the plan and the
+ *     meal are the caller's — and then `requireLoggableTarget`, which answers
+ *     `PlanNotFoundError` for a bucket that is not the caller's, one that is
+ *     deleted, and one filed under another day alike. One class for those three,
+ *     because a response that distinguished them would be an oracle for what
+ *     exists in another user's diary (§0.5.2's 404).
  *  5. THE SNAPSHOT, from `derivePlannedSnapshot` — which owns the single
  *     rounding — inserted through `insertPlannedMealEntry` with the servings
  *     the request asked for. The writer stores those integers verbatim, so
@@ -429,6 +440,25 @@ export const logPlannedMeal = async (
                 const diaryMeal = await lockedTx.meals.findFirst({
                     where: { id: payload.diaryMealId, user_id: userId },
                     select: { id: true, user_id: true, date: true, deleted_at: true },
+                });
+
+                // THE DATE VERDICT FIRST, AND SEPARATELY FROM THE BUCKET'S.
+                // §0.5.2 states `date ∈ [plan.startDate, plan.endDate]` among
+                // this route's request validations, so a well-formed day key
+                // outside the week is `400 invalid_request [{date,
+                // outside_plan_week}]` — the same typing a malformed date on
+                // this route already gets — and not one of the 404s below.
+                //
+                // It is safe HERE and nowhere earlier: the plan has been read by
+                // `{id, user_id}` (step 1) and the meal by `{id, meal_plan_id,
+                // user_id}` (step 3), so both are proven the caller's and a date
+                // verdict cannot confirm the existence of either. The position
+                // is also exactly where the week used to be judged inside
+                // `requireLoggableTarget`, so the order in which a request meets
+                // the four refusals is unchanged.
+                requireDateInPlanWeek(payload.date, {
+                    start_date: plan.startDate,
+                    end_date: plan.endDate,
                 });
 
                 requireLoggableTarget({

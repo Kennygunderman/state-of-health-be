@@ -25,11 +25,11 @@
 //    read "was 2.5 lb", because a baseline that moved with each diff would
 //    quietly lie about what the shopper actually bought.
 //
-//  * THE SAME-DISPLAY EXCEPTION. An increase that does not move the rendered
-//    text (2.51 -> 2.53 lb) updates the grams and raises no flag. A flag the
-//    user cannot see on the row is noise — and that holds however far the
-//    amount has drifted from the acknowledged one, so an invisible increase
-//    onto a row a decrease has already unflagged raises nothing either.
+//  * THE SAME-DISPLAY EXCEPTION. An amount whose rendered text does not differ
+//    from the ACKNOWLEDGED one (2.51 -> 2.53 lb) updates the grams and carries
+//    no flag. A flag the user cannot see on the row is noise — and because a
+//    row's text is always the rendering of the grams that row stores, "visible
+//    against what was acknowledged" and "visible on the row" are one question.
 //
 //  * THE UNIT-FAMILY LOCK. A row's unit family is chosen once, at plan
 //    generation, from the food's default portion, and every later update reads
@@ -38,11 +38,15 @@
 //    inside one family. Re-deriving the family per update is what would
 //    eventually break it.
 //
-// A decrease is deliberately SILENT: the number changes, the check stays, and
-// nothing is flagged, sub-lined or announced — a flag the row was already
-// carrying is cleared rather than left standing over an amount that has come
-// back down. Nothing disappears from the shopper's list and nothing shouts at
-// them about less shopping.
+// A decrease ADDS nothing: the number changes, the check stays, and no flag,
+// sub-line or banner is created by the fall itself — nothing disappears from
+// the shopper's list and nothing shouts at them about less shopping. What a
+// decrease does NOT do is retract a warning that is still true. A flag the row
+// is carrying stands until the amount comes back to, or below, what the shopper
+// acknowledged — or until the shopper acknowledges the row again by toggling it
+// — because until then the row still asks them for more than they bought, and
+// §0.7.3's baseline exists precisely so repeated swaps keep comparing with what
+// they actually saw.
 //
 // Division of responsibility, stated once because both boundaries are easy to
 // drift across:
@@ -149,7 +153,13 @@ const QUARTERS_SCALE = 4;
  */
 export const COUNT_DISPLAY_UNIT = 'count';
 
-/** The one `food_state` that never earns a name suffix on its own. */
+/**
+ * The UNMARKED `food_state` — the one §0.7.3 and §6.2 of
+ * `docs/meal-planning/planning-policy.md` name as earning no suffix on its own.
+ *
+ * It is the key its row of {@link STATE_LABELS} is written under, so the policy
+ * sentence and the label table cannot drift apart.
+ */
 const RAW_FOOD_STATE = 'raw';
 
 /** Separates the two halves of an aggregation key; neither half can contain it. */
@@ -213,16 +223,36 @@ export const isGroceryRenderingFault = (error: unknown): boolean =>
  *  - `invalid_id` — a path id that is not a v4 UUID.
  *  - `required` — `isChecked` is absent or null.
  *  - `invalid_type` — `isChecked` is present but not a boolean.
+ *  - `unknown_field` — a body key this endpoint does not accept.
+ *
+ * Spelt as `swap.logic.ts`, `plannedMealLog.logic.ts`, `mealPlan.logic.ts` and
+ * `preferences.logic.ts` spell the same conditions, so the client maps one
+ * vocabulary rather than one per endpoint.
  */
 export const GROCERY_FIELD_CODES = {
     INVALID_ID: 'invalid_id',
     REQUIRED: 'required',
     INVALID_TYPE: 'invalid_type',
+    UNKNOWN_FIELD: 'unknown_field',
 } as const;
 
 const PLAN_ID_FIELD = 'planId';
 const ITEM_ID_FIELD = 'itemId';
 const IS_CHECKED_FIELD = 'isChecked';
+
+/**
+ * Every key the toggle body accepts — and therefore, by omission, the
+ * definition of an unknown one.
+ *
+ * §0.5.1 gives this route no idempotency key and no expected revision, which is
+ * a statement about what it REQUIRES and not a licence to swallow either one: a
+ * client that sends `expectedPlanRevision` believes it asked for an
+ * optimistic-concurrency guard, and silence would let it believe the guard was
+ * applied. `planId` and `itemId` are absent deliberately — they are PATH
+ * values, and honouring them in the body would let a client aim a check mark at
+ * one row while the route named another.
+ */
+const ACCEPTED_TOGGLE_FIELDS: readonly string[] = [IS_CHECKED_FIELD];
 
 const requirePositiveFinite = (value: number, label: string): number => {
     if (!Number.isFinite(value) || value <= 0) {
@@ -841,11 +871,82 @@ export const indexFoodStatesByName = (
     return index;
 };
 
-/** The state code's own words: `as_purchased` -> `['as', 'purchased']`. */
-const stateWords = (foodState: string): string[] => foodState.toLowerCase().match(/[a-z]+/g) ?? [];
+/**
+ * The two labels a `food_state` can contribute to a shopping name.
+ *
+ * A stored state is an INTERNAL CODE, and printing it is how "Olive oil, as
+ * purchased" and "Peanut butter, prepared" reached a shopping list — 30 of the
+ * 69 foods the seeded recipes use carried such a suffix. A shopper buys olive
+ * oil; `as_purchased` says only that the catalog tabulated it in the form the
+ * shop sells, which is the default assumption of every line on the list. So
+ * each state states what it is worth saying, in the words a shopper would use,
+ * and the answer differs by WHY the state is being said:
+ *
+ *  * `ordinary` is the suffix a row carries on its own. It is EMPTY for the
+ *    three states that describe how the catalog measured the food rather than
+ *    what the shopper buys — `raw`, `as_purchased` and `prepared` — and it
+ *    keeps its word for `dry` and `cooked`, which are genuine shopping
+ *    distinctions: dry lentils and cooked lentils are different purchases, and
+ *    §0.7.3's own worked examples are exactly "Rice, dry" / "Rice, cooked".
+ *  * `distinguishing` is the label a row carries only when two states of ONE
+ *    display name are both on the list and the rows would otherwise read
+ *    identically. There an empty label is not available — two lines have to be
+ *    two lines — so every state has a shopper-readable one, and the two that
+ *    say nothing on their own say the least misleading thing they can: `as
+ *    sold` and `ready to use`.
+ */
+interface StateLabels {
+    readonly ordinary: string;
+    readonly distinguishing: string;
+}
 
 /**
- * Whether the name's own qualifiers already state this state, LITERALLY.
+ * The five `catalog_foods.food_state` values, with the words each contributes.
+ *
+ * Closed against the enum §0.7.3 declares, and consulted by key rather than by
+ * word-splitting the code — the splitting is what turned `as_purchased` into
+ * shopper copy.
+ */
+const STATE_LABELS: Readonly<Record<string, StateLabels>> = {
+    [RAW_FOOD_STATE]: { ordinary: '', distinguishing: RAW_FOOD_STATE },
+    as_purchased: { ordinary: '', distinguishing: 'as sold' },
+    prepared: { ordinary: '', distinguishing: 'ready to use' },
+    dry: { ordinary: 'dry', distinguishing: 'dry' },
+    cooked: { ordinary: 'cooked', distinguishing: 'cooked' },
+};
+
+/** A label's own words: `as sold` -> `['as', 'sold']`, `as_purchased` -> `['as', 'purchased']`. */
+const labelWords = (label: string): string[] => label.toLowerCase().match(/[a-z]+/g) ?? [];
+
+/**
+ * The labels for a state, falling back to the state's own humanised words.
+ *
+ * A future enum value the map has not been told about degrades to READABLE
+ * rather than to silent: `air_dried` would render "Beef, air dried", which is
+ * plainer than the copy a reviewed label would give it but still names the
+ * distinction the shopper is buying — and a state the list cannot say anything
+ * about at all would be worse than a rough word for it. A token with no letters
+ * in it states nothing truthful, so such a row carries no suffix instead of a
+ * dangling comma.
+ */
+const stateLabelsFor = (foodState: string): StateLabels => {
+    if (Object.prototype.hasOwnProperty.call(STATE_LABELS, foodState)) {
+        return STATE_LABELS[foodState];
+    }
+
+    const humanised = labelWords(foodState).join(' ');
+
+    return { ordinary: humanised, distinguishing: humanised };
+};
+
+/**
+ * Whether the name's own qualifiers already state the label about to be
+ * appended, LITERALLY.
+ *
+ * THE LABEL, NOT THE STATE CODE: the de-duplication has to read the words the
+ * name would actually gain, or a state whose spelling the label map changed
+ * would stop being recognised in names that already say it — "Flour, as sold"
+ * would become "Flour, as sold, as sold".
  *
  * Only the qualifiers are read — everything after the FIRST comma — so a food
  * whose own NOUN resembles a state is unaffected: "Dry-aged beef" on a `dry`
@@ -854,7 +955,7 @@ const stateWords = (foodState: string): string[] => foodState.toLowerCase().matc
  * not the state either: "Rolled oats, dry" on a `cooked` row is a different
  * food from the dry one and must still read "..., cooked".
  *
- * The match is literal containment of the state's OWN words as a contiguous run
+ * The match is literal containment of the label's OWN words as a contiguous run
  * of whole words, and nothing else: no synonyms, no equivalences, no
  * stem-matching. That is what makes the rule predictable — "Brown rice, cooked"
  * and "Peas, cooked in water" say `cooked` and keep their names, while
@@ -863,41 +964,49 @@ const stateWords = (foodState: string): string[] => foodState.toLowerCase().matc
  * substitution that used to hide the stored state behind a preparation word the
  * catalog happened to choose.
  */
-const qualifiersStateTheState = (baseName: string, foodState: string): boolean => {
+const qualifiersStateTheLabel = (baseName: string, label: string): boolean => {
     const [, ...qualifiers] = baseName.split(',');
     const words = qualifiers.join(' ').toLowerCase().match(/[a-z]+/g) ?? [];
 
-    return containsWordRun(words, stateWords(foodState));
+    return containsWordRun(words, labelWords(label));
 };
 
 /**
- * The shopping name: the base name, plus the state whenever the state is not
- * `raw`.
+ * The shopping name: the base name, plus the state's own label whenever the
+ * state is worth saying to a shopper.
  *
  * §0.7.3 and §6.2 of `docs/meal-planning/planning-policy.md` state the rule this
  * implements: "the food state is shown as a name suffix whenever it is not
  * `raw`, or whenever two states of one food coexist on the list… `raw` alone
- * earns no suffix, because it is the unmarked case". A shopper buying
- * `as_purchased` honey and `cooked` chickpeas is buying two different kinds of
- * thing, and the row is the only place that can say so.
+ * earns no suffix, because it is the unmarked case". WHAT IS SHOWN IS THE
+ * STATE'S SHOPPER LABEL AND NEVER ITS STORED CODE ({@link STATE_LABELS}), and
+ * three of the five states have nothing to say on a shopping line — `raw`
+ * because it is the unmarked case the policy already names, `as_purchased` and
+ * `prepared` because they describe the form the CATALOG measured the food in,
+ * which is the default assumption of every line a shopper reads. `dry` and
+ * `cooked` keep their words, because dry rice and cooked rice are different
+ * purchases.
  *
- * THE STATE IS STATED EXACTLY ONCE — never omitted, and never twice. Three
- * rules, in this order:
+ * THE LABEL IS STATED EXACTLY ONCE — never omitted where it distinguishes, and
+ * never twice. Three rules, in this order:
  *
- *  1. COEXISTENCE QUALIFIES EVERY ROW THAT DOES NOT ALREADY SAY ITS STATE.
- *     While one base name is on the list in more than one state, each of its
- *     rows has to render a distinguishable line — that is what keeps "Rice,
- *     dry" and "Rice, cooked" two lines rather than one — and it is the only
- *     reason a `raw` row is ever qualified. But a name that ALREADY states the
- *     row's own state needs no suffix to be distinguishable: a "Peas, cooked"
- *     food present in both `cooked` and `raw` renders "Peas, cooked" and
- *     "Peas, cooked, raw", which are two distinct lines each stating its own
- *     state once. Suffixing the first would render "Peas, cooked, cooked",
- *     which states it twice.
- *  2. UNLESS ANOTHER COEXISTING STATE IS LITERALLY STATED TOO, IN WHICH CASE
+ *  1. COEXISTENCE QUALIFIES EVERY ROW THAT DOES NOT ALREADY SAY ITS STATE, with
+ *     that state's DISTINGUISHING label. While one base name is on the list in
+ *     more than one state, each of its rows has to render a distinguishable
+ *     line — that is what keeps "Rice, dry" and "Rice, cooked" two lines rather
+ *     than one — and it is the only reason a `raw`, an `as_purchased` or a
+ *     `prepared` row is ever qualified: "Olive oil, as sold" beside "Olive oil,
+ *     cooked" is two lines, while two bare "Olive oil" lines would send the
+ *     shopper home with half of what the week needs. But a name that ALREADY
+ *     states the row's own label needs no suffix to be distinguishable: a
+ *     "Peas, cooked" food present in both `cooked` and `raw` renders "Peas,
+ *     cooked" and "Peas, cooked, raw", which are two distinct lines each
+ *     stating its own state once. Suffixing the first would render "Peas,
+ *     cooked, cooked", which states it twice.
+ *  2. UNLESS ANOTHER COEXISTING LABEL IS LITERALLY STATED TOO, IN WHICH CASE
  *     THE SUFFIX IS UNCONDITIONAL. This is the collision guard, and it is why
  *     rule 1 is not simply "de-duplicate first". A base name can state BOTH
- *     states of a coexisting pair — "Beans, cooked and dry" in `cooked` and in
+ *     labels of a coexisting pair — "Beans, cooked and dry" in `cooked` and in
  *     `dry` — and de-duplicating both rows would render one identical string
  *     twice, which is exactly the collapse coexistence exists to prevent. Both
  *     are therefore suffixed: "Beans, cooked and dry, cooked" and "Beans,
@@ -905,40 +1014,39 @@ const qualifiersStateTheState = (baseName: string, foodState: string): boolean =
  *
  *     The guard is also what makes rule 1 safe in general. At most ONE row of a
  *     coexisting name can ever de-duplicate: if two rows both stated their own
- *     state, the qualifiers they SHARE would state both states, and the guard
+ *     label, the qualifiers they SHARE would state both labels, and the guard
  *     would fire for both. And a de-duplicated name (the bare base) can never
- *     equal a suffixed one (the base plus ", state"), so no pair of rows can
- *     collide.
- *  3. OTHERWISE THE STATE IS APPENDED UNLESS THE NAME ALREADY SAYS IT. `raw`
- *     alone is silent; every other state is appended, with the underscores read
- *     as words ("as purchased"), unless the name's own qualifiers already
- *     contain those words literally ({@link qualifiersStateTheState}) — which is
- *     only ever a de-duplication, never a substitution. So "Brown rice, cooked"
- *     stays as it is and "Black beans, canned" becomes "Black beans, canned,
- *     cooked": the catalog's qualifier is kept AND the stored state is stated,
- *     exactly once.
+ *     equal a suffixed one (the base plus ", label"), so no pair of rows can
+ *     collide — every distinguishing label is a non-empty string, and no two
+ *     states share one.
+ *  3. OTHERWISE THE STATE'S ORDINARY LABEL IS APPENDED UNLESS THE NAME ALREADY
+ *     SAYS IT. `raw`, `as_purchased` and `prepared` have no ordinary label and
+ *     are silent; `dry` and `cooked` are appended unless the name's own
+ *     qualifiers already contain those words literally
+ *     ({@link qualifiersStateTheLabel}) — which is only ever a de-duplication,
+ *     never a substitution. So "Olive oil" in `as_purchased` is "Olive oil",
+ *     "Brown rice, cooked" stays as it is, and "Black beans, canned" becomes
+ *     "Black beans, canned, cooked": the catalog's qualifier is kept AND the
+ *     stored state is stated, exactly once.
  *
  * This is the one place a grocery state code becomes words, because the name is
  * text this module owns.
  */
 export const buildGroceryName = (baseName: string, foodState: string, statesByName: FoodStatesByName): string => {
     const coexistingStates = statesByName.get(baseName);
-    const suffixed = `${baseName}, ${foodState.replace(/_/g, ' ')}`;
-    const nameStatesThisState = qualifiersStateTheState(baseName, foodState);
+    const labels = stateLabelsFor(foodState);
+    const suffixedWith = (label: string): string => (label === '' ? baseName : `${baseName}, ${label}`);
 
     if (coexistingStates !== undefined && coexistingStates.size > 1) {
-        const nameStatesACoexistingState = [...coexistingStates].some(
-            (state) => state !== foodState && qualifiersStateTheState(baseName, state),
+        const nameStatesThisLabel = qualifiersStateTheLabel(baseName, labels.distinguishing);
+        const nameStatesACoexistingLabel = [...coexistingStates].some(
+            (state) => state !== foodState && qualifiersStateTheLabel(baseName, stateLabelsFor(state).distinguishing),
         );
 
-        return nameStatesThisState && !nameStatesACoexistingState ? baseName : suffixed;
+        return nameStatesThisLabel && !nameStatesACoexistingLabel ? baseName : suffixedWith(labels.distinguishing);
     }
 
-    if (foodState === RAW_FOOD_STATE) {
-        return baseName;
-    }
-
-    return nameStatesThisState ? baseName : suffixed;
+    return qualifiersStateTheLabel(baseName, labels.ordinary) ? baseName : suffixedWith(labels.ordinary);
 };
 
 /* ---------------------------------------------------------------------------
@@ -1032,18 +1140,32 @@ export const buildGroceryRows = (
 
     return lines
         .map(({ total, fact }) => {
-            const display = buildGroceryDisplay(
-                total.quantity_grams,
-                displayFamilyForPortion(fact),
-                fact,
-            );
+            // THE ROW IS RENDERED FROM THE GRAMS IT STORES, NOT FROM THE
+            // AGGREGATE BEHIND THEM. The sum is kept at full precision so
+            // rounding each contribution cannot drift the total, but the column
+            // holds two decimals — so the truncation happens ONCE, here, and
+            // both the stored number and the text it renders come from that one
+            // value. Rendering the untruncated aggregate instead put a row's
+            // text and its own `quantity_grams` on opposite sides of a
+            // display-rounding midpoint (13.1625 g renders "1¾ tbsp" while the
+            // stored 13.16 g renders "1½ tbsp"), and every flag decision pays
+            // for it twice: `applyToggle` records the acknowledged baseline as
+            // GRAMS, so `buildGroceryFlag` re-renders those grams for "was Y"
+            // while "Now X" is the row's stored text — overstating the pill in
+            // one direction — and `diffGroceryList`'s visibility test compares
+            // the stored text against that same re-rendering, suppressing a
+            // genuine, visible increase in the other. One truncation makes the
+            // baseline re-render to exactly the text the row was showing, which
+            // is what both rules assume.
+            const storedGrams = toStoredGrams(total.quantity_grams);
+            const display = buildGroceryDisplay(storedGrams, displayFamilyForPortion(fact), fact);
 
             return {
                 catalog_food_id: total.catalog_food_id,
                 food_state: total.food_state,
                 category: mapCategoryToGroceryCategory(fact.category),
                 name: buildGroceryName(fact.name, total.food_state, statesByName),
-                quantity_grams: toStoredGrams(total.quantity_grams),
+                quantity_grams: storedGrams,
                 display_quantity: display.quantity,
                 display_unit: display.unit,
                 display_text: display.text,
@@ -1348,17 +1470,15 @@ const sameInstant = (a: Date | null, b: Date | null): boolean => {
  *    reading.
  *  - INCREASED on a CHECKED row keeps the check — nothing may disappear from
  *    the list — and flags instead, against the acknowledged baseline.
- *  - An increase whose rendered text does not move is stored but RAISES no
- *    flag — including once a decrease has cleared one and left the row reading
- *    more than was acknowledged. A flag that already stands survives such an
- *    increase, because retracting a warning the user is looking at over a
- *    change they cannot see would be the same noise in reverse.
+ *  - An amount whose rendered text equals the ACKNOWLEDGED one carries no
+ *    flag, whichever way it moved: there is nothing for the shopper to see.
  *  - INCREASED on an unchecked row is just a new amount.
- *  - DECREASED updates the text and stays silent: check kept, and any standing
- *    flag CLEARED — the amount the shopper was warned about has gone away, so
- *    the warning goes with it, even when the new amount is still above what
- *    they acknowledged. The acknowledged baseline itself is kept, so a later
- *    increase is still measured from the amount they actually saw.
+ *  - DECREASED updates the text and announces nothing of its own: the check is
+ *    kept, and no flag is created by a fall. A flag the row is already carrying
+ *    STANDS while the new amount is still visibly above what was acknowledged,
+ *    and is CLEARED once it comes back to or below it. The acknowledged
+ *    baseline itself never moves here, so every later comparison is still
+ *    against the amount the shopper actually saw.
  *  - NEW arrives unchecked; REMOVED is deleted and counted, checked or not.
  *
  * `is_checked` is never part of an update: a recomputation of the week is not a
@@ -1418,38 +1538,40 @@ export const diffGroceryList = (
                 : buildGroceryDisplay(quantityGrams, family, fact);
 
         const baselineGrams = acknowledgedBaselineGrams(row);
-        // A flag the user cannot see on the row is noise, and the two texts it
-        // has to be visible against are different questions. It must differ
-        // from the ACKNOWLEDGED amount, or the pill would read "was 2.5 lb,
-        // Now 2.5 lb"; and RAISING a new one additionally requires this diff to
-        // have moved the row's OWN text, because an increase that leaves "2.9
-        // lb" reading "2.9 lb" is the same-display exception however far the
-        // amount has drifted from what was acknowledged. The second test is
-        // skipped for a flag that already stands: a later invisible increase
-        // must not retract a warning the user is already looking at.
+        // THE FLAG IS A STANDING STATEMENT ABOUT THE ACKNOWLEDGED AMOUNT, NOT A
+        // REPORT ON THE LAST CHANGE. It stands while the row asks a checked
+        // shopper for more than the amount they acknowledged AND the row shows
+        // it: above the baseline, or the pill would read "was 2.5 lb, Now
+        // 2.5 lb"; and visibly above it, because a warning the user cannot see
+        // on the row is noise — an amount that has drifted from 2.9 lb to
+        // 2.9 lb is the same-display exception however far the grams have moved.
+        //
+        // NEITHER TEST CONSULTS THE DIRECTION OF THIS DIFF, and that is the
+        // correction: judging the flag by the direction let a second swap that
+        // merely LOWERED an amount still above the baseline (3.1 lb -> 2.8 lb
+        // against an acknowledged 2.5 lb) clear a flag the shopper had never
+        // acknowledged, leaving a row they had ticked off silently asking for
+        // more than they bought. Dropping the direction test is safe rather
+        // than lax because visibility is judged against the ACKNOWLEDGED text
+        // and the rounding is monotone: a decrease can never newly become
+        // visible against a lower baseline, so a decrease can only ever keep a
+        // flag that was already true or clear one that has stopped being true.
         const aboveAcknowledged = classifyQuantityChange(baselineGrams, quantityGrams) === 'increased';
         const visibleAgainstAcknowledged =
             display.text !== buildGroceryDisplay(baselineGrams, family, fact).text;
-        const raisesOrKeepsAFlag = row.flagged_at !== null || display.text !== row.display_text;
 
-        const flagged =
-            change === 'increased' &&
-            row.is_checked &&
-            aboveAcknowledged &&
-            visibleAgainstAcknowledged &&
-            raisesOrKeepsAFlag;
+        const flagStands = row.is_checked && aboveAcknowledged && visibleAgainstAcknowledged;
 
         const previousQuantityGrams = row.is_checked ? baselineGrams : null;
-        // Only the change that actually arrived may re-judge the flag, which is
-        // why the direction is consulted and not just the baseline comparison.
-        // An INCREASE raises one, or keeps the instant an earlier one carries. A
-        // DECREASE clears it, because a smaller amount is nothing to warn about
-        // even while it stays above the acknowledged baseline. An UNCHANGED row
-        // keeps whatever it already had, deliberately WITHOUT re-deriving the
-        // predicate: the baseline is still below the current amount after a
-        // decrease has cleared a flag, so re-deriving it would raise a brand-new
-        // flag on an inert re-aggregation that told the shopper nothing.
-        const flaggedAt = change === 'unchanged' ? row.flagged_at : flagged ? (row.flagged_at ?? now) : null;
+        // An UNCHANGED row keeps whatever it already had, deliberately WITHOUT
+        // re-deriving the predicate: sub-epsilon noise is not a change the
+        // shopper made or the week made, so it may neither raise a flag nor
+        // retract one. Every other outcome re-derives the standing decision
+        // above and PRESERVES THE INSTANT a flag already carries, because the
+        // divergence dates from when it was raised — which is also what keeps
+        // "was Y" measured from the amount the user actually saw across any
+        // number of later swaps.
+        const flaggedAt = change === 'unchanged' ? row.flagged_at : flagStands ? (row.flagged_at ?? now) : null;
 
         const needsWrite =
             row.name !== draft.name ||
@@ -1720,11 +1842,43 @@ export const parseGroceryItemPath = (params: {
 };
 
 /**
+ * The refusal's message: the field's own sentence while `isChecked` is the only
+ * problem, and the general one once a stray key is in play.
+ *
+ * The two single-field sentences are unchanged, so a client rendering either
+ * beside the field keeps its copy; `details` is what the client actually maps,
+ * and it names every problem either way.
+ */
+const toggleRefusalMessage = (details: readonly InvalidRequestDetail[]): string => {
+    if (details.length === 1 && details[0].field === IS_CHECKED_FIELD) {
+        return details[0].code === GROCERY_FIELD_CODES.REQUIRED
+            ? 'isChecked is required'
+            : 'isChecked must be a boolean';
+    }
+
+    return 'The grocery check request is not valid';
+};
+
+/**
  * Validates the toggle body.
  *
  * `isChecked` must be an actual boolean: a truthy string or a 0/1 would let a
  * client set a check mark by accident, and the desired state is the whole
  * request.
+ *
+ * UNKNOWN KEYS ARE REPORTED, NOT IGNORED, for the reason
+ * `swap.logic.ts::parseSwapCommitRequest` and
+ * `plannedMealLog.logic.ts::parseLogPlannedMealRequest` report theirs:
+ * dropping a key silently lets a client believe a value it sent was honoured.
+ * This route is the one where that matters most, because the value a client
+ * would most plausibly send — `expectedPlanRevision` — asks for a concurrency
+ * guard that this endpoint deliberately does not implement (§0.5.1: a check
+ * mark is not a plan change), and an accepted request is the server saying it
+ * did something it did not.
+ *
+ * THE VERDICTS ACCUMULATE rather than short-circuit, exactly as the two ids of
+ * {@link parseGroceryItemPath} do: a body with a bad `isChecked` AND a stray
+ * key reports both, so the caller is not sent back twice.
  */
 export const parseToggleGroceryBody = (body: unknown): ParsedToggleGroceryBody => {
     if (typeof body !== 'object' || body === null || Array.isArray(body)) {
@@ -1733,21 +1887,30 @@ export const parseToggleGroceryBody = (body: unknown): ParsedToggleGroceryBody =
         ]);
     }
 
-    const isChecked = (body as Record<string, unknown>)[IS_CHECKED_FIELD];
+    const record = body as Record<string, unknown>;
+    const isChecked = record[IS_CHECKED_FIELD];
+    const details: InvalidRequestDetail[] = [];
 
     if (isChecked === undefined || isChecked === null) {
-        return invalidRequest('isChecked is required', [
-            { field: IS_CHECKED_FIELD, code: GROCERY_FIELD_CODES.REQUIRED },
-        ]);
+        details.push({ field: IS_CHECKED_FIELD, code: GROCERY_FIELD_CODES.REQUIRED });
+    } else if (typeof isChecked !== 'boolean') {
+        details.push({ field: IS_CHECKED_FIELD, code: GROCERY_FIELD_CODES.INVALID_TYPE });
     }
 
-    if (typeof isChecked !== 'boolean') {
-        return invalidRequest('isChecked must be a boolean', [
-            { field: IS_CHECKED_FIELD, code: GROCERY_FIELD_CODES.INVALID_TYPE },
-        ]);
+    for (const key of Object.keys(record)) {
+        if (!ACCEPTED_TOGGLE_FIELDS.includes(key)) {
+            details.push({ field: key, code: GROCERY_FIELD_CODES.UNKNOWN_FIELD });
+        }
     }
 
-    return { kind: 'ok', payload: { isChecked } };
+    if (details.length > 0) {
+        return invalidRequest(toggleRefusalMessage(details), details);
+    }
+
+    // The guard above established the type; the assertion carries that
+    // knowledge into the payload, as the other parser layers do, rather than
+    // re-testing it in a branch no input could reach.
+    return { kind: 'ok', payload: { isChecked: isChecked as boolean } };
 };
 
 /* ---------------------------------------------------------------------------

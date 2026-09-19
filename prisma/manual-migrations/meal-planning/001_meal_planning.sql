@@ -5,12 +5,14 @@
 -- This file is that migration's DDL, statement for statement, rewritten so it can
 -- be re-run safely. No npm script, CI step or Prisma command runs this folder.
 --
--- One statement carries a context guard as well as an idempotency guard, and it
--- is the only place this copy is conditional on anything but its own prior
--- application: the `idx_catalog_food_aliases_lower_alias` index, which a later
--- ledger entry retires. The reasoning sits with the statement itself, and the
--- equivalence it preserves is measured by the ledger-equivalence gate rather
--- than claimed here.
+-- Two statements carry a context guard as well as an idempotency guard, and they
+-- are the only places this copy is conditional on anything but its own prior
+-- application: the `idx_catalog_food_aliases_lower_alias` index and the
+-- `meal_plans_user_id_status_start_date_idx` index, each of which a later ledger
+-- entry retires. Both guards have the same shape - skip when the replacement
+-- construct is already present - and the reasoning sits with each statement
+-- itself. The equivalence they preserve is measured by the ledger-equivalence
+-- gate rather than claimed here.
 --
 -- Running it by hand is normally unnecessary, because the Prisma migration is
 -- applied automatically: the container's final command is
@@ -38,7 +40,7 @@
 -- before the foreign keys, and NOT NULL on the twelve required TEXT[]/UUID[]
 -- columns. Prisma cannot express any of them, which is why the authoritative
 -- migration writes them by hand and this copy repeats them - verbatim but for
--- the one context-guarded index named above. Of the
+-- the two context-guarded indexes named above. Of the
 -- three, the generated expression is the one `prisma migrate diff` reports.
 -- The expression index, the partial indexes and the array NOT NULLs are
 -- invisible to that command - a recorded AAP-versus-tool divergence, with the
@@ -462,7 +464,39 @@ CREATE INDEX IF NOT EXISTS "recipe_ingredients_recipe_version_id_idx" ON "recipe
 CREATE UNIQUE INDEX IF NOT EXISTS "meal_plan_preferences_user_id_key" ON "meal_plan_preferences"("user_id");
 
 -- CreateIndex
-CREATE INDEX IF NOT EXISTS "meal_plans_user_id_status_start_date_idx" ON "meal_plans"("user_id", "status", "start_date");
+-- THE SECOND CONTEXT-GUARDED STATEMENT IN THIS FILE, guarded for exactly the
+-- reason the `idx_catalog_food_aliases_lower_alias` block below is, and in the
+-- same shape. The authoritative migration's line reads
+--   CREATE INDEX "meal_plans_user_id_status_start_date_idx"
+--     ON "meal_plans"("user_id", "status", "start_date");
+-- unconditionally, and applied to a pre-feature schema - the only context this
+-- file is written for - the block below does exactly that.
+--
+-- WHY IT IS GUARDED AT ALL. 20260911000000_catalog_alias_search_vector_and_read_stats
+-- RETIRES this index in favour of "meal_plans_user_id_start_date_id_idx": the
+-- plan-lifecycle statement carries no status predicate and orders by
+-- (start_date, id), so this one measured zero index scans across the whole read
+-- workload while the status-filtered reads went to the partial index
+-- unique_active_meal_plan_start_date instead (that migration's header carries
+-- the measurements). Applied on top of an already-deployed ledger, an unguarded
+-- statement would resurrect a construct the ledger has already dropped, and this
+-- file would stop being the no-op the dual-ledger gate asserts it is in that
+-- order. Skipping when the replacement index is present is the same idempotency
+-- discipline as the IF NOT EXISTS guards elsewhere here, applied to the one
+-- other statement whose later fate in the ledger is removal rather than
+-- repetition.
+--
+-- Both operator procedures still end with the replacement index alone in place,
+-- because both reach 20260911000000 through `prisma migrate deploy` after
+-- `prisma migrate resolve --applied 20260908000000_meal_planning`, and that
+-- migration's own DROP is written `IF EXISTS` so the order that takes this
+-- guard's skip branch does not fail for finding nothing to drop.
+DO $$
+BEGIN
+    IF to_regclass('"meal_plans_user_id_start_date_id_idx"') IS NULL THEN
+        CREATE INDEX IF NOT EXISTS "meal_plans_user_id_status_start_date_idx" ON "meal_plans"("user_id", "status", "start_date");
+    END IF;
+END $$;
 
 -- CreateIndex
 CREATE UNIQUE INDEX IF NOT EXISTS "meal_plans_user_id_generation_key_key" ON "meal_plans"("user_id", "generation_key");
@@ -538,7 +572,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS "meal_entries_id_user_id_key" ON "meal_entries
 CREATE INDEX IF NOT EXISTS "idx_catalog_foods_search_vector" ON "catalog_foods" USING GIN ("search_vector");
 
 -- CreateIndex
--- THE ONE CONTEXT-GUARDED STATEMENT IN THIS FILE, and the guard is the only
+-- ONE OF THE TWO CONTEXT-GUARDED STATEMENTS IN THIS FILE (the other retires
+-- meal_plans_user_id_status_start_date_idx above), and the guard is the only
 -- difference between it and the authoritative migration's line 509, which reads
 --   CREATE INDEX "idx_catalog_food_aliases_lower_alias"
 --     ON "catalog_food_aliases"(lower("alias") text_pattern_ops);

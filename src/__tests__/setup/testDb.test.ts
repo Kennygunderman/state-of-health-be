@@ -19,11 +19,13 @@ import type {
 } from './testDb';
 import {
     CONFIRM_TARGET_FLAG,
+    CONNECTION_LIMIT_PARAMETER,
     FEATURE_TABLES,
     MAINTENANCE_DATABASE,
     MIGRATIONS_DIRECTORY,
     MIGRATIONS_DIRECTORY_FLAG,
     RECREATE_FLAG,
+    TEST_CONNECTION_LIMIT,
     SchemaFreshnessError,
     SchemaReadFailure,
     TestDatabaseGuardError,
@@ -39,6 +41,7 @@ import {
     deriveDatabaseUrl,
     describeSchemaFreshnessRefusal,
     missingDeclaredColumns,
+    pinConnectionLimit,
     readMigrationFingerprints,
     recreateStatements,
     recreateTestDatabase,
@@ -51,6 +54,12 @@ import {
 
 const BACKEND_ROOT = join(__dirname, '..', '..', '..');
 const JEST_SETUP_FILE = join(__dirname, 'jestSetup.ts');
+/**
+ * Read as TEXT, never imported: importing it constructs a live Prisma client,
+ * which is the one thing this module's header forbids. Text is enough for what
+ * the drift guard below asks of it.
+ */
+const PRISMA_CLIENT_FILE = join(BACKEND_ROOT, 'src', 'prisma', 'client.ts');
 /** The module under test, which is also the standalone diagnostic program. */
 const TEST_DB_MODULE = join(__dirname, 'testDb.ts');
 const TEST_TSCONFIG = join(BACKEND_ROOT, 'tsconfig.test.json');
@@ -1581,6 +1590,66 @@ describe('deriveDatabaseUrl', () => {
         expect(deriveDatabaseUrl('postgresql://soh:soh@localhost:5433/soh_test?sslmode=require', 'soh_test')).toBe(
             'postgresql://soh:soh@localhost:5433/soh_test?sslmode=require',
         );
+    });
+});
+
+describe('pinConnectionLimit', () => {
+    it('appends the bound to a URL that names none', () => {
+        expect(pinConnectionLimit('postgresql://soh:soh@127.0.0.1:5433/soh_test_46')).toBe(
+            `postgresql://soh:soh@127.0.0.1:5433/soh_test_46?connection_limit=${TEST_CONNECTION_LIMIT}`,
+        );
+    });
+
+    it('keeps the connectivity parameters already on the URL', () => {
+        expect(pinConnectionLimit('postgresql://soh:soh@localhost:5433/soh_test?sslmode=require')).toBe(
+            `postgresql://soh:soh@localhost:5433/soh_test?sslmode=require&connection_limit=${TEST_CONNECTION_LIMIT}`,
+        );
+    });
+
+    it('carries percent-encoded credentials through byte for byte', () => {
+        expect(pinConnectionLimit(`postgresql://${SECRET_USER}:p%40ss@127.0.0.1:5433/soh_test_46`)).toBe(
+            `postgresql://${SECRET_USER}:p%40ss@127.0.0.1:5433/soh_test_46?connection_limit=${TEST_CONNECTION_LIMIT}`,
+        );
+    });
+
+    it('leaves a bound the caller has already chosen, however small', () => {
+        const alreadyBounded = 'postgresql://soh:soh@127.0.0.1:5433/soh_test_46?connection_limit=3';
+        expect(pinConnectionLimit(alreadyBounded)).toBe(alreadyBounded);
+    });
+
+    it('applies the size it is given', () => {
+        expect(pinConnectionLimit('postgresql://soh:soh@127.0.0.1:5433/soh_test_46', 2)).toBe(
+            'postgresql://soh:soh@127.0.0.1:5433/soh_test_46?connection_limit=2',
+        );
+    });
+
+    it('returns an unparseable URL unchanged, so the refusal stays with the guard that owns it', () => {
+        expect(pinConnectionLimit('!! not a url !!')).toBe('!! not a url !!');
+        expectRefusal(envWith({ DATABASE_URL: '!! not a url !!' }), 'unparsable_database_url');
+    });
+
+    it('returns an absent or empty URL unchanged, because there is nothing to size', () => {
+        expect(pinConnectionLimit(undefined)).toBeUndefined();
+        expect(pinConnectionLimit('')).toBe('');
+    });
+
+    it('is pure: it reads no environment and writes none', () => {
+        const before = process.env.DATABASE_URL;
+        pinConnectionLimit('postgresql://soh:soh@127.0.0.1:5433/soh_test_46');
+        expect(process.env.DATABASE_URL).toBe(before);
+    });
+
+    it('names the parameter the production client reads, so the two cannot drift apart', () => {
+        expect(readFileSync(PRISMA_CLIENT_FILE, 'utf8')).toContain(`'${CONNECTION_LIMIT_PARAMETER}'`);
+    });
+
+    it('is applied by jestSetup after the guard, so the bound reaches every client in the process', () => {
+        const setup = readFileSync(JEST_SETUP_FILE, 'utf8');
+        const guardAt = setup.indexOf('assertTestDatabase();');
+        const pinAt = setup.indexOf('pinConnectionLimit(process.env.DATABASE_URL)');
+
+        expect(guardAt).toBeGreaterThanOrEqual(0);
+        expect(pinAt).toBeGreaterThan(guardAt);
     });
 });
 

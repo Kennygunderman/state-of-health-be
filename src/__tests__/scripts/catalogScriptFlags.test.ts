@@ -1,6 +1,10 @@
 /**
- * The switch-parsing policy of the two catalog stages whose no-value flags
- * authorize something expensive: `catalog-release.ts` and `catalog-validate.ts`.
+ * The flag policies that span the pipeline's ENTRY POINTS rather than living
+ * inside one of them: the no-value switches of the two stages whose flags
+ * authorize something expensive (`catalog-release.ts`, `catalog-validate.ts`),
+ * and `--help`/`-h` across all nine entry points at once.
+ *
+ * ── PART ONE: THE NO-VALUE SWITCHES ───────────────────────────────────────
  *
  * WHAT THIS FILE IS FOR. A flag that takes no value has exactly one accepted
  * spelling — the bare token — and the cases below pin that for all four of
@@ -41,8 +45,51 @@
  * that touch a value-taking flag are about the BOUNDARY of this policy, i.e.
  * that it did not spread to flags that take a value.
  *
+ * ── PART TWO: --help, ON EVERY ENTRY POINT ────────────────────────────────
+ *
+ * WHAT IT SETTLES. `docs/meal-planning/README.md` claims, without
+ * qualification, that "Each CLI entry point prints its own authoritative usage
+ * … for `npm run <script> -- --help`". That claim was false: `dbGuard.ts`
+ * asserts the database origin AT MODULE LOAD, which is before any script's
+ * `parseArgs` runs, so every one of the nine printed a `database_origin_refused`
+ * line and exited 1 unless `DATABASE_URL` already satisfied that script's
+ * policy — the operator least likely to have configured one being exactly the
+ * operator reaching for `--help`. The guard now skips its assertion for a help
+ * invocation, decided from argv alone, and the block below is what holds that
+ * claim true FOR EVERY ENTRY POINT, including a tenth added later: the scripts
+ * are enumerated from `SCRIPT_DATABASE_POLICIES` itself rather than listed
+ * here, so a new one joins these cases the moment it is given a policy.
+ *
+ * TWO ASSERTIONS PER SCRIPT, AND THE SECOND IS WHY THE FIRST IS SAFE. Under a
+ * `DATABASE_URL` every policy refuses: with a help flag the command prints its
+ * own usage block and exits 0, and with no help flag the SAME command against
+ * the SAME database still refuses fatally and prints no usage at all. An
+ * exemption that had widened past the scripts' own predicate would show up in
+ * the second case; the per-token agreement between that predicate and the
+ * guard's is asserted in process, just above, over both parsers of every
+ * script.
+ *
+ * WHY PART TWO SPAWNS. `require.main === module` guards every script's `main()`
+ * and this file has already imported the modules, so neither the module-load
+ * ordering nor an exit status is observable in process — the honest form is a
+ * real child per invocation, its status and its two streams read. The children
+ * cost about a second each, make no vendor call and need no vendor key: help
+ * returns before `preflight` and the refusal happens before `main()` at all.
+ * Their `DATABASE_URL` is a fixture no policy accepts AND no server answers, so
+ * a regression that let one through fails the case immediately instead of
+ * reaching a database.
+ *
+ * WHAT PART TWO IS NOT. It does not re-derive the origin policies themselves —
+ * which class each script accepts, and what `--confirm-target` opens, belong to
+ * `dbGuard.test.ts` — and it says nothing about the CONTENT of a usage block
+ * beyond its first line naming the command and the stage; each stage's suite
+ * owns its own options.
+ *
  * Jest's `roots` is `<rootDir>/src` (jest.config.ts), so the relative imports
- * into `scripts/` are a consequence of that rather than a choice.
+ * into `scripts/` are a consequence of that rather than a choice. Part one
+ * needs nothing but those imports; part two additionally needs `child_process`
+ * and the repository path its children run from, and neither part touches a
+ * database, a vendor or the clock from this process.
  *
  * Run it with:
  *
@@ -50,8 +97,19 @@
  *     DATABASE_URL=postgresql://…@127.0.0.1:5433/<name>_test \
  *     npx jest src/__tests__/scripts/catalogScriptFlags.test.ts --runInBand
  */
+import { spawnSync } from 'node:child_process';
+import path from 'node:path';
+
+import { parseArgs as parseGenerateArgs } from '../../../scripts/catalog-generate-ai';
+import { parseArgs as parseImportArgs } from '../../../scripts/catalog-import-usda';
+import { parseArgs as parseLoadArgs } from '../../../scripts/catalog-load';
 import { parseArgs as parseReleaseArgs } from '../../../scripts/catalog-release';
+import { parseArgs as parseReportArgs } from '../../../scripts/catalog-report';
 import { DEFAULT_CURATOR_DECISIONS_PATH, parseArgs as parseValidateArgs } from '../../../scripts/catalog-validate';
+import { HELP_FLAGS, isHelpInvocation, SCRIPT_DATABASE_POLICIES } from '../../../scripts/lib/dbGuard';
+import { parseArgs as parseRecipesSeedArgs } from '../../../scripts/recipes-seed';
+import { parseArgs as parseBenchmarkArgs } from '../../../scripts/search-benchmark';
+import { parseArgs as parseSeedDevArgs } from '../../../scripts/seed-dev';
 
 /**
  * The shape both stages' `ParseResult` unions satisfy, written structurally so
@@ -257,5 +315,236 @@ describe('the accepted command lines the policy must not have narrowed', () => {
             dryRun: true,
             curatorDecisionsPath: DEFAULT_CURATOR_DECISIONS_PATH,
         });
+    });
+});
+
+/* ===========================================================================
+ * PART TWO: --help, on every entry point
+ * ========================================================================= */
+
+/**
+ * Every entry point's `parseArgs`, keyed by the module name the guard's policy
+ * table uses.
+ *
+ * Written out rather than derived, because a dynamic import cannot be typed and
+ * a name typed twice is what the first case below catches: the key set is
+ * compared with `SCRIPT_DATABASE_POLICIES`, so a tenth script — which must have
+ * a policy to run at all — cannot join the pipeline without joining these
+ * cases.
+ */
+const ENTRY_POINT_PARSERS: Readonly<Record<string, (argv: readonly string[]) => ParseOutcome>> = {
+    'catalog-import-usda': parseImportArgs,
+    'catalog-generate-ai': parseGenerateArgs,
+    'catalog-validate': parseValidateArgs,
+    'catalog-report': parseReportArgs,
+    'catalog-release': parseReleaseArgs,
+    'catalog-load': parseLoadArgs,
+    'recipes-seed': parseRecipesSeedArgs,
+    'search-benchmark': parseBenchmarkArgs,
+    'seed-dev': parseSeedDevArgs,
+};
+
+/** The nine, in the order the policy table declares them. */
+const ENTRY_POINTS: readonly string[] = Object.keys(SCRIPT_DATABASE_POLICIES);
+
+/**
+ * Whether a parse answered HELP — false for a refusal, which is the reading
+ * that matters here: a script that refused the command line did not print a
+ * usage block and exit 0, so for the purposes of the exemption it is not help.
+ */
+const helpOf = (outcome: ParseOutcome): boolean =>
+    outcome.ok && (outcome.options as { readonly help?: unknown }).help === true;
+
+/**
+ * Every spelling the exemption is measured against, and what each one is doing
+ * there. The two predicates — each script's own and the guard's — have to
+ * return the same answer for every row, in both directions: a row the guard
+ * exempts and a script does not would reach that script's stage with no
+ * assertion behind it, and a row a script answers as help and the guard does
+ * not is the unreachable usage block this part exists to prevent.
+ */
+const HELP_SPELLINGS: readonly { readonly tail: readonly string[]; readonly meaning: string }[] = [
+    { tail: ['--help'], meaning: 'the long flag, alone' },
+    { tail: ['-h'], meaning: 'the short flag, alone' },
+    { tail: ['--help', '--dry-run'], meaning: 'help written first, with another flag after it' },
+    { tail: ['--dry-run', '--help'], meaning: 'help written last' },
+    { tail: ['--release', 'v1', '-h'], meaning: 'help after a flag that takes a value' },
+    { tail: ['--confirm-target', '-h'], meaning: "help where the guard's own flag would take its value" },
+    { tail: ['--confirm-target', 'soh_test', '--help'], meaning: 'help after a complete confirmation' },
+    { tail: ['--help=x'], meaning: 'an inline value on the long flag, which is not a help request' },
+    { tail: ['--help='], meaning: 'a trailing = with nothing after it' },
+    { tail: ['-h=1'], meaning: 'an inline value on the short flag' },
+    { tail: ['--helper'], meaning: 'a longer token that merely starts the same way' },
+    { tail: ['-help'], meaning: 'a single-dash spelling of the long flag' },
+    { tail: ['--HELP'], meaning: 'an upper-case spelling nothing folds' },
+    { tail: [], meaning: 'no arguments at all' },
+];
+
+describe('the help flag, across every entry point', () => {
+    it('has a parser here for every script the guard has a policy for', () => {
+        // The guard's policy table is the pipeline's own register of entry
+        // points, so it — not a list in this file — decides what "every entry
+        // point" means.
+        expect(Object.keys(ENTRY_POINT_PARSERS).sort()).toEqual([...ENTRY_POINTS].sort());
+        expect(ENTRY_POINTS).toHaveLength(9);
+    });
+
+    describe.each(ENTRY_POINTS)('%s', (script) => {
+        const parse = ENTRY_POINT_PARSERS[script];
+
+        it.each(HELP_SPELLINGS.map(({ tail, meaning }) => [meaning, tail] as const))(
+            'agrees with the guard about %s',
+            (_meaning, tail) => {
+                // The guard reads a full `process.argv`; a script reads
+                // `process.argv.slice(2)`. The same tail is therefore handed to
+                // both, in the two shapes each of them is given at runtime, and
+                // the answers must be identical.
+                expect(helpOf(parse(tail))).toBe(isHelpInvocation(['/usr/bin/node', `/repo/scripts/${script}.ts`, ...tail]));
+            },
+        );
+
+        it('answers help ahead of every argument error the same line would otherwise produce', () => {
+            // Why the exemption cannot need a valid command line first: the
+            // help branch is the first statement of each parser, so a line that
+            // is nonsense in every other respect is still a usage request.
+            const nonsense = ['--not-a-flag', 'value', '--help'];
+
+            expect(helpOf(parse(nonsense))).toBe(true);
+            expect(isHelpInvocation(['/usr/bin/node', `/repo/scripts/${script}.ts`, ...nonsense])).toBe(true);
+            // And without the help token the same line is a refusal, which is
+            // what makes the assertion above about help rather than about the
+            // parser being lenient.
+            expect(parse(['--not-a-flag', 'value']).ok).toBe(false);
+        });
+
+        it('declares the same two tokens the guard exempts', () => {
+            // Read off the parser rather than off the script's source: each
+            // script's `HELP_FLAGS` is private, so the observable form of "the
+            // same two tokens" is that each of them, alone, answers help and
+            // nothing else does.
+            for (const flag of HELP_FLAGS) {
+                expect(helpOf(parse([flag]))).toBe(true);
+            }
+            expect(helpOf(parse(['--usage']))).toBe(false);
+            expect(helpOf(parse(['-?']))).toBe(false);
+        });
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * The usage block, reached out of process under a refused database
+ * ------------------------------------------------------------------------- */
+
+/** The backend package root: `<repo>/backend`, three levels above this file. */
+const BACKEND_ROOT = path.resolve(__dirname, '..', '..', '..');
+
+/** One child compiles a whole stage through ts-node; a minute is generous. */
+const CHILD_TIMEOUT_MS = 60_000;
+
+/** Two children per case, plus Jest's own overhead. */
+const CASE_TIMEOUT_MS = 180_000;
+
+/**
+ * A `DATABASE_URL` every policy refuses and no server answers.
+ *
+ * `127.0.0.2` is deliberate on both counts. It is outside `LOCAL_HOSTS`, so the
+ * origin classifies `unknown` and is refused by all four policies — one fixture
+ * therefore covers the read-only stages and the writers alike, and the refusal
+ * is the same `unrecognised_origin` for every child. And it is a loopback
+ * address nothing listens on, so a regression that let a real run past the
+ * guard fails on a refused connection in milliseconds instead of reaching a
+ * database or hanging on DNS. The userinfo is a placeholder: nothing here ever
+ * opens a connection, so a real credential would be a committed secret for no
+ * gain.
+ */
+const REFUSED_DATABASE_URL = 'postgresql://flag_fixture:fixture-only@127.0.0.2:5432/state_of_health';
+
+interface CliOutcome {
+    readonly status: number | null;
+    readonly stdout: string;
+    readonly stderr: string;
+}
+
+/**
+ * Runs one entry point as a real CLI process with `REFUSED_DATABASE_URL` in its
+ * environment.
+ *
+ * The environment is built rather than inherited, for two reasons. `DATABASE_URL`
+ * must be SET: `lib/bootstrap.ts` calls `dotenv.config()` without override, so
+ * a child without one would silently fall back to `backend/.env` — the test
+ * database, which several policies accept, and the case would assert nothing.
+ * And no vendor key is passed, because none is needed: a help invocation
+ * returns before `preflight` reads one, and a refused invocation never reaches
+ * `main()`, so neither child can open a vendor request. `PATH`/`HOME` are
+ * forwarded because ts-node resolves through them.
+ */
+const runEntryPoint = (script: string, args: readonly string[]): CliOutcome => {
+    const child = spawnSync(
+        process.execPath,
+        ['--require', 'ts-node/register/transpile-only', path.join(BACKEND_ROOT, 'scripts', `${script}.ts`), ...args],
+        {
+            cwd: BACKEND_ROOT,
+            encoding: 'utf8',
+            timeout: CHILD_TIMEOUT_MS,
+            env: {
+                PATH: process.env.PATH,
+                HOME: process.env.HOME,
+                DATABASE_URL: REFUSED_DATABASE_URL,
+                TS_NODE_PROJECT: 'tsconfig.scripts.json',
+                TS_NODE_TRANSPILE_ONLY: '1',
+            },
+        },
+    );
+
+    expect(child.error).toBeUndefined();
+
+    return { status: child.status, stdout: child.stdout, stderr: child.stderr };
+};
+
+describe('every entry point under a database its policy refuses', () => {
+    describe.each(ENTRY_POINTS)('%s', (script) => {
+        it.each([['--help'], ['-h']])('prints its own usage block and exits 0 for %s', (flag) => {
+            const outcome = runEntryPoint(script, [flag]);
+
+            expect(outcome.status).toBe(0);
+            // The first line names the npm script an operator types and the
+            // stage that answered, so the usage block is provably THIS script's
+            // rather than any usage text at all.
+            const firstLine = outcome.stdout.split('\n')[0];
+            expect(firstLine).toMatch(/^Usage: npm run \S+ -- /);
+            expect(firstLine).toContain(`(${script})`);
+            // Nothing else reaches either stream: the usage block is the whole
+            // artefact of this path, and a `database_origin_refused` line on it
+            // would mean the guard had run and reported anyway.
+            expect(outcome.stdout).not.toContain('database_origin_refused');
+            expect(outcome.stderr).toBe('');
+        }, CASE_TIMEOUT_MS);
+
+        it('still refuses that database fatally, before main(), when no help flag is written', () => {
+            const outcome = runEntryPoint(script, []);
+
+            expect(outcome.status).toBe(1);
+            expect(outcome.stderr).toContain('"event":"database_origin_refused"');
+            expect(outcome.stderr).toContain(`"script":"${script}"`);
+            expect(outcome.stderr).toContain('"code":"unrecognised_origin"');
+            // The refusal precedes `parseArgs`, so a stage whose required flags
+            // are missing reports the DATABASE and not the flags: no usage
+            // block on either stream, and no argument error either.
+            expect(outcome.stdout).toBe('');
+            expect(outcome.stderr).not.toContain('Usage: npm run');
+            expect(outcome.stderr).not.toContain('argument_rejected');
+        }, CASE_TIMEOUT_MS);
+
+        it('is refused for --help=x, which no script reads as help', () => {
+            // The one direction a widened exemption would open, asserted
+            // end to end: an inline value makes the token an ordinary flag, so
+            // the guard must still refuse rather than hand the line to a parser
+            // that would reject it anyway.
+            const outcome = runEntryPoint(script, ['--help=x']);
+
+            expect(outcome.status).toBe(1);
+            expect(outcome.stderr).toContain('"event":"database_origin_refused"');
+            expect(outcome.stdout).toBe('');
+        }, CASE_TIMEOUT_MS);
     });
 });

@@ -1,0 +1,106 @@
+{
+  "slug": "chicken-rice-veggie-quick-bowl",
+  "name": "Chicken, rice and vegetable quick bowl",
+  "description": "Seared chicken breast with garlic, broccoli and red bell pepper, spooned over warm white rice in about twenty minutes.",
+  "iconKey": "bowl",
+  "instructions": [
+    "Cut the chicken breast into bite-sized pieces and season them with the salt and the black pepper.",
+    "Warm the olive oil in a wide skillet over medium-high heat, add the garlic and cook until fragrant, about 30 seconds.",
+    "Add the chicken in a single layer and sear it for 4 minutes without moving it, then stir and cook 4 minutes more, until it is cooked through.",
+    "Add the broccoli and the bell pepper and cook for 4 minutes, until the broccoli is bright and just tender.",
+    "Divide the warm white rice between two bowls and spoon the chicken and vegetables over it."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 bowl",
+  "prepMinutes": 8,
+  "cookMinutes": 12,
+  "mealSlots": [
+    "lunch",
+    "dinner"
+  ],
+  "dietTags": [
+    "gluten_free"
+  ],
+  "allergenTags": [],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "dairy_free"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:171077",
+      "quantity": 11,
+      "unit": "oz",
+      "gramWeight": 310.75,
+      "displayText": "11 oz",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169757",
+      "quantity": 2,
+      "unit": "cup",
+      "gramWeight": 316.0,
+      "displayText": "2 cups",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170379",
+      "quantity": 1.5,
+      "unit": "cup",
+      "gramWeight": 132.0,
+      "displayText": "1½ cups",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170108",
+      "quantity": 0.5,
+      "unit": "cup",
+      "gramWeight": 74.5,
+      "displayText": "½ cup",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 1.25,
+      "unit": "tbsp",
+      "gramWeight": 16.875,
+      "displayText": "1¼ tbsp",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169230",
+      "quantity": 2,
+      "unit": "clove",
+      "gramWeight": 6.0,
+      "displayText": "2 cloves",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170931",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 1.15,
+      "displayText": "½ tsp",
+      "sortOrder": 6,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 3.0,
+      "displayText": "½ tsp",
+      "sortOrder": 7,
+      "isOptional": false
+    }
+  ]
+}
