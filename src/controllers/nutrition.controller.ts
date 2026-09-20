@@ -12,6 +12,7 @@ import {
     InvalidServingError,
     LogEntryErrorVerdict,
     parseEntryPath,
+    parseLegacyTargetsBody,
     parseLogEntryBody,
     parseMealEntryEditBody,
     parseMealEntryPath,
@@ -304,18 +305,25 @@ export const getHistoryController = async (req: Request, res: Response) => {
 export const updateTargetsController = async (req: Request, res: Response) => {
     try {
         const userId = getUserId(req);
-        const parseTarget = (value: any): number | null | undefined => {
-            if (value === undefined) return undefined;
-            if (value === null) return null;
-            const parsed = Math.round(Number(value));
-            return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
-        };
-        const targets = await updateTargets(userId, {
-            calories: parseTarget(req.body.calories),
-            protein: parseTarget(req.body.protein),
-            carbs: parseTarget(req.body.carbs),
-            fat: parseTarget(req.body.fat),
-        });
+
+        // The coercion this route shipped with, moved into
+        // `nutrition.logic.ts::parseLegacyTargetsBody` so the one rule it now
+        // adds is testable without a database (Rule backend-architecture §4).
+        // That rule is the column's own range: `users.target_*` are `int4`, and
+        // a value past it used to reach PostgreSQL and answer 500 where §0.5.2
+        // requires `400 invalid_request` with a field code.
+        //
+        // Everything else about this route is unchanged, including the branch
+        // that makes it a compat trap: zero, a negative number and a
+        // non-numeric string are still SILENTLY IGNORED — 200 with the stored
+        // value untouched — because a client that means "clear it" sends null.
+        // `api/compat.test.ts` pins all three.
+        const parsed = parseLegacyTargetsBody(req.body);
+        if (parsed.kind === 'error') {
+            return res.status(400).json(logEntryErrorBody(parsed));
+        }
+
+        const targets = await updateTargets(userId, parsed.targets);
         if (!targets) {
             return res.status(404).json({ error: 'User not found' });
         }

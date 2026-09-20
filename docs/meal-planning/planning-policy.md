@@ -1229,9 +1229,27 @@ been shipping for two versions and its arithmetic is the reference:
 `nutrition.service.ts` rounds each per-serving value once as it writes an entry,
 multiplies that stored value by the servings eaten and rounds the product once,
 and its daily and history aggregates do the same in SQL as
-`SUM(FLOOR((x * servings)::numeric + 0.5))::int`. Step 3 above is that same
+`SUM(FLOOR((x * servings)::numeric + 0.5))::bigint`. Step 3 above is that same
 arithmetic applied to the same snapshot, so the server's totals, the SQL
 aggregates and the client's card agree by construction.
+
+**Why the sum is `::bigint`, and why `servings` is clamped before it.** The cast
+used to be `::int`. `meal_entries.servings` is `double precision` and, until the
+legacy write path bounded it, any finite value could be stored — so a single row
+with `servings = 1e308` made every product `Infinity` and two rows of
+`calories = 2147483647` merely exceeded `int4`. Either one made the cast throw,
+and because the aggregate is what the history read is built from, that read
+answered 500 for as long as the row existed. The write path now refuses such a
+value, but a row stored before that is still readable, so the read defends
+itself independently: every row is projected through the `bounded` CTE in
+`nutrition.service.ts`, which clamps `servings` to ±1e3 with
+`LEAST(GREATEST(servings, -1e3), 1e3)` — absorbing `±Infinity` and `NaN`, since
+PostgreSQL orders `NaN` above every number and the clamp therefore maps it to the
+ceiling — and the sum is accumulated as `::bigint`. The four macro columns are
+`int4`, so a clamped product cannot exceed ~2.15e12 and a day's sum has millions
+of rows of `int8` headroom. A `servings` inside the accepted `[0.25, 10]`
+contract passes through the clamp untouched, so the rounding parity this section
+states is bit-identical to what it was.
 
 **Why `FLOOR(… ::numeric + 0.5)` and not `ROUND`.** This paragraph used to name
 `SUM(ROUND(x * servings))::int`, and that claim was not true — which is the

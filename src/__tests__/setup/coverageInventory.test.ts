@@ -5261,7 +5261,7 @@ describe('policy-document drift gate', () => {
                 planningPolicy,
                 'recipe-rules',
                 'the SQL aggregate the diary already uses',
-                /aggregates do the same in SQL as `SUM\(FLOOR\(\((\w+) \* (\w+)\)::numeric \+ 0\.5\)\)::int`/,
+                /aggregates do the same in SQL as `SUM\(FLOOR\(\((\w+) \* (\w+)\)::numeric \+ 0\.5\)\)::bigint`/,
             );
             const nutritionService = readRepositoryFile(NUTRITION_SERVICE_PATH);
             const aggregates = claimMatches(

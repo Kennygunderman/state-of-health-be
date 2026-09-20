@@ -11,6 +11,7 @@ import foodRoutes from './routes/food.routes';
 import catalogRoutes from './routes/catalog.routes';
 import mealPlanningRoutes from './routes/mealPlanning.routes';
 import { authenticateFirebaseToken } from './middleware/auth';
+import { globalRateLimiter, principalRateLimiter, signupRateLimiter } from './middleware/rateLimit';
 import { prisma } from './prisma/client';
 import { SafeLogLevel, describeErrorSafely, logSafeEvent } from './utils/safeLogger';
 
@@ -108,6 +109,31 @@ app.get('/health', async (_req, res) => {
     }
 });
 
+// THE THREE ABUSE-CONTROL BUCKETS, and their positions are load-bearing (Rule
+// backend-architecture §3.1 — a new ordering constraint, documented here as
+// that section requires).
+//
+// All three mount AFTER `/health` above, which is how the liveness probe stays
+// exempt: by POSITION, not by a path test inside the limiter. Coolify health
+// checks, uptime monitoring and post-deploy verification poll it continuously
+// and must never be throttled, and a path test is a thing a future edit can get
+// wrong — a route mounted above this line simply cannot reach the limiter.
+//
+// This one is the process-wide ceiling, and it mounts BEFORE every body parser:
+// a refused request is answered without `express.json()` ever reading its body,
+// so a flood cannot make this process spend CPU parsing payloads it is about to
+// reject. It is also the bucket that charges a failed authentication extra —
+// see `middleware/rateLimit.ts` — which is what makes an unlimited stream of
+// `401`s (CWE-307) terminate in a `429`.
+//
+// It keys UNAUTHENTICATED traffic into a single global bucket rather than
+// per-IP, deliberately: `trust proxy` is unset above and the proxy in front of
+// this service APPENDS to `X-Forwarded-For`, so `req.ip` is the proxy's own
+// address for all production traffic and a per-IP bucket would throttle the
+// entire user base as one client. `RATE_LIMIT_TRUSTED_PROXY_DEPTH` is how an
+// operator turns per-IP keying on once the hop count is known.
+app.use(globalRateLimiter.handler);
+
 // The AI endpoints accept base64 photos, so they get a larger body limit.
 // Must be registered BEFORE the global express.json() — the first JSON parser
 // to run wins, and the global one would reject large payloads first.
@@ -117,11 +143,32 @@ app.use(['/api/macros/estimate', '/api/macros/label-scan'], express.json({ limit
 app.use('/api/user/avatar', express.json({ limit: '1mb' }));
 app.use(express.json());
 
+// The second bucket, mounted on the ONE unauthenticated write in the service
+// and immediately before the router that owns it, so nothing can be added
+// between the two. `app.post` with a bare middleware falls through to
+// `userRoutes` below when the bucket admits the request. The avatar routes are
+// a different path and method, so this bucket never sees them: they sit above
+// the per-principal bucket too (they carry their own per-route auth), which
+// leaves them under the process-wide ceiling alone — correct, because they are
+// the two routes that authenticate themselves rather than through the boundary
+// the third bucket keys off.
+//
+// Sized low on purpose: QA created fifteen real user rows with fifteen
+// concurrent calls to this route, and 10 a minute is still 14,400 a day.
+app.post('/api/user', signupRateLimiter.handler);
+
 // User routes: signup is unprotected, avatar routes carry per-route auth
 app.use('/api', userRoutes);
 
 // Protected routes
 app.use(authenticateFirebaseToken);
+
+// The third bucket, mounted immediately after the authentication boundary — the
+// first point in this file where a verified principal exists. Everything below
+// is keyed per token subject, which is the one identity a client cannot choose;
+// above this line no such identity exists yet, which is why the ceiling above
+// is global rather than per-caller.
+app.use(principalRateLimiter.handler);
 app.use('/api', workoutRoutes);
 app.use('/api', exerciseRoutes);
 app.use('/api', migrationRoutes);

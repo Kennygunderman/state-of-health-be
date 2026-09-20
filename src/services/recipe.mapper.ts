@@ -341,6 +341,29 @@ const requireStringArray = (value: unknown, column: string, versionId: string): 
 };
 
 /**
+ * The `badges` column as the closed-set codes a client renders, each at most
+ * once and in first-occurrence order.
+ *
+ * DEDUPED as well as filtered, and the `Set` is the point: `badges` is a
+ * `TEXT[]` with no uniqueness constraint, so a row written around
+ * `scripts/recipes-seed.ts` — which derives the codes from `RECIPE_BADGES` and
+ * cannot repeat one — may still hold the same code twice. A repeat asserts
+ * nothing the single code does not, while the recipe screen renders one pill
+ * per code and keys it by its label
+ * (`RecipeDetail/index.util.ts::resolveBadgeLabels`), so the second copy is a
+ * colliding React key rather than information. Collapsing it here keeps both
+ * badge responses honest at their one boundary instead of leaving each consumer
+ * to defend itself.
+ *
+ * An unrecognised MEMBER is still dropped rather than thrown on, for the reason
+ * `mapRecipeVersion` gives, and `meal_slots` is deliberately left alone: its
+ * consumers read the column through `recipe.logic.ts`, not this DTO.
+ */
+const readBadges = (version: RecipeVersionRow): RecipeVersionResponse['badges'] => [
+    ...new Set(requireStringArray(version.badges, 'badges', version.id).filter(isRecipeBadge)),
+];
+
+/**
  * The `instructions` JSONB column as the ordered list of steps the client
  * renders.
  *
@@ -520,7 +543,7 @@ export const mapRecipeVersion = (
     // substituting a plausible code would state a fact about the recipe that
     // nothing established.
     mealSlots: requireStringArray(version.meal_slots, 'meal_slots', version.id).filter(isMealSlot),
-    badges: requireStringArray(version.badges, 'badges', version.id).filter(isRecipeBadge),
+    badges: readBadges(version),
     dietTags: requireStringArray(version.diet_tags, 'diet_tags', version.id),
     allergenTags: requireStringArray(version.allergen_tags, 'allergen_tags', version.id),
     allergenStatus: narrowColumn(version.allergen_status, isAllergenStatus, 'allergen_status', version.id),
@@ -579,7 +602,7 @@ export const mapPlannedRecipeSummary = (version: RecipeVersionRow): MealPlanMeal
         name: version.name,
         iconKey: narrowColumn(version.icon_key, isRecipeIconKey, 'icon_key', version.id),
         totalMinutes: version.total_minutes,
-        badges: requireStringArray(version.badges, 'badges', version.id).filter(isRecipeBadge),
+        badges: readBadges(version),
         nutritionProvenance: PLANNED_RECIPE_PROVENANCE,
     };
 };

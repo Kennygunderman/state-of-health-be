@@ -579,6 +579,114 @@ respective file's header for local use. To prove the ledger and its operator cop
 still agree, follow the equivalence procedure in
 `prisma/manual-migrations/meal-planning/README.md`.
 
+## Request throttling
+
+Three in-process buckets, mounted in `src/app.ts` and configured entirely from
+the environment. They are abuse ceilings, not quotas anyone is metered against
+— the one metered allowance in this service is the AI daily quota, which lives
+in the database. Nothing here needs a deploy to retune: every value is an
+environment variable, and `.env.example` carries the same table with its
+reasoning.
+
+| Bucket | Keyed on | Default | Variables |
+| --- | --- | --- | --- |
+| Process-wide ceiling, ahead of every body parser | one global counter | 1200 / 60 s | `RATE_LIMIT_GLOBAL_MAX`, `RATE_LIMIT_GLOBAL_WINDOW_SECONDS` |
+| Failed-authentication surcharge on that ceiling | the same counter | +29 tokens per `401` | `RATE_LIMIT_AUTH_FAILURE_SURCHARGE` |
+| `POST /api/user` (the only unauthenticated write) | one global counter | 10 / 60 s | `RATE_LIMIT_SIGNUP_MAX`, `RATE_LIMIT_SIGNUP_WINDOW_SECONDS` |
+| Everything behind the auth boundary | the verified token subject | 300 / 60 s | `RATE_LIMIT_PRINCIPAL_MAX`, `RATE_LIMIT_PRINCIPAL_WINDOW_SECONDS` |
+
+`RATE_LIMIT_ENABLED=false` turns all three off without a code change, and
+throttling is disabled outright whenever `NODE_ENV=test`. A variable that is set
+but is not the integer it names **fails startup** rather than falling back, so a
+limit nobody chose can never be the one in force; leaving a variable unset is
+always safe and always means the default above.
+
+**`/health` is never throttled**, and by position rather than by a path test:
+every bucket mounts after it in `src/app.ts`, so the Coolify health check, the
+uptime monitor and the post-deploy verification in
+[Release order](#release-order) keep answering while a bucket is empty.
+
+**Four operator facts, and the last two are the ones that matter under load:**
+
+- A refusal answers `429` with `{"error":"rate_limited", policy, limit,
+  retryAfterSeconds, resetsAt}` and carries `Retry-After`, `RateLimit-Limit`,
+  `RateLimit-Remaining`, `RateLimit-Reset` and `RateLimit-Policy`. It logs one
+  `warn` line, `[meal-planning] rate_limit_refused {…}`, which names the bucket
+  and the class of caller (`keyKind`) and deliberately carries no path, no token
+  subject and no client address — so counting refusals per bucket is a `grep`,
+  and identifying an individual abuser is not.
+- **The counters are per process.** N API replicas enforce N times each limit,
+  because there is no shared store: adding one would mean adding Redis, which
+  AAP §0.4.2 does not permit. It fails open, and N × a ceiling is still a
+  ceiling — but size the numbers against the replica count, not against one
+  process.
+- **No bucket is keyed on an IP address by default, and turning that on is an
+  operator decision.** `trust proxy` is unset, and Coolify/Traefik *appends* to
+  `X-Forwarded-For`, so the header's first value is whatever the client sent and
+  `req.ip` is the proxy's own address for every production request: keying on
+  either would hand an attacker a fresh bucket per forged value, or throttle the
+  entire user base as one client. Set `RATE_LIMIT_TRUSTED_PROXY_DEPTH` to the
+  real number of proxies in front of this service (1 behind a single reverse
+  proxy) to key unauthenticated traffic per client address instead — the value
+  read is then that many hops from the *right* of the header, which is the last
+  address this infrastructure wrote.
+- **The surcharge is shared, which is the cost of having no per-IP key.** A
+  client looping on an expired token spends 30 tokens per attempt from the same
+  ceiling everyone else draws on, so ~40 failed authentications in a minute can
+  refuse other callers for the rest of that window. That is the intended trade
+  — it is what makes an authentication flood terminate — but it is also the
+  first thing to look at if `rate_limit_refused` lines appear with
+  `"policy":"global"` and no attack: raise `RATE_LIMIT_GLOBAL_MAX`, or set
+  `RATE_LIMIT_AUTH_FAILURE_SURCHARGE=0` to keep the ceiling and drop the
+  penalty.
+
+A `rate_limit_store_pressure` line means one bucket's key table hit
+`RATE_LIMIT_MAX_TRACKED_KEYS` (50,000 by default) with every window still live,
+and an entry was evicted. It is reported at most once per window. Only the
+per-principal bucket can realistically reach it, and its keys are verified token
+subjects, so the number to raise is that variable.
+
+## Dependency advisories
+
+`npm audit --omit=dev` reports advisories in this production tree today, and CI
+gates on them **as a baseline**: the `Dependency audit gate` step runs
+`npm run audit:gate`, which is `scripts/audit-baseline-compare.mjs` comparing a
+fresh audit against the reviewed list in
+`docs/meal-planning/dependency-audit-baseline.json` and failing the build on any
+finding that list does not carry.
+
+The baseline is not a mute button. Each entry records the advisory, its severity
+and the reachability determination behind accepting it — which packages never
+load at all, and for the ones that do, what input their vulnerable path actually
+receives — and the file carries the review date and the counts as reviewed.
+`npm audit` itself exits non-zero while any advisory exists; that status is not
+the gate, and the comparator ignores it. What it does **not** ignore is an audit
+that produces no report: a gate that cannot see the advisories must not report
+that there are none, so that case fails the build.
+
+**Refreshing it is a reviewed data change.** The comparator never writes the
+file. On a failure it prints each new finding as the JSON entry that would
+accept it; a human pastes that entry in with a real reason, moves `reviewedOn`
+to today, and says in the commit message whether the finding was fixed or
+accepted. Entries it reports as no longer present may be deleted in the same
+pass — a finding that is gone cannot be a regression, so pruning never fails
+the gate. Run it locally with `npm run audit:gate`, or against a captured report
+with `node scripts/audit-baseline-compare.mjs --report <file>`.
+
+**Separately scoped follow-up: `firebase-admin@14.4.0`.** Every advisory in the
+baseline is reachable only through `firebase-admin`, and `npm audit` offers the
+same fix for all of them: `firebase-admin@14.4.0`. It is a **semver-major that
+removes the namespaced API this application uses at five call sites** — four in
+`src/utils/firebase.ts` (`admin.ServiceAccount`, `admin.initializeApp`,
+`admin.credential.cert`, `admin.firestore`) and `admin.auth().verifyIdToken` in
+`src/middleware/auth.ts`, which is the token verification every `/api` route
+sits behind — so it is not a dependency bump. It is a code change with its own
+review, its own test pass and its own release. It is
+deliberately **not** attempted as part of this work, and it is recorded here so
+it is scheduled rather than forgotten. When it is taken on: migrate the five
+call sites to the modular API, re-run `npm run audit:gate` and prune every entry
+the upgrade clears, in the same commit.
+
 ## Forbidden operations
 
 Off-limits for this work, and **none of them was performed**:

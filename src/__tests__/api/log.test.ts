@@ -3230,3 +3230,221 @@ describe('a legacy diary write carrying U+0000', () => {
         });
     });
 });
+
+/* ---------------------------------------------------------------------------
+ * The numeric contract on the two legacy diary write paths
+ *
+ * WHY THIS IS AN API TEST AND NOT ONLY A UNIT TEST. `nutrition.logic.test.ts`
+ * owns the predicates; what cannot be seen from there is the CONSEQUENCE, and
+ * the consequence is this suite's whole reason for existing. An accepted write
+ * used to take `GET /macros/history` out of service for its owner
+ * permanently — the stored `servings` overflowed the aggregate's integer cast,
+ * Prisma raised P2010, and the route answered 500 on every subsequent request
+ * while the day read stayed 200, so the one screen that could have deleted the
+ * offending row was the only one still working. Only a request can show that,
+ * and only a request can show the other half of the fix: a row that is already
+ * stored, past the bound, must not be able to hold the endpoint down either.
+ *
+ * So each case here asserts the STATUS, the body's field code, and the state of
+ * the database and of the history read afterwards.
+ * ------------------------------------------------------------------------- */
+
+describe('the numeric contract on a legacy diary write', () => {
+    /** A well-formed legacy entry body, the shape the shipped app posts. */
+    const legacyBody = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+        name: 'Scrambled eggs',
+        calories: 220,
+        protein: 14,
+        carbs: 2,
+        fat: 16,
+        ...overrides,
+    });
+
+    const postEntry = async (body: Record<string, unknown>) => {
+        const bucketId = await diaryBucketId(USER_ID, week.dayKey);
+
+        return asUser(request.post(`/api/macros/meal/${bucketId}/entries`), { uid: USER_ID }).send(body);
+    };
+
+    /** A stored entry to edit, created through the route the app uses. */
+    const storedEntryId = async (): Promise<string> => {
+        const created = await postEntry(legacyBody());
+
+        expect(created.status).toBe(201);
+
+        return (created.body as { id: string }).id;
+    };
+
+    const putEntry = async (entryId: string, body: Record<string, unknown>) =>
+        asUser(request.put(`/api/macros/entry/${entryId}`), { uid: USER_ID }).send(body);
+
+    const historyStatus = async (): Promise<number> =>
+        (await asUser(request.get('/api/macros/history'), { uid: USER_ID })).status;
+
+    describe('POST /api/macros/meal/:mealId/entries', () => {
+        it.each([
+            ['servings of 1e308, the value that broke the history read', { servings: 1e308 }, 'servings', 'invalid_servings'],
+            ['servings above the contract', { servings: 11 }, 'servings', 'invalid_servings'],
+            ['servings below the contract', { servings: 0.1 }, 'servings', 'invalid_servings'],
+            ['servings of zero', { servings: 0 }, 'servings', 'invalid_servings'],
+            ['negative servings', { servings: -1 }, 'servings', 'invalid_servings'],
+            ['calories at the int4 boundary, which two rows overflow', { calories: 2147483647 }, 'calories', 'out_of_range'],
+            ['calories past int4', { calories: 2147483648 }, 'calories', 'out_of_range'],
+            ['calories of 1e308', { calories: 1e308 }, 'calories', 'out_of_range'],
+            ['a protein past the stored magnitude', { protein: 1e308 }, 'protein', 'out_of_range'],
+            ['a name past the stored cap', { name: 'x'.repeat(301) }, 'name', 'invalid_length'],
+        ])('answers %s with 400 and writes nothing', async (_case, overrides, field, code) => {
+            const response = await postEntry(legacyBody(overrides));
+
+            expect(response.status).toBe(400);
+            expect(response.body).toStrictEqual({
+                error: 'invalid_request',
+                details: [{ field, code }],
+            });
+            // The refusal is judged before the writer runs, so the proof is the
+            // absence of a row and a history read that still answers.
+            expect(await storedEntries()).toHaveLength(0);
+            expect(await historyStatus()).toBe(200);
+        });
+
+        it.each([
+            ['the servings the ⅓ chip stores', { servings: 0.33 }],
+            ['the contract maximum', { servings: 10 }],
+            ['no servings at all, which the writer defaults to one', {}],
+            ['a macro at the magnitude bound', { calories: 100000 }],
+            ['a negative macro, which the rounding-parity contract depends on', { protein: -145 }],
+            ['a name at the stored cap', { name: 'x'.repeat(300) }],
+        ])('still logs an entry with %s', async (_case, overrides) => {
+            const response = await postEntry(legacyBody(overrides));
+
+            expect(response.status).toBe(201);
+            expect(await storedEntries()).toHaveLength(1);
+            expect(await historyStatus()).toBe(200);
+        });
+    });
+
+    describe('PUT /api/macros/entry/:id', () => {
+        it.each([
+            ['a macro that does not coerce to a number', { calories: 'x' }, 'calories', 'invalid_type'],
+            ['servings of 1e308', { servings: 1e308 }, 'servings', 'invalid_servings'],
+            ['servings above the contract', { servings: 99 }, 'servings', 'invalid_servings'],
+            ['a name that is not a string', { name: 123 }, 'name', 'invalid_type'],
+            ['a macro past the stored magnitude', { fat: 1e308 }, 'fat', 'out_of_range'],
+        ])('answers %s with 400 and leaves the row alone', async (_case, body, field, code) => {
+            const entryId = await storedEntryId();
+            const before = await storedEntry();
+
+            const response = await putEntry(entryId, body);
+
+            expect(response.status).toBe(400);
+            expect(response.body).toStrictEqual({
+                error: 'invalid_request',
+                details: [{ field, code }],
+            });
+
+            const after = await storedEntry();
+
+            expect(after).toStrictEqual(before);
+            expect(await historyStatus()).toBe(200);
+        });
+
+        it('still answers a body that names no editable field with an unchanged 200', async () => {
+            // The no-op this route has always been for an empty body. Nothing is
+            // judged, because nothing would be written.
+            const entryId = await storedEntryId();
+            const before = await storedEntry();
+
+            const response = await putEntry(entryId, {});
+
+            expect(response.status).toBe(200);
+            expect(await storedEntry()).toStrictEqual(before);
+        });
+
+        it('still applies a servings edit inside the contract', async () => {
+            const entryId = await storedEntryId();
+
+            const response = await putEntry(entryId, { servings: 2 });
+
+            expect(response.status).toBe(200);
+            expect((response.body as { servings: number }).servings).toBe(2);
+            expect((await storedEntry()).servings).toBe(2);
+        });
+
+        it('still accepts a macro sent as a numeric string, as it always has', async () => {
+            const entryId = await storedEntryId();
+
+            const response = await putEntry(entryId, { calories: '240' });
+
+            expect(response.status).toBe(200);
+            expect((await storedEntry()).calories).toBe(240);
+        });
+    });
+
+    describe('a row already stored past the bound', () => {
+        /**
+         * Inserts a row the parser would now refuse, the way one could only
+         * arrive from here on: written before the bounds existed, or by a
+         * migration, a script or manual SQL. This is the only way to exercise
+         * the read-side half of the fix now that the write side is closed.
+         */
+        const insertUnboundedRow = async (values: { servings?: number; calories?: number }): Promise<void> => {
+            const bucketId = await diaryBucketId(USER_ID, week.dayKey);
+
+            await prisma.meal_entries.create({
+                data: {
+                    meal_id: bucketId,
+                    user_id: USER_ID,
+                    date: new Date(`${week.dayKey}T00:00:00.000Z`),
+                    name: 'Stored before the bound',
+                    servings: values.servings ?? 1,
+                    calories: values.calories ?? 220,
+                    protein_g: 14,
+                    carbs_g: 2,
+                    fat_g: 16,
+                },
+            });
+        };
+
+        it('keeps the history read answering for a servings past every bound', async () => {
+            // `220 × 1e308` is `Infinity` as a double, which the unclamped
+            // aggregate could not cast and which `::numeric` cannot represent
+            // either — so this case proves the clamp and not merely the wider
+            // cast.
+            await insertUnboundedRow({ servings: 1e308 });
+
+            const history = await asUser(request.get('/api/macros/history'), { uid: USER_ID });
+            const day = await asUser(request.get(`/api/macros/${week.dayKey}`), { uid: USER_ID });
+
+            expect(history.status).toBe(200);
+            expect(day.status).toBe(200);
+
+            const days = (history.body as { days: { date: string; calories: number }[] }).days;
+            const reported = days.find((entry) => entry.date === week.dayKey);
+
+            // Bounded rather than absurd, and a real number rather than a
+            // failure: the row is nonsense, and what the screen owes its user is
+            // a page that loads.
+            expect(reported?.calories).toBe(220 * 1000);
+        });
+
+        it('sums two rows at the int4 boundary instead of failing on the cast', async () => {
+            // Each row is individually inside `int4`; their SUM is not, which is
+            // what the `::bigint` cast fixes and what no per-row clamp could.
+            await insertUnboundedRow({ calories: 2147483647 });
+            await insertUnboundedRow({ calories: 2147483647 });
+
+            const history = await asUser(request.get('/api/macros/history'), { uid: USER_ID });
+
+            expect(history.status).toBe(200);
+
+            const days = (history.body as { days: { date: string; calories: number; meals: { calories: number }[] }[] })
+                .days;
+            const reported = days.find((entry) => entry.date === week.dayKey);
+
+            expect(reported?.calories).toBe(2 * 2147483647);
+            // The per-meal breakdown is a second query with its own ten-site
+            // expression, so it is asserted rather than assumed.
+            expect(reported?.meals[0].calories).toBe(2 * 2147483647);
+        });
+    });
+});

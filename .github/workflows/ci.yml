@@ -446,5 +446,39 @@ jobs:
           echo "docker exec, then re-run."
           exit 1
 
+      # The supply-chain gate, and it is BASELINED rather than absolute.
+      #
+      # `npm audit --omit=dev` reports 21 advisories in this production tree —
+      # 4 critical and 5 high — every one of them reachable only through
+      # firebase-admin, and the whole cluster clears only with
+      # firebase-admin@14.4.0: a semver-major that removes the namespaced API
+      # this application uses at five call sites. A plain
+      # `npm audit --audit-level=high` would therefore fail every build from
+      # the first one, with no fix available that this repository is allowed to
+      # make, and a gate that can only be satisfied by switching it off is not
+      # a control. So the reviewed, dated baseline at
+      # docs/meal-planning/dependency-audit-baseline.json records each of those
+      # findings with the reachability determination behind accepting it, and
+      # the comparator fails the build on any finding the baseline does not
+      # carry — which is the thing that was actually missing: detection of the
+      # NEXT advisory.
+      #
+      # This mirrors the mobile repository's lint baseline
+      # (scripts/lint-baseline-compare.mjs), deliberately: one shape for both
+      # "accepted today, fail on anything new" gates.
+      #
+      # Two properties of the comparator matter to this step. `npm audit`
+      # itself exits non-zero whenever any advisory exists, so the comparator
+      # captures the report and ignores that status — while still failing when
+      # no report can be produced at all, because a gate that cannot see the
+      # advisories must not report that there are none. And it never writes the
+      # baseline: a refresh is a human pasting the entry it prints, with a
+      # reason, in a reviewed commit.
+      #
+      # Placed before `npm test` so a supply-chain regression is reported
+      # before the long test run rather than after it.
+      - name: Dependency audit gate
+        run: npm run audit:gate
+
       - run: npm test
       - run: docker build -t soh-be-ci .

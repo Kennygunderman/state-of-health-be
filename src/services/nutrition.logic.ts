@@ -4,6 +4,7 @@ import {
     EntryInputMethod,
     LogCatalogMealEntryPayload,
     LogMealEntryPayload,
+    MacroTargetsResponse,
     MacroTotals,
     NutritionProvenance,
     UpdateMealEntryPayload,
@@ -101,16 +102,27 @@ type LogEntryRoute = 'legacy' | 'catalog' | 'conflict' | 'unrecognized';
  *   (`mealId`, `id`). An absent `catalogFoodId` is never this code: its
  *   presence is what selects the catalog shape at all.
  * - `invalid_servings` — `servings` is absent or outside the servings contract.
- * - `invalid_type` — `servingText` was sent as something other than a string.
+ * - `invalid_type` — `servingText` was sent as something other than a string,
+ *   or an entry edit sent a `name` that is not a string or a macro that does
+ *   not coerce to a finite number (the edit route's fields are all optional, so
+ *   an unusable one is a type failure rather than a missing `required` value).
  * - `invalid_characters` — a string the request asks the server to STORE holds
  *   a character the column cannot represent. Only U+0000 qualifies; see
  *   {@link containsNulCharacter}.
  * - `conflicting_food_reference` — the body names both a personal food and a
  *   catalog food, so no shape can be chosen for it.
  * - `unrecognized_payload` — the body names neither shape.
+ * - `out_of_range` — a well-formed macro outside the magnitude this endpoint
+ *   stores; see {@link MAX_LEGACY_MACRO_MAGNITUDE}. Spelled as
+ *   `mealPlan.logic.ts` spells the same condition ("a well-formed value outside
+ *   its permitted window").
+ * - `invalid_length` — a stored string longer than the cap; see
+ *   {@link MAX_LEGACY_NAME_LENGTH}. Spelled as `catalog.logic.ts` spells the
+ *   same condition for `q`.
  *
- * The spellings match `grocery.logic.ts`, `plannedMealLog.logic.ts` and
- * `targets.logic.ts`, so the client maps one vocabulary and not four.
+ * The spellings match `grocery.logic.ts`, `plannedMealLog.logic.ts`,
+ * `mealPlan.logic.ts`, `catalog.logic.ts` and `targets.logic.ts`, so the client
+ * maps one vocabulary and not four.
  */
 const FIELD_ERROR_CODES = {
     REQUIRED: 'required',
@@ -120,6 +132,8 @@ const FIELD_ERROR_CODES = {
     INVALID_CHARACTERS: 'invalid_characters',
     CONFLICTING_FOOD_REFERENCE: 'conflicting_food_reference',
     UNRECOGNIZED_PAYLOAD: 'unrecognized_payload',
+    OUT_OF_RANGE: 'out_of_range',
+    INVALID_LENGTH: 'invalid_length',
 } as const;
 
 const LEGACY_MACRO_FIELDS = ['calories', 'protein', 'carbs', 'fat'] as const;
@@ -131,6 +145,11 @@ const LEGACY_MACRO_FIELDS = ['calories', 'protein', 'carbs', 'fat'] as const;
 // module uses.
 const MEAL_ID_PATH_FIELD = 'mealId';
 const ENTRY_ID_PATH_FIELD = 'id';
+
+// The two body fields the bound checks below name, spelled once: both legacy
+// paths judge them and the wire detail carries the name verbatim.
+const NAME_FIELD = 'name';
+const SERVINGS_FIELD = 'servings';
 
 // Fields only a legacy body carries. `servings` and `servingText` are absent by
 // design: both shapes use them, so neither may act as a shape signal.
@@ -165,6 +184,86 @@ const MAX_SERVINGS = 10;
 const SERVINGS_DECIMALS = 2;
 const SERVINGS_SCALE = 10 ** SERVINGS_DECIMALS;
 const SERVINGS_SCALE_TOLERANCE = 1e-9;
+
+/* ---------------------------------------------------------------------------
+ * The numeric contract on the legacy diary write paths (§0.5.2)
+ *
+ * §0.5.2 requires `400 invalid_request` with a field code for a value outside
+ * its window, and the planned-log path already enforces exactly that. The two
+ * legacy paths — `POST /macros/meal/:mealId/entries` and
+ * `PUT /macros/entry/:id` — did not, and that was not merely an inconsistency:
+ * an ACCEPTED write could put the diary's own history screen permanently out of
+ * service for its owner. `meal_entries.calories` and its three siblings are
+ * `int4` and `servings` is `double precision`, so the read-time product
+ * `calories × servings` is a double that the history aggregates sum and cast to
+ * an integer. A stored `servings` of 1e308 overflowed that cast, and so did two
+ * ordinary rows holding `calories = 2147483647`; `GET /macros/history` then
+ * answered 500 for that user on every request until the row was deleted — from
+ * a screen §0.7.4 routes this feature's own "View in diary" to, and which the
+ * user cannot use to delete the offending row precisely because it is down.
+ *
+ * Both halves are fixed, because either one alone leaves a hole: the bounds
+ * below stop a new write from being storable, and the clamp in
+ * `nutrition.service.ts`'s ten aggregate sites keeps rows already stored from
+ * holding the endpoint down.
+ *
+ * WHAT IS BOUNDED, AND WHAT IS DELIBERATELY NOT.
+ *
+ *  * `servings` — the §0.5.2 contract itself, {@link isServingsInContract}:
+ *    `[0.25, 10]` with at most two decimals. The same predicate the catalog
+ *    body is judged by, so one contract governs the field wherever it arrives,
+ *    and its IEEE-754 tolerance is what keeps the mobile fraction chips' stored
+ *    `0.33`/`0.66` acceptable.
+ *  * the four macros — MAGNITUDE ONLY, and symmetrically. The SIGN stays
+ *    unbounded: a negative macro is storable today and
+ *    `api/compat.test.ts`'s three-reader rounding-parity contract is pinned on
+ *    a deliberately negative fixture, so refusing a sign would break a
+ *    documented contract rather than a defect. The magnitude bound is what the
+ *    overflow needs, and `nutrition.service.ts`'s rounding-parity note explains
+ *    why the negative half-value case must keep working.
+ *  * `name` — a length cap. A 100,000-character name was storable and is echoed
+ *    by `GET /macros/:date`, where three of them grew one day's response from
+ *    1.7 KB to 266 KB (CWE-400).
+ *
+ * The numeric-string coercion the shipped guard performs is untouched: a macro
+ * sent as `'220'` is still accepted and still rounds identically, because
+ * tightening that would refuse requests live clients send (§0.3.1).
+ * ------------------------------------------------------------------------- */
+
+/**
+ * The largest magnitude a legacy macro may carry, per serving.
+ *
+ * 100,000 kcal/g per serving is far past any real food — a day's intake is
+ * three to four thousand — and it sits four orders of magnitude inside `int4`,
+ * so no sum of realistic rows can approach the cast the history aggregates
+ * perform. That headroom is the point of choosing it over `int4`'s own
+ * 2,147,483,647: two rows at the `int4` boundary are individually storable and
+ * together overflow the SUM, which is precisely how an accepted write took the
+ * history screen down.
+ */
+const MAX_LEGACY_MACRO_MAGNITUDE = 100_000;
+
+/**
+ * The longest `name` a diary entry may store, in characters, measured after the
+ * trim the writer applies.
+ *
+ * 300 rather than `safeLogger`'s 200: the longest name this repository's own
+ * data carries is a 184-character USDA-derived catalog description
+ * (`data/meal-planning/catalog/releases/v1/validation-records.jsonl`), and a
+ * branded food logged through `POST /macros/search-branded-foods` is named by
+ * the same kind of vendor description. A 200-character cap would refuse names
+ * the app legitimately produces; 300 clears every name in the fixtures, the
+ * seeds and the catalog release with room to spare while still bounding the
+ * response one day's read can be made to return.
+ */
+const MAX_LEGACY_NAME_LENGTH = 300;
+
+/**
+ * The one sentence the servings contract is reported with, wherever it is
+ * refused. Shared by the catalog body and both legacy paths so a client reads
+ * one message for one rule.
+ */
+const SERVINGS_CONTRACT_MESSAGE = `servings must be a number between ${MIN_SERVINGS} and ${MAX_SERVINGS} with at most ${SERVINGS_DECIMALS} decimal places`;
 
 const UUID_V4_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -248,7 +347,7 @@ export const CATALOG_INPUT_METHOD: LogCatalogMealEntryPayload['inputMethod'] = '
 
 const CATALOG_FIELD_MESSAGES: Record<string, string> = {
     catalogFoodId: 'catalogFoodId must be a v4 UUID',
-    servings: `servings must be a number between ${MIN_SERVINGS} and ${MAX_SERVINGS} with at most ${SERVINGS_DECIMALS} decimal places`,
+    servings: SERVINGS_CONTRACT_MESSAGE,
     servingText: 'servingText must be a string',
 };
 
@@ -269,6 +368,57 @@ const isServingsInContract = (value: unknown): value is number => {
     // third decimal still fails — 1.005 * 100 is 100.49999999999999.
     const scaled = value * SERVINGS_SCALE;
     return Math.abs(scaled - Math.round(scaled)) < SERVINGS_SCALE_TOLERANCE;
+};
+
+/**
+ * Whether a macro is a usable number at all — the shipped guard's own question,
+ * named so both legacy paths ask it the same way.
+ *
+ * `Number()` and not `typeof value === 'number'`: a macro sent as a numeric
+ * string has always been accepted here and the writers round it identically
+ * (§0.3.1), so this stays the coercion the endpoint shipped with.
+ */
+const coercesToFiniteNumber = (value: unknown): boolean => Number.isFinite(Number(value));
+
+/**
+ * Whether a macro is a usable number whose MAGNITUDE is past what this endpoint
+ * stores.
+ *
+ * Deliberately false for a value that does not coerce at all: that is a
+ * different failure with a different code on both paths (`required` under the
+ * frozen legacy guard, `invalid_type` on an edit), and reporting one field
+ * twice would tell the caller to fix two things about one value.
+ */
+const exceedsMacroMagnitude = (value: unknown): boolean => {
+    const numeric = Number(value);
+
+    return Number.isFinite(numeric) && Math.abs(numeric) > MAX_LEGACY_MACRO_MAGNITUDE;
+};
+
+/** Whether a stored string is longer than the column's cap, measured as the writer trims it. */
+const exceedsStoredNameLength = (value: unknown): boolean =>
+    typeof value === 'string' && value.trim().length > MAX_LEGACY_NAME_LENGTH;
+
+/**
+ * The sentence one bound failure is reported with, derived from its code so the
+ * message and the machine code cannot describe different rules.
+ *
+ * Exhaustive over the codes the two bound checks below emit; anything else is a
+ * compile error rather than a silently generic sentence.
+ */
+const boundMessage = ({ field, code }: LogEntryFieldError): string => {
+    switch (code) {
+        case FIELD_ERROR_CODES.INVALID_SERVINGS:
+            return SERVINGS_CONTRACT_MESSAGE;
+        case FIELD_ERROR_CODES.INVALID_LENGTH:
+            return `${field} must be at most ${MAX_LEGACY_NAME_LENGTH} characters`;
+        case FIELD_ERROR_CODES.INVALID_TYPE:
+            // `name` is the only string the edit body carries; the other four
+            // fields it type-checks are macros.
+            return field === NAME_FIELD ? `${field} must be a string` : `${field} must be a number`;
+        default:
+            return `${field} must be between -${MAX_LEGACY_MACRO_MAGNITUDE} and ${MAX_LEGACY_MACRO_MAGNITUDE}`;
+    }
 };
 
 // The three factories return the error verdict itself rather than the wider
@@ -412,17 +562,58 @@ const legacyFieldErrors = (record: Record<string, unknown>): LogEntryFieldError[
     const name = record.name;
 
     if (typeof name !== 'string' || name.trim().length === 0) {
-        errors.push({ field: 'name', code: FIELD_ERROR_CODES.REQUIRED });
+        errors.push({ field: NAME_FIELD, code: FIELD_ERROR_CODES.REQUIRED });
     }
 
     LEGACY_MACRO_FIELDS.forEach((field) => {
-        if (!Number.isFinite(Number(record[field]))) {
+        if (!coercesToFiniteNumber(record[field])) {
             errors.push({ field, code: FIELD_ERROR_CODES.REQUIRED });
         }
     });
 
     return errors;
 };
+
+/**
+ * The §0.5.2 numeric and length bounds on a legacy log body, judged only once
+ * the frozen guard above has accepted every field it names.
+ *
+ * Reports every offending field of one body at once, in the order the frozen
+ * message lists them and with `servings` last, so one round trip tells the
+ * caller everything it has to fix — the same reporting rule `parseCatalogBody`
+ * and {@link unstorableText} follow.
+ *
+ * `servings` is judged only when the body carries one: absent and `null` both
+ * mean "one serving" to the writer (`payload.servings ?? 1`), which is how
+ * every shipped client that omits the field logs an entry.
+ */
+const legacyBoundErrors = (record: Record<string, unknown>): LogEntryFieldError[] => {
+    const errors: LogEntryFieldError[] = [];
+
+    if (exceedsStoredNameLength(record[NAME_FIELD])) {
+        errors.push({ field: NAME_FIELD, code: FIELD_ERROR_CODES.INVALID_LENGTH });
+    }
+
+    LEGACY_MACRO_FIELDS.forEach((field) => {
+        if (exceedsMacroMagnitude(record[field])) {
+            errors.push({ field, code: FIELD_ERROR_CODES.OUT_OF_RANGE });
+        }
+    });
+
+    if (isPresent(record[SERVINGS_FIELD]) && !isServingsInContract(record[SERVINGS_FIELD])) {
+        errors.push({ field: SERVINGS_FIELD, code: FIELD_ERROR_CODES.INVALID_SERVINGS });
+    }
+
+    return errors;
+};
+
+/**
+ * The `400 invalid_request` verdict for a set of bound failures, or `null` when
+ * there are none. The message is the failures' own sentences joined, which is
+ * how {@link unstorableText} reports several fields of one body.
+ */
+const boundsVerdict = (errors: LogEntryFieldError[]): LogEntryErrorVerdict | null =>
+    errors.length === 0 ? null : invalidRequest(errors.map(boundMessage).join('; '), errors);
 
 const parseLegacyBody = (body: unknown, record: Record<string, unknown>): ParsedLogEntryBody => {
     const errors = legacyFieldErrors(record);
@@ -436,6 +627,15 @@ const parseLegacyBody = (body: unknown, record: Record<string, unknown>): Parsed
     // has to fix instead of the five the frozen message lists.
     const unstorable = unstorableText(record, LEGACY_STORED_TEXT_FIELDS);
     if (unstorable !== null) return unstorable;
+
+    // The §0.5.2 bounds, judged last for the same reason: every body the two
+    // checks above already refuse keeps the verdict it earns today, so this one
+    // can only replace a response that was a 201 storing an unusable value or a
+    // 500 from the column — never an existing 400. See the numeric-contract
+    // note above MAX_LEGACY_MACRO_MAGNITUDE for what is bounded and what is
+    // deliberately left alone.
+    const bounds = boundsVerdict(legacyBoundErrors(record));
+    if (bounds !== null) return bounds;
 
     // The legacy body's own `foodId` is deliberately NOT judged here. It reaches
     // `meal_entries.food_id` — a `@db.Uuid` column — and the dedupe lookup that
@@ -976,18 +1176,72 @@ export type ParsedMealEntryEdit =
     | LogEntryErrorVerdict;
 
 /**
- * Judges an edit body for the one failure the writer cannot answer: a `name`
- * carrying U+0000, which reaches `meal_entries.name` and comes back as a 500
- * for a request only the caller can fix.
+ * The bounds and types an edit body is judged by, reported in the order the
+ * columns are written: `name`, the four macros, then `servings`.
  *
- * Narrow on purpose. This route has never validated its body, and everything
- * else it accepts today it must go on accepting: a `name` or macro of another
- * type is still passed through and still refused at the column, a body that
- * mentions no editable field is still the no-op 200 it has always been, and a
- * body that is not an object at all still reaches the writer unchanged — this
- * parser reports on the fields it can read and invents no other verdict. So the
- * only response it changes is the one that was a 500, which is exactly what the
- * shape decision on the log route above does.
+ * Every field is optional, so each is judged only when the body MENTIONS it —
+ * `!== undefined`, exactly the test {@link planMealEntryEdit} uses to decide
+ * which columns the update touches, so a field this parser judges is a field
+ * the writer would have written and nothing else.
+ *
+ * `null` is a mention and not an omission, and each column answers it
+ * differently: `meal_entries.name` and `servings` are NOT NULL, so a `null`
+ * reaches the column and used to come back as a 500, while a macro's `null`
+ * coerces to `0` through `Math.round` and stores — so the macro check asks the
+ * shipped coercion's own question and the other two ask for their type.
+ */
+const mealEntryEditErrors = (record: Record<string, unknown>): LogEntryFieldError[] => {
+    const errors: LogEntryFieldError[] = [];
+    const name = record[NAME_FIELD];
+    const servings = record[SERVINGS_FIELD];
+
+    if (name !== undefined && typeof name !== 'string') {
+        errors.push({ field: NAME_FIELD, code: FIELD_ERROR_CODES.INVALID_TYPE });
+    } else if (exceedsStoredNameLength(name)) {
+        errors.push({ field: NAME_FIELD, code: FIELD_ERROR_CODES.INVALID_LENGTH });
+    }
+
+    LEGACY_MACRO_FIELDS.forEach((field) => {
+        const value = record[field];
+
+        if (value === undefined) return;
+
+        if (!coercesToFiniteNumber(value)) {
+            errors.push({ field, code: FIELD_ERROR_CODES.INVALID_TYPE });
+        } else if (exceedsMacroMagnitude(value)) {
+            errors.push({ field, code: FIELD_ERROR_CODES.OUT_OF_RANGE });
+        }
+    });
+
+    if (servings !== undefined && !isServingsInContract(servings)) {
+        errors.push({ field: SERVINGS_FIELD, code: FIELD_ERROR_CODES.INVALID_SERVINGS });
+    }
+
+    return errors;
+};
+
+/**
+ * Judges an edit body for the failures the writer cannot answer: a `name`
+ * carrying U+0000, and a value the column or the diary's own reads cannot hold
+ * (§0.5.2). Both used to reach `meal_entries` — the first as a 500 from the
+ * column, the second as a stored value that made `GET /macros/history` answer
+ * 500 for its owner on every subsequent request.
+ *
+ * Narrow on purpose, and the narrowness is a compatibility rule rather than
+ * caution. Two behaviours are preserved exactly:
+ *
+ *  * a body that MENTIONS no editable field is still the no-op 200 it has
+ *    always been — nothing is judged, because nothing would be written; and
+ *  * a body that is not an object at all still reaches the writer unchanged,
+ *    since this parser reports on the fields it can read and invents no other
+ *    verdict.
+ *
+ * What it now also refuses is the same contract the log route above and the
+ * planned-log path enforce, applied to the same columns: the numbers this route
+ * accepted without bound are the numbers that route stores, and leaving the
+ * edit path open would have let a caller re-fill a column the log path had just
+ * closed. That is why the bound moved on both paths together and not only on
+ * the one QA reproduced it from.
  *
  * `payload` is the body handed on, not a rebuilt object, for the same reason
  * `parseLegacyBody` hands its body on unchanged: `planMealEntryEdit` reads each
@@ -995,9 +1249,16 @@ export type ParsedMealEntryEdit =
  */
 export const parseMealEntryEditBody = (body: unknown): ParsedMealEntryEdit => {
     const record = asRecord(body);
-    const unstorable = record === null ? null : unstorableText(record, EDIT_STORED_TEXT_FIELDS);
+
+    if (record === null) return { kind: 'ok', payload: body as UpdateMealEntryPayload };
+
+    const unstorable = unstorableText(record, EDIT_STORED_TEXT_FIELDS);
 
     if (unstorable !== null) return unstorable;
+
+    const bounds = boundsVerdict(mealEntryEditErrors(record));
+
+    if (bounds !== null) return bounds;
 
     return { kind: 'ok', payload: body as UpdateMealEntryPayload };
 };
@@ -1076,22 +1337,23 @@ const MACRO_EDIT_COLUMNS: readonly {
 /**
  * The name as the column would hold it.
  *
- * A non-string is passed through unchanged, deliberately. The shipped endpoint
- * calls `payload.name.trim()` on an unvalidated body, so a numeric `name` has
- * always been answered with a 500; coercing it to `'42'` would store a name the
- * caller never sent, and ignoring it would turn a broken request into a silent
- * success. Passed through, Prisma refuses it at the `String` column and the
- * endpoint keeps answering exactly as it does today.
+ * The `typeof` arm is retained even though {@link parseMealEntryEditBody} now
+ * refuses a non-string `name` with `400 invalid_type` before this runs: this
+ * function is exported logic's, not the parser's, and coercing an unexpected
+ * value to `'42'` would store a name the caller never sent. Keeping it total
+ * means a future caller that reaches `planMealEntryEdit` without the parser
+ * still cannot write a fabricated name.
  */
 const editedName = (value: string): string => (typeof value === 'string' ? value.trim() : value);
 
 /**
  * Whether a normalized value actually replaces what the column holds.
  *
- * A value that is not a real number (a `name` sent as an object, a macro sent as
- * `'abc'`) cannot be compared, so it counts as a change: it is a rewrite
- * attempt, and the write it belongs to fails at the column, which means nothing
- * is detached either way.
+ * A value that is not a real number cannot be compared, so it counts as a
+ * change: it is a rewrite attempt either way. Such a value no longer reaches
+ * this function through the route — `parseMealEntryEditBody` refuses a macro
+ * that does not coerce with `400 invalid_type` — so the arm is what keeps this
+ * exported rule total for a caller that has not parsed its input.
  */
 const macroDiffers = (normalized: number, stored: number): boolean =>
     !Number.isFinite(normalized) || normalized !== stored;
@@ -1127,6 +1389,10 @@ export const planMealEntryEdit = (
     const fields: MealEntryEditFields = {};
     let rewritesSnapshot = false;
 
+    // Written as sent: `parseMealEntryEditBody` has already judged it against
+    // the §0.5.2 servings contract, so a value that reaches here is a number in
+    // [0.25, 10] with at most two decimals — the same window the planned-log
+    // path and the catalog body use.
     if (payload.servings !== undefined) {
         fields.servings = payload.servings;
     }
@@ -1154,4 +1420,98 @@ export const planMealEntryEdit = (
         existing.recipe_version_id !== null;
 
     return { fields, detachesFromSource: isLinked && rewritesSnapshot };
+};
+
+/* ---------------------------------------------------------------------------
+ * The legacy target writer
+ *
+ * `PUT /api/user/targets` is untouched by design (§0.1.3, §0.5.2: "PUT
+ * /api/user/targets is untouched") — it is not the canonical targets writer,
+ * owns no preferences row and bumps no revision. One thing about it could not
+ * stand, though: `users.target_*` are `int4`, and the handler kept any value
+ * that was finite and positive, so `{"calories": 1e308}` reached the column and
+ * the route answered 500 where §0.5.2 requires `400 invalid_request` with a
+ * field code.
+ *
+ * SO THE BOUND IS THE COLUMN'S OWN RANGE AND NOTHING TIGHTER. The canonical
+ * writer's `MANUAL_CALORIE_RANGE` (`targets.logic.ts`) is a nutritional window;
+ * borrowing it here would refuse values this route stores today, which is
+ * exactly the compatibility break §0.5.2 forbids. `int4`'s ceiling is the line
+ * between "stored, as it always was" and "answered with a 500", so it is the
+ * only line this parser may draw.
+ *
+ * AND THE SILENT-IGNORE BRANCH IS PRESERVED EXACTLY. A value that is zero,
+ * negative or non-numeric collapses to `undefined`, which the writer reads as
+ * "not being written" — so `{"calories": 0}` answers 200 with the stored value
+ * unchanged rather than clearing it or refusing it. That is a documented compat
+ * trap (`api/compat.test.ts` § "the untouched legacy target writer" pins all
+ * three cases), and a client that means "clear it" sends `null`. Nothing here
+ * changes it: the only response this parser alters is the 500.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * `int4`'s ceiling, which is the range of all four `users.target_*` columns.
+ * A value past it is the input that used to reach PostgreSQL and come back as
+ * this route's 500.
+ */
+const MAX_STORED_TARGET = 2147483647;
+
+/** The four keys the legacy body may write, in the order a failure reports them. */
+const TARGET_FIELDS = ['calories', 'protein', 'carbs', 'fat'] as const;
+
+export type ParsedLegacyTargets =
+    | { kind: 'ok'; targets: Partial<MacroTargetsResponse> }
+    | LogEntryErrorVerdict;
+
+/**
+ * The value one target column is written with:
+ * - `undefined` — the request did not name the field, or named a value this
+ *   route has always ignored (zero, negative, non-numeric). The writer skips
+ *   the column.
+ * - `null` — an explicit clear, which is a real request on this route.
+ * - a rounded number — the value to store.
+ *
+ * `out of range` is reported separately rather than folded in here, because it
+ * is the one outcome that is neither stored nor ignored.
+ */
+const resolvedTarget = (value: unknown): number | null | undefined => {
+    if (value === undefined) return undefined;
+    if (value === null) return null;
+
+    const parsed = Math.round(Number(value));
+
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+};
+
+/**
+ * Validates and resolves a legacy targets body.
+ *
+ * Total over its input: a non-object body reports every field as absent, which
+ * is the no-op 200 the route answers today for `{}`.
+ */
+export const parseLegacyTargetsBody = (body: unknown): ParsedLegacyTargets => {
+    const record = asRecord(body) ?? {};
+    const targets: Partial<MacroTargetsResponse> = {};
+    const errors: LogEntryFieldError[] = [];
+
+    TARGET_FIELDS.forEach((field) => {
+        const resolved = resolvedTarget(record[field]);
+
+        if (resolved !== undefined && resolved !== null && resolved > MAX_STORED_TARGET) {
+            errors.push({ field, code: FIELD_ERROR_CODES.OUT_OF_RANGE });
+
+            return;
+        }
+
+        targets[field] = resolved;
+    });
+
+    if (errors.length > 0) {
+        return invalidRequest(
+            errors.map((error) => `${error.field} must be at most ${MAX_STORED_TARGET}`).join('; '),
+            errors,
+        );
+    }
+
+    return { kind: 'ok', targets };
 };

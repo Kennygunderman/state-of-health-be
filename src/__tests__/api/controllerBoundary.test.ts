@@ -63,6 +63,31 @@ jest.mock('../../services/grocery.service', () => ({
     uncheckAllGroceries: jest.fn(),
 }));
 
+// The legacy food routes are mocked for the same reason the meal-planning
+// services are: what this file asserts about them is the SHAPE OF WHAT THEY
+// LOG when a service throws, and a mock is the only way to make a specific
+// throw — a Prisma error carrying a stack, a `meta` payload and a
+// `clientVersion` — reach the handler's catch without a database.
+jest.mock('../../services/food.service', () => ({
+    createFood: jest.fn(),
+    deleteFood: jest.fn(),
+    getFoodsForUser: jest.fn(),
+    updateFood: jest.fn(),
+}));
+
+jest.mock('../../services/usda.service', () => {
+    // The real class, not a stand-in: `handleUsdaError` branches on
+    // `instanceof UsdaError`, so a fake would take the wrong arm and the 502
+    // case would silently assert the 500 one.
+    const actual = jest.requireActual('../../services/usda.service');
+
+    return {
+        UsdaError: actual.UsdaError,
+        getBrandedFood: jest.fn(),
+        searchBrandedFoods: jest.fn(),
+    };
+});
+
 import type { Request, Response } from 'express';
 
 import {
@@ -80,6 +105,15 @@ import {
     swapMealController,
 } from '../../controllers/mealPlanning.controller';
 import {
+    createFoodController,
+    deleteFoodController,
+    getBrandedFoodController,
+    getFoods,
+    searchBrandedFoodsController,
+    updateFoodController,
+} from '../../controllers/food.controller';
+import { createFood, deleteFood, getFoodsForUser, updateFood } from '../../services/food.service';
+import {
     parseAffectedMealsPath,
     parseGeneratePlanSyntax,
     parseMealPlanDayPath,
@@ -94,6 +128,8 @@ import { getPreferences, savePreferences, saveSetupStep } from '../../services/p
 import { parseSwapAlternativesPath, parseSwapCommitRequest, parseSwapPreviewPath } from '../../services/swap.logic';
 import { commitSwap, getSwapAlternatives, getSwapPreview } from '../../services/swap.service';
 import { parseSaveTargetsRequest } from '../../services/targets.logic';
+import { UsdaError, getBrandedFood, searchBrandedFoods } from '../../services/usda.service';
+import { UserNotProvisionedError } from '../../services/user.service';
 import { saveTargets } from '../../services/targets.service';
 import * as featureFlags from '../../utils/featureFlags';
 import { POST_COMMIT_ABORT_HEADER } from '../../utils/featureFlags';
@@ -170,7 +206,12 @@ afterEach(() => {
  * it is how a test observes a response that was never sent.
  */
 const doubles = (
-    request: { params?: Record<string, unknown>; body?: unknown; headers?: Record<string, string> } = {},
+    request: {
+        params?: Record<string, unknown>;
+        body?: unknown;
+        headers?: Record<string, string>;
+        query?: Record<string, unknown>;
+    } = {},
 ): { req: Request; res: Response; recorded: RecordedResponse } => {
     const recorded: RecordedResponse = { statusCode: null, body: null, socketDestroyed: false };
     const res = {
@@ -196,6 +237,11 @@ const doubles = (
         req: {
             user: { uid: USER_ID },
             params: request.params ?? {},
+            // The legacy food routes read `req.query` (`q`, `page`, `limit`),
+            // which no meal-planning handler does — so it defaults to an empty
+            // object rather than being omitted, and a handler that reads it
+            // gets the same shape Express gives it.
+            query: request.query ?? {},
             body: request.body,
             header: (name: string) => headers[name.toLowerCase()],
         } as unknown as Request,
@@ -1435,3 +1481,284 @@ describe('the answers no controller in this file produces', () => {
     });
 });
 
+
+/* ---------------------------------------------------------------------------
+ * (vii) The legacy food routes log the same way, and log nothing sensible
+ *
+ * WHY THESE ARE HERE RATHER THAN IN A FOOD-SPECIFIC SUITE. What is being
+ * asserted is the event contract this file already owns: the two names, the two
+ * levels, one event per answered request, and the three guarantees a log line
+ * must keep. `food.controller.ts` reached those guarantees LAST — until now its
+ * five handlers shared a `console.error(fallback, error)` fallback, and one
+ * `POST /api/foods` 500 printed a Prisma stack with fourteen absolute
+ * filesystem paths, a four-line source excerpt of `food.service.ts`, five
+ * frames inside `src/generated/prisma/runtime/library.js`, the connector error
+ * quoting the offending value, the whole `data {…}` payload including
+ * `user_id`, and `clientVersion: '6.9.0'`.
+ *
+ * The canary is therefore a Prisma-shaped error carrying every one of those
+ * parts, thrown from a mocked service, asserted absent from the line.
+ * ------------------------------------------------------------------------- */
+
+/** A stand-in for the exact error the /foods 500 was measured on. */
+class PrismaLikeError extends Error {
+    readonly code = 'P2010';
+    readonly clientVersion = '6.9.0';
+    readonly meta: Record<string, unknown>;
+
+    constructor() {
+        super(
+            'Invalid `prisma.foods.create()` invocation in\n' +
+                '/app/backend/src/services/food.service.ts:88:37\n' +
+                'Unable to fit value 1e+308 into a 64-bit signed integer',
+        );
+        this.name = 'PrismaClientKnownRequestError';
+        this.stack =
+            `${this.name}: overflow\n` +
+            '    at kn (/app/backend/src/generated/prisma/runtime/library.js:32:1363)\n' +
+            '    at Zn.handleRequestError (/app/backend/src/generated/prisma/runtime/library.js:124:7102)';
+        this.meta = { data: { user_id: USER_ID, calories: 1e308 }, database_url: 'postgresql://soh:secret@host/db' };
+    }
+}
+
+/** Every part of that error that must not survive into the log line. */
+const LEAKED_FRAGMENTS: readonly string[] = [
+    'clientVersion',
+    '6.9.0',
+    'src/generated/prisma',
+    'food.service.ts',
+    '/app/backend',
+    ' at ',
+    'user_id',
+    'secret',
+    'postgresql://',
+    '1e+308',
+];
+
+const expectNoLeak = (line: string): void => {
+    for (const fragment of LEAKED_FRAGMENTS) {
+        expect(line).not.toContain(fragment);
+    }
+};
+
+// A well-formed food id, used wherever a case needs to reach PAST the path
+// guard to the behaviour it is actually exercising.
+//
+// `parseFoodPath` refuses a malformed `:id` with `400 invalid_request` before
+// any service call, which AAP §0.5.2 requires and which the diary's own entry
+// routes have always done. Cases below that drive the service into a fault, or
+// that assert a BODY refusal, therefore have to carry an id the guard admits —
+// otherwise they assert the guard instead of their own subject. The guard has
+// its own cases at the end of this describe, and its unit cases live in
+// `food.logic.test.ts`.
+const A_FOOD_ID = '3f7c1e94-2b6a-4d58-9c30-118f462190f2';
+
+describe('a legacy food route that faulted', () => {
+    it.each([
+        [
+            'the library read',
+            'food.list',
+            'Failed to get foods',
+            () => asMock(getFoodsForUser),
+            (req: Request, res: Response) => getFoods(req, res),
+            {},
+        ],
+        [
+            'the create route',
+            'food.create',
+            'Failed to create food',
+            () => asMock(createFood),
+            (req: Request, res: Response) => createFoodController(req, res),
+            { body: { name: 'Greek yogurt', calories: 120, protein: 20, carbs: 7, fat: 0 } },
+        ],
+        [
+            'the update route',
+            'food.update',
+            'Failed to update food',
+            () => asMock(updateFood),
+            (req: Request, res: Response) => updateFoodController(req, res),
+            { params: { id: A_FOOD_ID }, body: { calories: 130 } },
+        ],
+        [
+            'the delete route',
+            'food.delete',
+            'Failed to delete food',
+            () => asMock(deleteFood),
+            (req: Request, res: Response) => deleteFoodController(req, res),
+            { params: { id: A_FOOD_ID } },
+        ],
+    ] as const)(
+        'answers %s with its unchanged 500 body and one scrubbed error event',
+        async (_case, action, body, service, handler, request) => {
+            service().mockRejectedValue(new PrismaLikeError());
+
+            const { req, res, recorded } = doubles(request);
+
+            await handler(req, res);
+
+            // The client-visible half is unchanged, byte for byte.
+            expect(recorded.statusCode).toBe(500);
+            expect(recorded.body).toEqual({ error: body });
+
+            const failures = eventsNamed('request_failed');
+
+            expect(failures).toHaveLength(1);
+            expect(failures[0].level).toBe('error');
+            expect(failures[0].fields).toEqual({
+                action,
+                status: 500,
+                errorName: 'PrismaClientKnownRequestError',
+                errorCode: 'P2010',
+            });
+            expectNoLeak(failures[0].line);
+            // One event per answered request: a failure is not also a rejection.
+            expect(eventsNamed('request_rejected')).toEqual([]);
+            expect(captured).toHaveLength(1);
+        },
+    );
+
+    it('records the library read´s unprovisioned refusal as a rejection and not as a failure', async () => {
+        // The one refusal on these routes that earns a line: the 404 is
+        // indistinguishable from an absent row by design, so the log is an
+        // operator's only signal that a sign-up completed its Firebase half and
+        // not its `users` half. It is the same condition, code and body the
+        // diary's day read answers.
+        asMock(getFoodsForUser).mockRejectedValue(new UserNotProvisionedError(USER_ID));
+
+        const { req, res, recorded } = doubles({});
+
+        await getFoods(req, res);
+
+        expect(recorded.statusCode).toBe(404);
+        expect(recorded.body).toEqual({ error: 'User not found' });
+
+        const rejections = eventsNamed('request_rejected');
+
+        expect(rejections).toHaveLength(1);
+        expect(rejections[0].level).toBe('warn');
+        expect(rejections[0].fields).toEqual({
+            action: 'food.list',
+            status: 404,
+            code: 'user_not_provisioned',
+            errorName: 'UserNotProvisionedError',
+        });
+        expect(eventsNamed('request_failed')).toEqual([]);
+        expect(captured).toHaveLength(1);
+    });
+
+    it.each([
+        ['the branded search', 'food.searchBranded', () => asMock(searchBrandedFoods), (req: Request, res: Response) => searchBrandedFoodsController(req, res), { query: { q: 'yogurt' } }],
+        ['the branded detail read', 'food.brandedDetail', () => asMock(getBrandedFood), (req: Request, res: Response) => getBrandedFoodController(req, res), { params: { foodId: '123456' } }],
+    ] as const)('answers %s vendor failure with 502 and never logs the vendor´s own text', async (_case, action, service, handler, request) => {
+        // `UsdaError.message` is built from the vendor's response body, and the
+        // site that used to print it was `console.error('USDA error:',
+        // error.message)`. The class name is what an operator needs; the text is
+        // the one thing a vendor boundary must not persist.
+        const vendorText = 'API_KEY_INVALID for api_key=usda-secret-key: {"error":"over rate limit"}';
+
+        service().mockRejectedValue(new UsdaError(vendorText));
+
+        const { req, res, recorded } = doubles(request);
+
+        await handler(req, res);
+
+        expect(recorded.statusCode).toBe(502);
+        expect(recorded.body).toEqual({ error: 'branded_search_failed' });
+
+        const failures = eventsNamed('request_failed');
+
+        expect(failures).toHaveLength(1);
+        expect(failures[0].level).toBe('error');
+        expect(failures[0].fields).toEqual({ action, status: 502, errorName: 'UsdaError' });
+        expect(failures[0].line).not.toContain('usda-secret-key');
+        expect(failures[0].line).not.toContain('over rate limit');
+        expect(failures[0].line).not.toContain('API_KEY_INVALID');
+        expect(captured).toHaveLength(1);
+    });
+
+    it('answers a non-vendor failure on the same route with its shared 500 body', async () => {
+        asMock(searchBrandedFoods).mockRejectedValue(new PrismaLikeError());
+
+        const { req, res, recorded } = doubles({ query: { q: 'yogurt' } });
+
+        await searchBrandedFoodsController(req, res);
+
+        expect(recorded.statusCode).toBe(500);
+        expect(recorded.body).toEqual({ error: 'Failed to search branded foods' });
+
+        const [failure] = eventsNamed('request_failed');
+
+        expect(failure.fields).toEqual({
+            action: 'food.searchBranded',
+            status: 500,
+            errorName: 'PrismaClientKnownRequestError',
+            errorCode: 'P2010',
+        });
+        expectNoLeak(failure.line);
+    });
+
+    it.each([
+        ['a create body outside the numeric contract', { body: { name: 'x', calories: 1e308, protein: 1, carbs: 1, fat: 1 } }, (req: Request, res: Response) => createFoodController(req, res), { error: 'invalid_request', details: [{ field: 'calories', code: 'out_of_range' }] }],
+        ['an update body whose name is not a string', { params: { id: A_FOOD_ID }, body: { name: 123 } }, (req: Request, res: Response) => updateFoodController(req, res), { error: 'invalid_request', details: [{ field: 'name', code: 'invalid_type' }] }],
+    ] as const)('refuses %s at the boundary, without reaching its service and without an event', async (_case, request, handler, body) => {
+        const { req, res, recorded } = doubles(request);
+
+        await handler(req, res);
+
+        expect(recorded.statusCode).toBe(400);
+        expect(recorded.body).toEqual(body);
+        // The parse happens before the service, which is what makes the 400 a
+        // refusal rather than a recovered failure.
+        expect(asMock(createFood)).not.toHaveBeenCalled();
+        expect(asMock(updateFood)).not.toHaveBeenCalled();
+        // A 400 that names the field in its own body needs no log line: the
+        // response is the record, and these routes emit an event only for a
+        // fault or for a refusal the response cannot express.
+        expect(captured).toEqual([]);
+    });
+
+    // The path guard, at the boundary.
+    //
+    // Before it, `PUT`/`DELETE /api/foods/not-a-uuid` passed the raw segment to
+    // `prisma.foods.updateMany()`, the connector threw P2023 ("Error creating
+    // UUID, invalid character"), and the handler answered
+    // `500 {"error":"Failed to update food"}` while logging the raw Prisma
+    // error — a stack with absolute paths, a source excerpt and `clientVersion`.
+    // §0.5.2 asks for a typed 400 for a malformed path id, which is what the
+    // diary's entry routes already answered for the identical input, so the two
+    // families now agree.
+    it.each([
+        ['the update route', (req: Request, res: Response) => updateFoodController(req, res), { body: { calories: 130 } }],
+        ['the delete route', (req: Request, res: Response) => deleteFoodController(req, res), {}],
+    ] as const)('refuses a malformed path id on %s before reaching its service', async (_case, handler, extra) => {
+        const { req, res, recorded } = doubles({ params: { id: 'not-a-uuid' }, ...extra });
+
+        await handler(req, res);
+
+        expect(recorded.statusCode).toBe(400);
+        expect(recorded.body).toEqual({ error: 'invalid_request', details: [{ field: 'id', code: 'invalid_id' }] });
+        expect(asMock(updateFood)).not.toHaveBeenCalled();
+        expect(asMock(deleteFood)).not.toHaveBeenCalled();
+    });
+
+    it('judges the path before the body, so a request wrong in both names the id', async () => {
+        const { req, res, recorded } = doubles({ params: { id: 'not-a-uuid' }, body: { name: 123 } });
+
+        await updateFoodController(req, res);
+
+        expect(recorded.statusCode).toBe(400);
+        expect(recorded.body).toEqual({ error: 'invalid_request', details: [{ field: 'id', code: 'invalid_id' }] });
+        expect(asMock(updateFood)).not.toHaveBeenCalled();
+    });
+
+    it('still answers 404 for a well-formed id that matched no row, so ownership stays indistinguishable', async () => {
+        asMock(updateFood).mockResolvedValue(null);
+
+        const { req, res, recorded } = doubles({ params: { id: A_FOOD_ID }, body: { calories: 130 } });
+
+        await updateFoodController(req, res);
+
+        expect(recorded.statusCode).toBe(404);
+        expect(asMock(updateFood)).toHaveBeenCalled();
+    });
+});

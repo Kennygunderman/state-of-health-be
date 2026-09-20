@@ -112,12 +112,14 @@ import {
     ParsedEntryPath,
     ParsedLogEntryBody,
     ParsedMealEntryEdit,
+    ParsedLegacyTargets,
     ParsedMealEntryPath,
     StoredMealEntrySnapshot,
     containsNulCharacter,
     isDatabaseParsableUuid,
     isEntryNutritionProvenance,
     parseEntryPath,
+    parseLegacyTargetsBody,
     parseLogEntryBody,
     parseMealEntryEditBody,
     parseMealEntryPath,
@@ -473,23 +475,161 @@ describe('parseLogEntryBody', () => {
             expect(asLegacy(parseLogEntryBody(body)).payload).toBe(body);
         });
 
-        it('accepts negative macros, because the shipped guard does not bound sign', () => {
-            // Pinned as current behaviour, not endorsed as sensible: the
-            // endpoint has never rejected a negative macro, so introducing a
-            // bound here would refuse bodies it accepts today. The bound
-            // belongs to a reviewed contract change, and this test is what
-            // makes that change visible.
+        it('accepts negative macros, because the guard bounds magnitude and not sign', () => {
+            // The SIGN is still unbounded, deliberately, and that is now a
+            // reviewed decision rather than an accident: `api/compat.test.ts`
+            // pins the three readers' rounding parity on a fixture whose
+            // protein, carbs and fat are negative, because `Math.round(-72.5)`
+            // is -72 where `round(numeric)` would answer -73. Refusing a sign
+            // here would break that documented contract.
+            //
+            // What DID change is the magnitude — see the `out_of_range` cases
+            // below — and these four values are far inside it.
             const body = { ...validLegacyBody(), calories: -220, protein: -14, carbs: -2, fat: -16 };
 
             expect(asLegacy(parseLogEntryBody(body)).payload).toBe(body);
         });
 
-        it('does not apply the catalog servings contract to a legacy body', () => {
-            // 99 servings is far outside the catalog [0.25, 10] bound. The legacy
-            // branch must not police it: nutrition.service.ts owns the legacy
-            // servings default, and adding a check here would reject bodies the
-            // endpoint has always accepted.
-            expect(parseLogEntryBody({ ...validLegacyBody(), servings: 99 }).kind).toBe('legacy');
+        it('applies the servings contract to a legacy body', () => {
+            // THE REVIEWED CONTRACT CHANGE this test's predecessor existed to
+            // make visible. It asserted the opposite — that 99 servings routed
+            // as `legacy` — and said the bound "belongs to a reviewed contract
+            // change, and this test is what makes that change visible". This is
+            // that change.
+            //
+            // It is not tidiness. `servings` is `double precision` and the
+            // macros are `int4`, so the history aggregates' per-row product
+            // `calories × servings` is a double: a STORED `servings` of 1e308
+            // overflowed the sum's integer cast and made
+            // `GET /macros/history` answer 500 for that user on every
+            // subsequent request, from a screen they could not use to delete
+            // the row. §0.5.2 bounds the field to [0.25, 10] with at most two
+            // decimals and the planned-log path already enforced exactly that,
+            // so the legacy path now judges it by the same predicate.
+            const verdict = parseLogEntryBody({ ...validLegacyBody(), servings: 99 });
+
+            expect(asError(verdict).code).toBe('invalid_request');
+            expect(asError(verdict).message).toBe(SERVINGS_MESSAGE);
+            expect(fieldCodes(verdict)).toStrictEqual(['servings:invalid_servings']);
+        });
+
+        it.each([
+            ['1e308, the value that broke the history read', 1e308],
+            ['1e154', 1e154],
+            ['2147483648', 2147483648],
+            ['above the contract', 11],
+            ['below the contract', 0.1],
+            ['zero', 0],
+            ['negative', -1],
+            ['a third decimal', 1.005],
+            ['a numeric string, which this field has never coerced', '2'],
+        ])('refuses servings that are %s', (_case, servings) => {
+            expect(fieldCodes(parseLogEntryBody({ ...validLegacyBody(), servings }))).toStrictEqual([
+                'servings:invalid_servings',
+            ]);
+        });
+
+        it.each([
+            ['the contract minimum', 0.25],
+            ['the contract maximum', 10],
+            ['the ⅓ chip value the app stores', 0.33],
+            ['the ⅔ chip value the app stores', 0.66],
+            ['a whole number inside it', 2],
+        ])('still accepts servings of %s', (_case, servings) => {
+            expect(parseLogEntryBody({ ...validLegacyBody(), servings }).kind).toBe('legacy');
+        });
+
+        it.each([
+            ['absent', {}],
+            ['null', { servings: null }],
+        ])('treats servings sent as %s as the writer´s own default rather than a failure', (_case, overrides) => {
+            // `logMealEntry` stores `payload.servings ?? 1`, so both of these
+            // mean one serving — which is how every shipped client that omits
+            // the field logs an entry.
+            expect(parseLogEntryBody({ ...validLegacyBody(), ...overrides }).kind).toBe('legacy');
+        });
+
+        it.each(['calories', 'protein', 'carbs', 'fat'])(
+            'refuses a %s past the stored magnitude, in either sign',
+            (field) => {
+                // 2147483647 is INSIDE int4 and was accepted; two such rows on
+                // one date overflowed the history SUM, which is why the bound
+                // is four orders of magnitude tighter than the column.
+                for (const value of [100001, 2147483647, 2147483648, 1e308, -100001, -1e308]) {
+                    expect(fieldCodes(parseLogEntryBody({ ...validLegacyBody(), [field]: value }))).toStrictEqual([
+                        `${field}:out_of_range`,
+                    ]);
+                }
+            },
+        );
+
+        it('accepts a macro at the magnitude bound itself', () => {
+            const body = { ...validLegacyBody(), calories: 100000, protein: -100000 };
+
+            expect(asLegacy(parseLogEntryBody(body)).payload).toBe(body);
+        });
+
+        it('reports every out-of-range field of one body at once, servings last', () => {
+            const verdict = parseLogEntryBody({
+                name: 'Absurd',
+                calories: 1e308,
+                protein: 1e308,
+                carbs: 1e308,
+                fat: 1e308,
+                servings: 1e308,
+            });
+
+            expect(fieldCodes(verdict)).toStrictEqual([
+                'calories:out_of_range',
+                'protein:out_of_range',
+                'carbs:out_of_range',
+                'fat:out_of_range',
+                'servings:invalid_servings',
+            ]);
+            expect(asError(verdict).code).toBe('invalid_request');
+        });
+
+        it('lets the frozen guard answer before the bounds', () => {
+            // A body that is wrong both ways keeps the response it earns today:
+            // the bounds may only ever replace a 201 that stored an unusable
+            // value or a 500 from the column, never an existing 400.
+            const verdict = parseLogEntryBody({ name: '  ', calories: 1e308, protein: 1, carbs: 1, fat: 1 });
+
+            expect(asError(verdict).code).toBe('legacy_fields_required');
+            expect(asError(verdict).message).toBe(LEGACY_REQUIRED_MESSAGE);
+        });
+
+        it('lets the unstorable-text verdict answer before the bounds', () => {
+            const verdict = parseLogEntryBody({ ...validLegacyBody(), name: `a${NUL}b`, servings: 99 });
+
+            expect(fieldCodes(verdict)).toStrictEqual(['name:invalid_characters']);
+        });
+
+        it('refuses a name longer than the stored cap', () => {
+            // 100,000 characters was storable, and `GET /macros/:date` echoes
+            // the field: three such names grew one day's response from 1.7 KB
+            // to 266 KB (CWE-400).
+            const verdict = parseLogEntryBody({ ...validLegacyBody(), name: 'x'.repeat(301) });
+
+            expect(asError(verdict).code).toBe('invalid_request');
+            expect(asError(verdict).message).toBe('name must be at most 300 characters');
+            expect(fieldCodes(verdict)).toStrictEqual(['name:invalid_length']);
+        });
+
+        it.each([
+            ['the cap itself', 300],
+            ['one below the cap', 299],
+            ['the longest name this repository´s own catalog data carries', 184],
+        ])('still accepts a name of %s characters', (_case, length) => {
+            expect(parseLogEntryBody({ ...validLegacyBody(), name: 'x'.repeat(length) }).kind).toBe('legacy');
+        });
+
+        it('measures the name cap after the trim the writer applies', () => {
+            // `logMealEntry` stores `payload.name.trim()`, so padding is not
+            // length: a 300-character name inside 40 spaces still stores 300.
+            const padded = `${' '.repeat(20)}${'x'.repeat(300)}${' '.repeat(20)}`;
+
+            expect(parseLogEntryBody({ ...validLegacyBody(), name: padded }).kind).toBe('legacy');
         });
 
         it('does not require the legacy servingText or inputMethod to be well formed', () => {
@@ -1059,11 +1199,22 @@ describe('containsNulCharacter', () => {
 });
 
 describe('parseMealEntryEditBody', () => {
-    // `PUT /api/macros/entry/:id` has never validated its body, and everything
-    // it accepts today it must go on accepting — so this suite is mostly the
-    // bodies it must hand through untouched. The single refusal exists for the
-    // same reason as the log route's: a `name` carrying U+0000 reaches
-    // `meal_entries.name` and returns as a 500 for a fixable request.
+    // `PUT /api/macros/entry/:id` validates its body for the failures the
+    // writer cannot answer, and for nothing else — so this suite is still
+    // largely the bodies it must hand through untouched.
+    //
+    // Two of those refusals used to be 500s from the column: a `name` carrying
+    // U+0000, and a `name`, `servings` or macro the column cannot hold. The
+    // third is the §0.5.2 numeric contract, and it is here rather than only on
+    // the log route because the two write the same columns: an edit could
+    // otherwise re-fill a column the log route had just closed, and a stored
+    // `servings` of 1e308 takes `GET /macros/history` down for its owner
+    // however it got there.
+    //
+    // The two behaviours the suite still pins as unchanged are the
+    // compatibility half of the rule: a body naming no editable field is the
+    // no-op 200 it has always been, and a body that is not an object at all
+    // still reaches the writer.
     it('refuses a name carrying U+0000, naming the field', () => {
         const verdict = asEditError(parseMealEntryEditBody({ name: `Scrambled${NUL}eggs` }));
 
@@ -1092,15 +1243,77 @@ describe('parseMealEntryEditBody', () => {
         ['a macro-only edit', { calories: 240 }],
         ['a name containing other control characters', { name: 'a\u0007b\u001bc' }],
         ['a padded name', { name: '  Scrambled eggs  ' }],
-        ['a name of the wrong type', { name: 42 }],
-        ['a name explicitly nulled', { name: null }],
+        ['a macro sent as a numeric string, which this route has always rounded', { calories: '240' }],
+        ['a macro explicitly nulled, which the shipped coercion stores as zero', { calories: null }],
+        ['a macro sent as a boolean, which coerces to one', { protein: true }],
+        ['a name at the stored cap', { name: 'x'.repeat(300) }],
         ['a body of unrecognised keys', { nope: `a${NUL}b` }],
     ])('hands %s through unchanged', (_case, body) => {
-        // Including the two that still fail at the column: a non-string name and
-        // an unrecognised key carrying U+0000. The rule reports on the one field
-        // the route stores and invents no other verdict, so nothing this route
-        // answers today changes.
+        // The coercion cases are the compatibility half of the numeric checks:
+        // `Math.round` accepts a numeric string, `null` and a boolean and the
+        // route stores the result, so the bound asks the shipped coercion's own
+        // question rather than a stricter one. An unrecognised key is not a
+        // field this route stores, so it is not this parser's to report.
         expect(asEditOk(parseMealEntryEditBody(body)).payload).toBe(body);
+    });
+
+    it.each([
+        ['a name sent as a number', { name: 42 }, 'name:invalid_type'],
+        ['a name explicitly nulled, which the NOT NULL column refuses', { name: null }, 'name:invalid_type'],
+        ['a name sent as an object', { name: { text: 'eggs' } }, 'name:invalid_type'],
+        ['a name past the stored cap', { name: 'x'.repeat(301) }, 'name:invalid_length'],
+        ['a macro that does not coerce', { calories: 'x' }, 'calories:invalid_type'],
+        ['a macro sent as an object', { protein: {} }, 'protein:invalid_type'],
+        ['a macro past the stored magnitude', { carbs: 1e308 }, 'carbs:out_of_range'],
+        ['a macro at the int4 boundary, which two rows overflow', { fat: 2147483647 }, 'fat:out_of_range'],
+        ['servings outside the contract', { servings: 1e308 }, 'servings:invalid_servings'],
+        ['servings above the contract', { servings: 99 }, 'servings:invalid_servings'],
+        ['servings explicitly nulled, which the NOT NULL column refuses', { servings: null }, 'servings:invalid_servings'],
+        ['servings with a third decimal', { servings: 1.005 }, 'servings:invalid_servings'],
+    ])('refuses %s', (_case, body, detail) => {
+        const verdict = asEditError(parseMealEntryEditBody(body));
+
+        expect(verdict.code).toBe('invalid_request');
+        expect(editFieldCodes(verdict)).toStrictEqual([detail]);
+    });
+
+    it('reports every offending field of one body at once, in column order', () => {
+        const verdict = parseMealEntryEditBody({
+            name: 42,
+            calories: 1e308,
+            protein: 'x',
+            carbs: 1e308,
+            fat: 1e308,
+            servings: 1e308,
+        });
+
+        expect(editFieldCodes(verdict)).toStrictEqual([
+            'name:invalid_type',
+            'calories:out_of_range',
+            'protein:invalid_type',
+            'carbs:out_of_range',
+            'fat:out_of_range',
+            'servings:invalid_servings',
+        ]);
+    });
+
+    it('answers the unstorable-text verdict before the bounds', () => {
+        // A NUL name is the refusal that shipped first, and a body wrong both
+        // ways keeps the response it earns today.
+        expect(editFieldCodes(parseMealEntryEditBody({ name: `a${NUL}b`, servings: 99 }))).toStrictEqual([
+            'name:invalid_characters',
+        ]);
+    });
+
+    it.each([
+        ['the contract minimum', 0.25],
+        ['the contract maximum', 10],
+        ['the ⅓ chip value the app stores', 0.33],
+        ['a macro at the magnitude bound', 100000],
+    ])('still accepts %s', (_case, value) => {
+        const body = typeof value === 'number' && value > 10 ? { calories: value } : { servings: value };
+
+        expect(parseMealEntryEditBody(body).kind).toBe('ok');
     });
 
     it.each([
@@ -1981,5 +2194,112 @@ describe('planMealEntryEdit', () => {
             expect(DETACHED_ENTRY_SNAPSHOT.nutrition_provenance).toBe(CLIENT_SNAPSHOT_PROVENANCE);
             expect(DETACHED_ENTRY_SNAPSHOT.input_method).not.toBe(PLANNED_INPUT_METHOD);
         });
+    });
+});
+
+describe('parseLegacyTargetsBody', () => {
+    // `PUT /api/user/targets` is untouched by design (§0.1.3): it is not the
+    // canonical targets writer, owns no preferences row and bumps no revision.
+    // This suite pins the one thing about it that changed and, at greater
+    // length, the three things that must not — because two of them are a
+    // documented compat trap that `api/compat.test.ts` also pins over HTTP.
+    const asTargetsError = (verdict: ParsedLegacyTargets): ErrorVerdict => {
+        if (verdict.kind !== 'error') {
+            throw new Error('expected a refusal, received an accepted body');
+        }
+        return verdict;
+    };
+
+    const accepted = (verdict: ParsedLegacyTargets): Partial<Record<string, unknown>> => {
+        if (verdict.kind !== 'ok') {
+            throw new Error(`expected an accepted body, received ${asTargetsError(verdict).code}`);
+        }
+        return verdict.targets;
+    };
+
+    const targetCodes = (verdict: ParsedLegacyTargets): string[] =>
+        asTargetsError(verdict).details.map((detail) => `${detail.field}:${detail.code}`);
+
+    it('resolves the four values it writes', () => {
+        expect(accepted(parseLegacyTargetsBody({ calories: 2000, protein: 150, carbs: 200, fat: 70 }))).toStrictEqual({
+            calories: 2000,
+            protein: 150,
+            carbs: 200,
+            fat: 70,
+        });
+    });
+
+    it('rounds a fractional value the way this route always has', () => {
+        expect(accepted(parseLegacyTargetsBody({ calories: 1999.6 })).calories).toBe(2000);
+    });
+
+    it('keeps an explicit null, because clearing a target is a real request', () => {
+        expect(accepted(parseLegacyTargetsBody({ protein: null })).protein).toBeNull();
+    });
+
+    it.each([
+        ['zero', 0],
+        ['a negative number', -500],
+        ['a value that does not coerce', 'abc'],
+        ['an object', {}],
+    ])('leaves the column alone for %s rather than storing or refusing it', (_case, calories) => {
+        // THE COMPAT TRAP this route exists with. The shipped coercion keeps a
+        // value only when it is finite AND > 0; everything else collapses to
+        // `undefined`, which the writer reads as "not being written" — so these
+        // are SILENTLY IGNORED and the response is a 200 with the stored value
+        // unchanged. A client that means "clear it" has to send null. Refusing
+        // them here would change a shipped response, which §0.5.2 forbids.
+        expect(accepted(parseLegacyTargetsBody({ calories })).calories).toBeUndefined();
+    });
+
+    it('names every absent field as unwritten', () => {
+        expect(accepted(parseLegacyTargetsBody({}))).toStrictEqual({
+            calories: undefined,
+            protein: undefined,
+            carbs: undefined,
+            fat: undefined,
+        });
+    });
+
+    it.each([
+        ['null', null],
+        ['undefined', undefined],
+        ['an array', [2000]],
+        ['a number', 2000],
+    ])('treats a body that is %s as naming no field rather than throwing', (_case, body) => {
+        expect(accepted(parseLegacyTargetsBody(body)).calories).toBeUndefined();
+    });
+
+    it.each([
+        ['1e308', 1e308],
+        ['one past int4', 2147483648],
+        ['a fraction that rounds past int4', 2147483647.6],
+    ])('refuses %s, which used to reach the int4 column and answer 500', (_case, calories) => {
+        const verdict = asTargetsError(parseLegacyTargetsBody({ calories }));
+
+        expect(verdict.code).toBe('invalid_request');
+        expect(verdict.message).toBe('calories must be at most 2147483647');
+        expect(targetCodes(verdict)).toStrictEqual(['calories:out_of_range']);
+    });
+
+    it('accepts int4´s own ceiling, because the column stores it', () => {
+        // The bound is the COLUMN's range and nothing tighter: the canonical
+        // writer's nutritional window would refuse values this route stores
+        // today, which is the compatibility break §0.5.2 forbids.
+        expect(accepted(parseLegacyTargetsBody({ calories: 2147483647 })).calories).toBe(2147483647);
+    });
+
+    it('reports every out-of-range field of one body at once', () => {
+        expect(
+            targetCodes(parseLegacyTargetsBody({ calories: 1e308, protein: 1e308, carbs: 200, fat: 1e308 })),
+        ).toStrictEqual(['calories:out_of_range', 'protein:out_of_range', 'fat:out_of_range']);
+    });
+
+    it('writes nothing at all when one field is refused', () => {
+        // The refusal is the whole request's: a body that would have written
+        // three columns and overflowed a fourth writes none of them.
+        const verdict = parseLegacyTargetsBody({ calories: 2000, protein: 1e308 });
+
+        expect(verdict.kind).toBe('error');
     });
 });

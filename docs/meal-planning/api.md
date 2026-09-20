@@ -1073,12 +1073,91 @@ They did not before: the day read rounds in JavaScript (`Math.round`, half-up)
 while the history and breakdown aggregates round in SQL, and PostgreSQL's
 `round(double precision)` is half-to-even — so any value landing on `.5` differed
 by 1 between two screens showing the same day. All ten SQL aggregate sites use
-`SUM(FLOOR((x * servings)::numeric + 0.5))::int`, which is `Math.round`'s
+`SUM(FLOOR((x * servings)::numeric + 0.5))::bigint`, which is `Math.round`'s
 definition rather than an approximation of it. Casting to `numeric` and keeping
 `ROUND` is *not* equivalent: `round(numeric)` rounds negative halves away from
 zero where `Math.round` rounds them towards positive infinity, and negative
 macros are storable through the legacy body. The reasoning is recorded beside the
 queries and in `planning-policy.md` §5.2.
+
+**The aggregates cannot be overflowed by a stored row.** Two things protect them,
+and both exist because a single bad row used to hold `GET /api/macros/history`
+down for its owner permanently — the aggregate raised `integer out of range`,
+Prisma surfaced `P2010`, and the route answered `500` on every subsequent call
+until the row was deleted by hand. First, every aggregate accumulates into
+`::bigint` rather than `::int`: `meal_entries.calories` and its three siblings are
+`int4`, so a day holding two rows at `int4`'s ceiling already sums past `int4`
+even though each row is individually legal. Second, the reads project the rows
+through a `WITH bounded AS (...)` step that clamps `servings` —
+`LEAST(GREATEST(servings, -1e3), 1e3)` — before any multiplication. `servings` is
+the only `double precision` operand in the expression and therefore the only
+operand a row can make non-finite; the clamp absorbs `1e308`, `±Infinity` and
+`NaN` (PostgreSQL orders `NaN` above every number, so `LEAST` picks the cap) and
+bounds the per-row product to about `2.15e12`, leaving `int8` room for millions of
+such rows. A `servings` inside the accepted `[0.25, 10]` contract passes through
+the clamp untouched, so the rounding parity above is bit-identical to what it was
+before the clamp existed. The clamp is a read-side backstop for rows already in
+the table: the write-side bounds below are what stop new ones arriving.
+
+**Six legacy writes now bound their numerics (§0.5.2).** Each of these routes
+accepted any finite number and any value `Math.round` would coerce, so a value
+past its column answered `500` from PostgreSQL and a value inside its column but
+outside the reads' arithmetic stored fine and broke a later read. All six now
+answer `400` with the field that has to change. Every refusal below replaces a
+`500` or an unusable `201`; **no response that is a `400` or a `200` today
+changes**, which is what makes the bounds additive under §0.5.2.
+
+| Route | Field | Bound | Code |
+| --- | --- | --- | --- |
+| `POST /api/macros/meal/:mealId/entries` (legacy body) | `name` | at most 300 characters, trimmed | `invalid_length` |
+| | `calories`, `protein`, `carbs`, `fat` | magnitude at most 100000 | `out_of_range` |
+| | `servings` | the catalog contract — `[0.25, 10]`, at most 2 decimals | `invalid_servings` |
+| `PUT /api/macros/entry/:id` | `name` | a string, at most 300 characters | `invalid_type`, `invalid_length` |
+| | `calories`, `protein`, `carbs`, `fat` | coercible to a finite number, magnitude at most 100000 | `invalid_type`, `out_of_range` |
+| | `servings` | the same servings contract | `invalid_servings` |
+| `PUT /api/user/targets` | `calories`, `protein`, `carbs`, `fat` | at most 2147483647, the `int4` ceiling of `users.target_*` | `out_of_range` |
+| `POST /api/foods` | `name` | a string, at most 300 characters | `invalid_type`, `invalid_length` |
+| | `calories`, `protein`, `carbs`, `fat` | magnitude at most 100000 | `out_of_range` |
+| | `servingAmount` | a number, magnitude at most 100000 | `invalid_type`, `out_of_range` |
+| `PUT /api/foods/:id` | the same four fields, each judged only when the body mentions it | as above; `servingAmount: null` is refused because `foods.serving_amount` is `NOT NULL` | `invalid_type`, `invalid_length`, `out_of_range` |
+| `POST /api/weigh-in` | `weight` | at most 2000 — unit-agnostic, since 300 kg is 661 lb is 47 st | `out_of_range` |
+
+The body is the §0.5.2 envelope — `{"error": "invalid_request", "details":
+[{"field": "...", "code": "..."}]}` — and one request reports **every** offending
+field of its body at once, in the order the columns are written, so a caller
+fixes one round trip's worth of problems rather than one field per round trip.
+`out_of_range` (a well-formed value outside the window its column or the reads
+can hold) and `invalid_length` (a stored string past its cap) are the two codes
+the vocabulary gained; both are declared in `FIELD_ERROR_CODES` in
+`nutrition.logic.ts` beside the codes that were already there.
+
+Five deliberate non-changes are part of the contract, each pinned by a test:
+
+- **Macro sign is still unbounded.** Only magnitude is judged. A negative macro
+  is storable through the legacy body on purpose and is the negative-half case of
+  the three-reader rounding parity above, so `{"protein": -145}` is still a
+  `201`.
+- **`PUT /api/user/targets` still silently ignores** zero, a negative number and
+  a non-numeric string: `200`, with the stored value untouched. Only the
+  out-of-`int4` case changed, from `500` to `400`. `null` still clears the
+  target.
+- **An edit body that mentions no editable field is still a no-op `200`**, and a
+  body that is not an object at all still reaches the writer unchanged. Nothing
+  is judged where nothing would be written.
+- **The frozen message-only refusals keep their exact bytes and carry no code
+  and no `details`**: the legacy log route's required-field sentence, `POST
+  /api/foods`'s `name, calories, protein, carbs, and fat are required`, and
+  `POST /api/weigh-in`'s `weight must be a positive number and loggedAt a valid
+  date`. The bounds are judged **after** those guards, so a body either of them
+  already refuses cannot reach a new verdict.
+- **`PUT /api/foods/:id` judges the body before it reads the row**, so a
+  malformed body says nothing about whether the id exists, and a well-formed body
+  naming someone else's food is still the `404` it was.
+
+Each rule lives in the pure parser that owns the input: `nutrition.logic.ts` for
+the two diary routes and the legacy targets writer, `food.logic.ts` for the two
+food routes, `weighIn.logic.ts` for the weigh-in — no shared validation helper,
+because a rule away from its parser is a rule that drifts from the body it judges.
 
 **Two lazy inserts now refuse an unprovisioned caller.** `GET /api/macros/:date`
 backfills the four meal buckets and `GET /api/foods` seeds the starter foods, and
@@ -1122,8 +1201,15 @@ one would be speaking HTTP from the wrong layer.
 
 Error bodies use the `{"error": "<code>"}` envelope the client's existing code
 reader already understands, with any payload members alongside the code.
-Failures are logged server-side with `console.error`; **the raw error object is
-never part of the body**.
+Failures are logged server-side through `safeLogger` — `logSafeEvent('error',
+'request_failed', …)` for a fault and `logSafeEvent('warn',
+'request_rejected', …)` for a refusal, one line per request and never both, with
+the route in an `action` field and the error reduced to its class name and code
+by `describeErrorSafely`. **The raw error object is part of neither the body nor
+the log**: handing it to `console.error` printed the stack, the absolute paths of
+the frames, a source excerpt, the Prisma `clientVersion` and the offending
+`data` payload including `user_id`. The legacy food routes went through that
+fallback and now use the same two events as the rest of the surface.
 
 All twenty-two meal-planning error classes, each with exactly one status:
 

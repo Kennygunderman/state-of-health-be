@@ -10,6 +10,7 @@
     "prisma": "prisma",
     "test": "jest --ci --runInBand --coverage",
     "test:watch": "jest --watch",
+    "audit:gate": "node scripts/audit-baseline-compare.mjs",
     "typecheck": "tsc --noEmit",
     "typecheck:test": "tsc -p tsconfig.test.json",
     "typecheck:scripts": "tsc -p tsconfig.scripts.json",

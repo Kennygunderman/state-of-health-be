@@ -126,13 +126,19 @@ export interface LogCatalogMealEntryPayload {
 // whose response was lost, keeps the link, the "From meal plan" caption and the
 // source label rather than erasing them.
 //
-// The members are typed as the values the endpoint means, not as what an
-// unvalidated body may contain: this route validates its body for one failure
-// only — a `name` carrying U+0000, which no `text` column can hold and which
-// `nutrition.logic.ts::parseMealEntryEditBody` refuses with `400
-// invalid_request` rather than letting it become a 500. Everything else is
-// unjudged as it always has been, so a caller that sends a name or macro of
-// another type still reaches the column and is still refused there.
+// The members are typed as the values the endpoint means, and
+// `nutrition.logic.ts::parseMealEntryEditBody` now holds the route to them. It
+// judges only the fields a body actually mentions — an absent member stays a
+// column the update leaves alone — and refuses with `400 invalid_request` and a
+// `{field, code}` detail in four cases: a `name` carrying U+0000, which no
+// `text` column can hold; a `name` that is not a string or is longer than the
+// stored cap; a macro that is not coercible to a number, or whose magnitude
+// would not fit `int4`; and a `servings` outside the `[0.25, 10]`
+// two-decimal contract. Each of those used to reach the column and surface as a
+// 500, and one of them — an unbounded `servings` — stored successfully and then
+// broke the history read for as long as the row existed. Two behaviours are
+// deliberately unchanged: a body naming no editable field is still a no-op 200,
+// and a non-object body still passes through as it always has.
 export interface UpdateMealEntryPayload {
     servings?: number;
     name?: string;

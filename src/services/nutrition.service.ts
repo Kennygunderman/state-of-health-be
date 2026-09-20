@@ -443,13 +443,18 @@ export const deleteMealEntry = async (userId: string, entryId: string): Promise<
     return count > 0;
 };
 
+// The macro members are `bigint` because the aggregates below sum into
+// `::bigint` — Prisma maps PostgreSQL `int8` to JavaScript `BigInt`, the same
+// way `meal_count` has always arrived from `COUNT(…)`. Both mappers convert
+// with `Number(…)`, so the response DTOs stay `number`; see the aggregate note
+// below for why the cast was widened.
 interface DailySummaryRow {
     date: Date;
     meal_count: bigint;
-    calories: number | null;
-    protein: number | null;
-    carbs: number | null;
-    fat: number | null;
+    calories: bigint | null;
+    protein: bigint | null;
+    carbs: bigint | null;
+    fat: bigint | null;
 }
 
 interface DaySummaryMealRow {
@@ -457,10 +462,10 @@ interface DaySummaryMealRow {
     meal_id: string;
     name: string;
     sort_order: number;
-    calories: number | null;
-    protein: number | null;
-    carbs: number | null;
-    fat: number | null;
+    calories: bigint | null;
+    protein: bigint | null;
+    carbs: bigint | null;
+    fat: bigint | null;
 }
 
 /* ---------------------------------------------------------------------------
@@ -495,8 +500,134 @@ interface DaySummaryMealRow {
  *
  * All ten call sites use the same expression, including the two `HAVING`
  * clauses: a day is skipped when its calories total is not positive, and that
- * total has to be the one the page reports.
+ * total has to be the one the page reports. Each one is a named fragment below
+ * rather than an expression inlined into a statement, and the day's calories
+ * total is the same fragment in its `SELECT` list and in both `HAVING`s, so the
+ * reported total and the skip decision cannot diverge.
+ *
+ * WHY THE ROW IS READ THROUGH A BOUND AND THE SUM IS `bigint`
+ *
+ * These aggregates used to cast to `::int`, and that made a single stored row
+ * able to take `GET /macros/history` out of service for its owner
+ * PERMANENTLY. `calories` is `int4` and `servings` is `double precision`, so
+ * `calories × servings` is a double: a row with `servings = 1e308` produced
+ * `Infinity`, and two ordinary rows holding `calories = 2147483647` produced a
+ * sum past `int4` — either way PostgreSQL raised `integer out of range`, Prisma
+ * reported `P2010`, and the route answered 500 on every subsequent request
+ * until the row was deleted. The day read stayed 200 throughout, so the screen
+ * that could have deleted the row was the only one still working.
+ *
+ * `nutrition.logic.ts` now refuses such a write, and the two changes below are
+ * the other half of that fix rather than a duplicate of it: a row stored BEFORE
+ * the bounds existed — or written by a migration, a script or manual SQL — must
+ * not be able to hold the endpoint down either.
+ *
+ *  1. Every row is read through {@link boundedEntries}, which clamps `servings`
+ *     into `[-1e3, 1e3]` before it is multiplied. That is the one operand a
+ *     stored row can make unusable: the four macro columns are `int4` and so
+ *     are finite and bounded by the column, while `servings` is
+ *     `double precision` and could hold 1e308, `±Infinity` or `NaN`.
+ *     `LEAST`/`GREATEST` absorb all three — PostgreSQL orders `NaN` above every
+ *     value, so `NaN` and `+Infinity` clamp to the upper bound and `-Infinity`
+ *     to the lower — which matters because `'NaN'::numeric` raises rather than
+ *     rounding. The clamp is applied to the DOUBLE and the product is still
+ *     computed in double space before the `::numeric` cast: moving the
+ *     multiplication into numeric space would change the rounding, because the
+ *     double→numeric conversion would happen per operand rather than on the
+ *     product.
+ *  2. The sum casts to `::bigint`. That is what fixes the second overflow,
+ *     which no clamp on a single row can: two rows at `int4`'s own boundary are
+ *     each individually storable and together exceed `int4`. With `servings`
+ *     bounded to 1e3 and `calories` to `int4`, a row's product cannot exceed
+ *     2.15e12, so `int8` accommodates four million such rows on one day before
+ *     it is troubled — and a row written under the new bounds is a million
+ *     times smaller than that.
+ *
+ * Neither changes a real row's number. A `servings` inside the §0.5.2 contract
+ * `[0.25, 10]` passes through `LEAST`/`GREATEST` untouched, so the expression is
+ * bit-identical to the one the parity above was measured on — including the
+ * negative half-values `api/compat.test.ts` pins — and the rounding itself is
+ * still `FLOOR(x::numeric + 0.5)` character for character, which is what
+ * `planning-policy.md` §5.2 states and what the policy-drift gate in
+ * `src/__tests__/setup/coverageInventory.test.ts` reads this file for.
  * ------------------------------------------------------------------------- */
+
+/**
+ * The window a stored `servings` is read through, as SQL literal text.
+ *
+ * `1e3` is three orders of magnitude past the §0.5.2 contract's maximum of 10,
+ * so no value a request can produce is affected — including one grown by
+ * `logMealEntry`'s dedupe branch, which would need a thousand logs of the same
+ * food to reach it. It is a numeric literal to PostgreSQL, and
+ * `LEAST`/`GREATEST` resolve `double precision` against it by promoting to
+ * `double precision` — the preferred type of that category — so the comparison
+ * and its result stay in the double space the product is computed in.
+ */
+const SERVINGS_READ_CLAMP = Prisma.sql`1e3`;
+
+/**
+ * The rows the aggregates read: `meal_entries` with `servings` clamped into the
+ * window above, under its own name.
+ *
+ * Clamping in the projection rather than inside each aggregate is what keeps
+ * the ten rounding expressions the single expression `planning-policy.md` §5.2
+ * documents — one bound, written once per query, instead of the same clamp
+ * repeated inside ten `SUM`s where a typo in one would silently produce a
+ * different total from the other nine.
+ *
+ * `where` carries the caller's bound parameters, so the predicate stays a
+ * parameterized fragment: `Prisma.raw` appears nowhere in `src/`, and this
+ * file follows `grocery.service.ts`, `preferences.service.ts` and
+ * `catalog.service.ts` in composing `Prisma.Sql` fragments instead.
+ */
+const boundedEntries = (where: Prisma.Sql): Prisma.Sql => Prisma.sql`
+        SELECT
+            date,
+            meal_id,
+            calories,
+            protein_g,
+            carbs_g,
+            fat_g,
+            LEAST(GREATEST(servings, -${SERVINGS_READ_CLAMP}), ${SERVINGS_READ_CLAMP}) AS servings
+        FROM meal_entries
+        WHERE ${where}
+    `;
+
+/* ---------------------------------------------------------------------------
+ * The ten consumed totals, one named `Prisma.Sql` fragment each
+ *
+ * `SUM(FLOOR((<column> * servings)::numeric + 0.5))::bigint` — the day query's
+ * four columns unqualified, the joined breakdown's four qualified with its `e`
+ * alias, and the day's calories reused by both `HAVING` clauses.
+ *
+ * SPELLED OUT RATHER THAN COMPOSED FROM A COLUMN PARAMETER, deliberately. This
+ * arithmetic is a documented contract, not an implementation detail:
+ * `planning-policy.md` §5.2 states it character for character as the reference
+ * the planned-meal rounding mirrors, and the policy-drift gate in
+ * `src/__tests__/setup/coverageInventory.test.ts` reads THIS FILE'S TEXT for
+ * the expression the document names — which is what makes a regression to
+ * either `ROUND` spelling fail a test instead of quietly disagreeing with the
+ * day read by 1 on every half value. A `Prisma.sql` template interpolating the
+ * column would put `${column}` in the source where the expression belongs, so
+ * the gate could no longer see it and the document's claim about this file
+ * would become unverifiable.
+ *
+ * Each fragment carries no placeholder, so it is verbatim static text: nothing
+ * here becomes a bound parameter, and `Prisma.raw` — which would accept one —
+ * appears nowhere in `src/`. What IS composed once is everything that could
+ * drift silently: the clamp lives in {@link boundedEntries} and the widened
+ * cast is the `::bigint` each fragment ends with.
+ * ------------------------------------------------------------------------- */
+
+const DAY_CALORIES_TOTAL = Prisma.sql`SUM(FLOOR((calories * servings)::numeric + 0.5))::bigint`;
+const DAY_PROTEIN_TOTAL = Prisma.sql`SUM(FLOOR((protein_g * servings)::numeric + 0.5))::bigint`;
+const DAY_CARBS_TOTAL = Prisma.sql`SUM(FLOOR((carbs_g * servings)::numeric + 0.5))::bigint`;
+const DAY_FAT_TOTAL = Prisma.sql`SUM(FLOOR((fat_g * servings)::numeric + 0.5))::bigint`;
+
+const MEAL_CALORIES_TOTAL = Prisma.sql`SUM(FLOOR((e.calories * e.servings)::numeric + 0.5))::bigint`;
+const MEAL_PROTEIN_TOTAL = Prisma.sql`SUM(FLOOR((e.protein_g * e.servings)::numeric + 0.5))::bigint`;
+const MEAL_CARBS_TOTAL = Prisma.sql`SUM(FLOOR((e.carbs_g * e.servings)::numeric + 0.5))::bigint`;
+const MEAL_FAT_TOTAL = Prisma.sql`SUM(FLOOR((e.fat_g * e.servings)::numeric + 0.5))::bigint`;
 
 // Per-meal totals for a set of days, keyed by day. Feeds the history screen's
 // line-by-line breakdown; only meals with logged entries appear.
@@ -506,20 +637,20 @@ const getMealBreakdowns = async (
 ): Promise<Map<string, DaySummaryMealResponse[]>> => {
     if (dates.length === 0) return new Map();
     const rows = await prisma.$queryRaw<DaySummaryMealRow[]>`
+        WITH bounded AS (${boundedEntries(
+            Prisma.sql`user_id = ${userId} AND deleted_at IS NULL AND date IN (${Prisma.join(dates)})`,
+        )})
         SELECT
             e.date,
             e.meal_id,
             m.name,
             m.sort_order,
-            SUM(FLOOR((e.calories * e.servings)::numeric + 0.5))::int AS calories,
-            SUM(FLOOR((e.protein_g * e.servings)::numeric + 0.5))::int AS protein,
-            SUM(FLOOR((e.carbs_g * e.servings)::numeric + 0.5))::int AS carbs,
-            SUM(FLOOR((e.fat_g * e.servings)::numeric + 0.5))::int AS fat
-        FROM meal_entries e
+            ${MEAL_CALORIES_TOTAL} AS calories,
+            ${MEAL_PROTEIN_TOTAL} AS protein,
+            ${MEAL_CARBS_TOTAL} AS carbs,
+            ${MEAL_FAT_TOTAL} AS fat
+        FROM bounded e
         JOIN meals m ON m.id = e.meal_id
-        WHERE e.user_id = ${userId}
-            AND e.deleted_at IS NULL
-            AND e.date IN (${Prisma.join(dates)})
         GROUP BY e.date, e.meal_id, m.name, m.sort_order
         ORDER BY m.sort_order ASC, m.name ASC
     `;
@@ -531,10 +662,13 @@ const getMealBreakdowns = async (
             id: row.meal_id,
             name: row.name,
             sortOrder: row.sort_order,
-            calories: row.calories ?? 0,
-            protein: row.protein ?? 0,
-            carbs: row.carbs ?? 0,
-            fat: row.fat ?? 0,
+            // `Number(…)` because the aggregate sums into `::bigint`, the same
+            // conversion `mealCount` performs on `COUNT(…)`: the DTO the client
+            // decodes is a JSON number, and a BigInt would not serialize at all.
+            calories: Number(row.calories ?? 0),
+            protein: Number(row.protein ?? 0),
+            carbs: Number(row.carbs ?? 0),
+            fat: Number(row.fat ?? 0),
         });
         byDay.set(key, meals);
     }
@@ -550,27 +684,28 @@ export const getHistory = async (
     // as the old reselect selectors, and round exactly as `asEaten` does — see
     // the rounding-parity note above `getMealBreakdowns`. Zero-calorie days are
     // skipped (old PreviousDailyMealEntriesScreen behavior).
+    const ownRows = Prisma.sql`user_id = ${userId} AND deleted_at IS NULL`;
     const rows = await prisma.$queryRaw<DailySummaryRow[]>`
+        WITH bounded AS (${boundedEntries(ownRows)})
         SELECT
             date,
             COUNT(DISTINCT meal_id) AS meal_count,
-            SUM(FLOOR((calories * servings)::numeric + 0.5))::int AS calories,
-            SUM(FLOOR((protein_g * servings)::numeric + 0.5))::int AS protein,
-            SUM(FLOOR((carbs_g * servings)::numeric + 0.5))::int AS carbs,
-            SUM(FLOOR((fat_g * servings)::numeric + 0.5))::int AS fat
-        FROM meal_entries
-        WHERE user_id = ${userId} AND deleted_at IS NULL
+            ${DAY_CALORIES_TOTAL} AS calories,
+            ${DAY_PROTEIN_TOTAL} AS protein,
+            ${DAY_CARBS_TOTAL} AS carbs,
+            ${DAY_FAT_TOTAL} AS fat
+        FROM bounded
         GROUP BY date
-        HAVING SUM(FLOOR((calories * servings)::numeric + 0.5)) > 0
+        HAVING ${DAY_CALORIES_TOTAL} > 0
         ORDER BY date DESC
         LIMIT ${limit} OFFSET ${(page - 1) * limit}
     `;
     const totalRows = await prisma.$queryRaw<{ count: bigint }[]>`
         SELECT COUNT(*) AS count FROM (
-            SELECT date FROM meal_entries
-            WHERE user_id = ${userId} AND deleted_at IS NULL
+            WITH bounded AS (${boundedEntries(ownRows)})
+            SELECT date FROM bounded
             GROUP BY date
-            HAVING SUM(FLOOR((calories * servings)::numeric + 0.5)) > 0
+            HAVING ${DAY_CALORIES_TOTAL} > 0
         ) days
     `;
     const mealsByDay = await getMealBreakdowns(userId, rows.map((row) => row.date));
@@ -578,10 +713,12 @@ export const getHistory = async (
         days: rows.map((row) => ({
             date: toDayKey(row.date),
             mealCount: Number(row.meal_count),
-            calories: row.calories ?? 0,
-            protein: row.protein ?? 0,
-            carbs: row.carbs ?? 0,
-            fat: row.fat ?? 0,
+            // Same conversion as the breakdown mapper above, and for the same
+            // reason: `::bigint` arrives as a BigInt and the DTO is a number.
+            calories: Number(row.calories ?? 0),
+            protein: Number(row.protein ?? 0),
+            carbs: Number(row.carbs ?? 0),
+            fat: Number(row.fat ?? 0),
             meals: mealsByDay.get(toDayKey(row.date)) ?? [],
         })),
         total: Number(totalRows[0]?.count ?? 0),

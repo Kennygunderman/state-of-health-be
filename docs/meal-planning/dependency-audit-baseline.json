@@ -1,0 +1,420 @@
+{
+    "purpose": "The reviewed dependency advisories the CI gate accepts. scripts/audit-baseline-compare.mjs runs `npm audit --omit=dev --json`, keys every finding, and fails the build on any key absent from the findings list below. Nothing regenerates this file: a new advisory is accepted only by a human adding its entry, with a reason, in a reviewed commit that also moves reviewedOn.",
+    "auditCommand": "npm audit --omit=dev --json",
+    "auditReportVersion": 2,
+    "reviewedOn": "2026-09-19",
+    "reviewBasis": "Reachability was determined package by package rather than assumed: a boot-time module-load probe established which vulnerable packages load at all (@google-cloud/firestore, jws, node-forge, uuid) and which never do (protobufjs, websocket-driver, faye-websocket, fast-xml-parser, form-data, @grpc/grpc-js, jsonwebtoken), and each loaded package's vulnerable path was then traced to the input it actually receives. Each entry below carries the result for its own package.",
+    "acceptedUntil": "The next firebase-admin major upgrade. Every entry here is reachable only through firebase-admin, and the whole cluster clears with firebase-admin@14.4.0 — a semver-major that removes the namespaced API this application uses at five call sites, so it is a separately scoped change recorded in docs/meal-planning/release-and-recovery.md rather than part of this work.",
+    "refreshProcedure": "Run `npm run audit:gate`. On a failure it prints each new finding as the entry that would accept it; paste the entry in with a real reason, move reviewedOn to today, and state in the commit message why the finding is accepted or how it was fixed. Entries it reports as no longer present may be deleted in the same pass — a finding that is gone can never be a regression, so pruning never fails the gate.",
+    "summaryAtReview": {
+        "info": 0,
+        "low": 1,
+        "moderate": 11,
+        "high": 5,
+        "critical": 4,
+        "total": 21
+    },
+    "productionDependenciesAtReview": 199,
+    "findings": [
+        {
+            "key": "advisory:1109540:form-data",
+            "package": "form-data",
+            "severity": "critical",
+            "title": "form-data uses unsafe random function in form-data for choosing boundary",
+            "url": "https://github.com/advisories/GHSA-fjxv-7rqg-78g4",
+            "reason": "Never loaded at boot (module-load probe): no code path in src/ or the CLI scripts builds a multipart body. Reachable only through firebase-admin's storage/gax stack, which this service does not call. Clears only with firebase-admin@14.4.0 (semver-major, out of scope)."
+        },
+        {
+            "key": "advisory:1110996:node-forge",
+            "package": "node-forge",
+            "severity": "high",
+            "title": "node-forge has ASN.1 Unbounded Recursion",
+            "url": "https://github.com/advisories/GHSA-554w-wpv2-vw27",
+            "reason": "Loaded lazily at firebase-admin credential-internal.js:177 to parse OUR OWN service-account PEM, never attacker-supplied input, so none of the ASN.1/signature-forgery paths takes untrusted data. Clears only with firebase-admin@14.4.0 (semver-major, out of scope)."
+        },
+        {
+            "key": "advisory:1110998:node-forge",
+            "package": "node-forge",
+            "severity": "high",
+            "title": "node-forge has an Interpretation Conflict vulnerability via its ASN.1 Validator Desynchronization",
+            "url": "https://github.com/advisories/GHSA-5gfm-wpxj-wjgq",
+            "reason": "Loaded lazily at firebase-admin credential-internal.js:177 to parse OUR OWN service-account PEM, never attacker-supplied input, so none of the ASN.1/signature-forgery paths takes untrusted data. Clears only with firebase-admin@14.4.0 (semver-major, out of scope)."
+        },
+        {
+            "key": "advisory:1111068:node-forge",
+            "package": "node-forge",
+            "severity": "moderate",
+            "title": "node-forge is vulnerable to ASN.1 OID Integer Truncation",
+            "url": "https://github.com/advisories/GHSA-65ch-62r8-g69g",
+            "reason": "Loaded lazily at firebase-admin credential-internal.js:177 to parse OUR OWN service-account PEM, never attacker-supplied input, so none of the ASN.1/signature-forgery paths takes untrusted data. Clears only with firebase-admin@14.4.0 (semver-major, out of scope)."
+        },
+        {
+            "key": "advisory:1111243:jws",
+            "package": "jws",
+            "severity": "high",
+            "title": "auth0/node-jws Improperly Verifies HMAC Signature",
+            "url": "https://github.com/advisories/GHSA-869p-cjfg-cm3x",
+            "reason": "Token verification runs through the nested jws 3.2.2 with RS256 pinned (firebase-admin lib/utils/jwt.js:173); the hoisted 4.0.0 copy is used only for outbound signing with our own key, so the HMAC-confusion path takes no attacker input. Clears only with firebase-admin@14.4.0 (semver-major, out of scope)."
+        },
+        {
+            "key": "advisory:1111244:jws",
+            "package": "jws",
+            "severity": "high",
+            "title": "auth0/node-jws Improperly Verifies HMAC Signature",
+            "url": "https://github.com/advisories/GHSA-869p-cjfg-cm3x",
+            "reason": "Token verification runs through the nested jws 3.2.2 with RS256 pinned (firebase-admin lib/utils/jwt.js:173); the hoisted 4.0.0 copy is used only for outbound signing with our own key, so the HMAC-confusion path takes no attacker input. Clears only with firebase-admin@14.4.0 (semver-major, out of scope)."
+        },
+        {
+            "key": "advisory:1113161:qs",
+            "package": "qs",
+            "severity": "low",
+            "title": "qs's arrayLimit bypass in comma parsing allows denial of service",
+            "url": "https://github.com/advisories/GHSA-w7fw-mjwx-w883",
+            "reason": "Query parsing is bounded before it reaches a handler: every route reads fixed, individually parsed fields and the server answers 431 on an oversized URL and 413 over the body limits, so the array/bracket-expansion DoS paths have no amplification here. Fixed in express 4.22.3+; tracked with the express bump."
+        },
+        {
+            "key": "advisory:1113567:fast-xml-parser",
+            "package": "fast-xml-parser",
+            "severity": "critical",
+            "title": "fast-xml-parser has an entity encoding bypass via regex injection in DOCTYPE entity names",
+            "url": "https://github.com/advisories/GHSA-m7jm-9gc2-mpf2",
+            "reason": "Never loaded at boot (module-load probe): reached only by @google-cloud/storage, which this service never calls. Clears only with firebase-admin@14.4.0 (semver-major, out of scope)."
+        },
+        {
+            "key": "advisory:1113570:fast-xml-parser",
+            "package": "fast-xml-parser",
+            "severity": "high",
+            "title": "fast-xml-parser affected by DoS through entity expansion in DOCTYPE (no expansion limit)",
+            "url": "https://github.com/advisories/GHSA-jmr7-xgp7-cmfj",
+            "reason": "Never loaded at boot (module-load probe): reached only by @google-cloud/storage, which this service never calls. Clears only with firebase-admin@14.4.0 (semver-major, out of scope)."
+        },
+        {
+            "key": "advisory:1113719:qs",
+            "package": "qs",
+            "severity": "moderate",
+            "title": "qs's arrayLimit bypass in its bracket notation allows DoS via memory exhaustion",
+            "url": "https://github.com/advisories/GHSA-6rw7-vpxm-498p",
+            "reason": "Query parsing is bounded before it reaches a handler: every route reads fixed, individually parsed fields and the server answers 431 on an oversized URL and 413 over the body limits, so the array/bracket-expansion DoS paths have no amplification here. Fixed in express 4.22.3+; tracked with the express bump."
+        },
+        {
+            "key": "advisory:1114149:fast-xml-parser",
+            "package": "fast-xml-parser",
+            "severity": "low",
+            "title": "fast-xml-parser has stack overflow in XMLBuilder with preserveOrder",
+            "url": "https://github.com/advisories/GHSA-fj3w-jwp8-x2g3",
+            "reason": "Never loaded at boot (module-load probe): reached only by @google-cloud/storage, which this service never calls. Clears only with firebase-admin@14.4.0 (semver-major, out of scope)."
+        },
+        {
+            "key": "advisory:1115338:fast-xml-parser",
+            "package": "fast-xml-parser",
+            "severity": "high",
+            "title": "fast-xml-parser affected by numeric entity expansion bypassing all entity expansion limits (incomplete fix for CVE-2026-26278)",
+            "url": "https://github.com/advisories/GHSA-8gc5-j5rx-235r",
+            "reason": "Never loaded at boot (module-load probe): reached only by @google-cloud/storage, which this service never calls. Clears only with firebase-admin@14.4.0 (semver-major, out of scope)."
+        },
+        {
+            "key": "advisory:1115527:path-to-regexp",
+            "package": "path-to-regexp",
+            "severity": "high",
+            "title": "path-to-regexp vulnerable to Regular Expression Denial of Service via multiple route parameters",
+            "url": "https://github.com/advisories/GHSA-37ch-88jc-xwx2",
+            "reason": "ReDoS precondition unmet: all 59 route patterns registered by this app were inspected and none has two adjacent parameters in one segment (/:a-:b), which is the shape the advisory needs. Fixed in express 4.22.3+; tracked with the express bump rather than accepted indefinitely."
+        },
+        {
+            "key": "advisory:1115545:node-forge",
+            "package": "node-forge",
+            "severity": "high",
+            "title": "Forge has a basicConstraints bypass in its certificate chain verification (RFC 5280 violation)",
+            "url": "https://github.com/advisories/GHSA-2328-f5f3-gj25",
+            "reason": "Loaded lazily at firebase-admin credential-internal.js:177 to parse OUR OWN service-account PEM, never attacker-supplied input, so none of the ASN.1/signature-forgery paths takes untrusted data. Clears only with firebase-admin@14.4.0 (semver-major, out of scope)."
+        },
+        {
+            "key": "advisory:1115546:node-forge",
+            "package": "node-forge",
+            "severity": "high",
+            "title": "Forge has signature forgery in Ed25519 due to missing S > L check",
+            "url": "https://github.com/advisories/GHSA-q67f-28xg-22rw",
+            "reason": "Loaded lazily at firebase-admin credential-internal.js:177 to parse OUR OWN service-account PEM, never attacker-supplied input, so none of the ASN.1/signature-forgery paths takes untrusted data. Clears only with firebase-admin@14.4.0 (semver-major, out of scope)."
+        },
+        {
+            "key": "advisory:1115548:node-forge",
+            "package": "node-forge",
+            "severity": "high",
+            "title": "Forge has Denial of Service via Infinite Loop in BigInteger.modInverse() with Zero Input",
+            "url": "https://github.com/advisories/GHSA-5m6q-g25r-mvwx",
+            "reason": "Loaded lazily at firebase-admin credential-internal.js:177 to parse OUR OWN service-account PEM, never attacker-supplied input, so none of the ASN.1/signature-forgery paths takes untrusted data. Clears only with firebase-admin@14.4.0 (semver-major, out of scope)."
+        },
+        {
+            "key": "advisory:1115612:node-forge",
+            "package": "node-forge",
+            "severity": "high",
+            "title": "Forge has signature forgery in RSA-PKCS due to ASN.1 extra field  ",
+            "url": "https://github.com/advisories/GHSA-ppp5-5v6c-4jwp",
+            "reason": "Loaded lazily at firebase-admin credential-internal.js:177 to parse OUR OWN service-account PEM, never attacker-supplied input, so none of the ASN.1/signature-forgery paths takes untrusted data. Clears only with firebase-admin@14.4.0 (semver-major, out of scope)."
+        },
+        {
+            "key": "advisory:1116308:fast-xml-parser",
+            "package": "fast-xml-parser",
+            "severity": "moderate",
+            "title": "Entity Expansion Limits Bypassed When Set to Zero Due to JavaScript Falsy Evaluation in fast-xml-parser",
+            "url": "https://github.com/advisories/GHSA-jp2q-39xq-3w4g",
+            "reason": "Never loaded at boot (module-load probe): reached only by @google-cloud/storage, which this service never calls. Clears only with firebase-admin@14.4.0 (semver-major, out of scope)."
+        },
+        {
+            "key": "advisory:1117571:protobufjs",
+            "package": "protobufjs",
+            "severity": "critical",
+            "title": "Arbitrary code execution in protobufjs",
+            "url": "https://github.com/advisories/GHSA-xq3m-2v4x-88gg",
+            "reason": "Never loaded at boot (module-load probe): gRPC is only used by the Firestore client, whose sole consumer (src/routes/migration.routes.ts) has its registration lines commented out. Clears only with firebase-admin@14.4.0 (semver-major, out of scope)."
+        },
+        {
+            "key": "advisory:1117911:fast-xml-parser",
+            "package": "fast-xml-parser",
+            "severity": "moderate",
+            "title": "fast-xml-parser XMLBuilder: XML Comment and CDATA Injection via Unescaped Delimiters",
+            "url": "https://github.com/advisories/GHSA-gh4j-gqv2-49f6",
+            "reason": "Never loaded at boot (module-load probe): reached only by @google-cloud/storage, which this service never calls. Clears only with firebase-admin@14.4.0 (semver-major, out of scope)."
+        },
+        {
+            "key": "advisory:1118641:protobufjs",
+            "package": "protobufjs",
+            "severity": "high",
+            "title": "protobuf.js: Code injection through bytes field defaults in generated toObject code",
+            "url": "https://github.com/advisories/GHSA-66ff-xgx4-vchm",
+            "reason": "Never loaded at boot (module-load probe): gRPC is only used by the Firestore client, whose sole consumer (src/routes/migration.routes.ts) has its registration lines commented out. Clears only with firebase-admin@14.4.0 (semver-major, out of scope)."
+        },
+        {
+            "key": "advisory:1118924:protobufjs",
+            "package": "protobufjs",
+            "severity": "moderate",
+            "title": "protobuf.js: Denial of service from crafted field names in generated code",
+            "url": "https://github.com/advisories/GHSA-2pr8-phx7-x9h3",
+            "reason": "Never loaded at boot (module-load probe): gRPC is only used by the Firestore client, whose sole consumer (src/routes/migration.routes.ts) has its registration lines commented out. Clears only with firebase-admin@14.4.0 (semver-major, out of scope)."
+        },
+        {
+            "key": "advisory:1118926:protobufjs",
+            "package": "protobufjs",
+            "severity": "moderate",
+            "title": "protobuf.js: Prototype injection in generated message constructors",
+            "url": "https://github.com/advisories/GHSA-fx83-v9x8-x52w",
+            "reason": "Never loaded at boot (module-load probe): gRPC is only used by the Firestore client, whose sole consumer (src/routes/migration.routes.ts) has its registration lines commented out. Clears only with firebase-admin@14.4.0 (semver-major, out of scope)."
+        },
+        {
+            "key": "advisory:1118928:protobufjs",
+            "package": "protobufjs",
+            "severity": "high",
+            "title": "protobuf.js: Code generation gadget after prototype pollution",
+            "url": "https://github.com/advisories/GHSA-75px-5xx7-5xc7",
+            "reason": "Never loaded at boot (module-load probe): gRPC is only used by the Firestore client, whose sole consumer (src/routes/migration.routes.ts) has its registration lines commented out. Clears only with firebase-admin@14.4.0 (semver-major, out of scope)."
+        },
+        {
+            "key": "advisory:1118930:protobufjs",
+            "package": "protobufjs",
+            "severity": "high",
+            "title": "protobuf.js: Process-wide denial of service through unsafe option paths",
+            "url": "https://github.com/advisories/GHSA-jvwf-75h9-cwgg",
+            "reason": "Never loaded at boot (module-load probe): gRPC is only used by the Firestore client, whose sole consumer (src/routes/migration.routes.ts) has its registration lines commented out. Clears only with firebase-admin@14.4.0 (semver-major, out of scope)."
+        },
+        {
+            "key": "advisory:1118932:protobufjs",
+            "package": "protobufjs",
+            "severity": "high",
+            "title": "protobuf.js: Denial of service through unbounded protobuf recursion",
+            "url": "https://github.com/advisories/GHSA-685m-2w69-288q",
+            "reason": "Never loaded at boot (module-load probe): gRPC is only used by the Firestore client, whose sole consumer (src/routes/migration.routes.ts) has its registration lines commented out. Clears only with firebase-admin@14.4.0 (semver-major, out of scope)."
+        },
+        {
+            "key": "advisory:1118933:@protobufjs/utf8",
+            "package": "@protobufjs/utf8",
+            "severity": "moderate",
+            "title": "protobufjs has overlong UTF-8 decoding",
+            "url": "https://github.com/advisories/GHSA-q6x5-8v7m-xcrf",
+            "reason": "Never loaded at boot (module-load probe), for the same reason as protobufjs: the gRPC/Firestore path is unreachable dead code here. Clears only with firebase-admin@14.4.0 (semver-major, out of scope)."
+        },
+        {
+            "key": "advisory:1118935:protobufjs",
+            "package": "protobufjs",
+            "severity": "moderate",
+            "title": "protobufjs has overlong UTF-8 decoding",
+            "url": "https://github.com/advisories/GHSA-q6x5-8v7m-xcrf",
+            "reason": "Never loaded at boot (module-load probe): gRPC is only used by the Firestore client, whose sole consumer (src/routes/migration.routes.ts) has its registration lines commented out. Clears only with firebase-admin@14.4.0 (semver-major, out of scope)."
+        },
+        {
+            "key": "advisory:1119378:protobufjs",
+            "package": "protobufjs",
+            "severity": "moderate",
+            "title": "protobufjs: Denial of Service via unbounded recursive JSON descriptor expansion",
+            "url": "https://github.com/advisories/GHSA-jggg-4jg4-v7c6",
+            "reason": "Never loaded at boot (module-load probe): gRPC is only used by the Firestore client, whose sole consumer (src/routes/migration.routes.ts) has its registration lines commented out. Clears only with firebase-admin@14.4.0 (semver-major, out of scope)."
+        },
+        {
+            "key": "advisory:1119438:@tootallnate/once",
+            "package": "@tootallnate/once",
+            "severity": "low",
+            "title": "@tootallnate/once vulnerable to Incorrect Control Flow Scoping",
+            "url": "https://github.com/advisories/GHSA-vpq2-c234-7xj6",
+            "reason": "Reached only through firebase-admin's http(s)-proxy-agent; this service configures no proxy agent, and the advisory is a control-flow scoping defect with no request-borne input here. Clears only with firebase-admin@14.4.0 (semver-major, out of scope)."
+        },
+        {
+            "key": "advisory:1119441:uuid",
+            "package": "uuid",
+            "severity": "moderate",
+            "title": "uuid: Missing buffer bounds check in v3/v5/v6 when buf is provided",
+            "url": "https://github.com/advisories/GHSA-w5hq-g745-h8pq",
+            "reason": "The backend calls uuid v4 only (workout/record/exercise services); the missing-bounds-check advisory is in the v3/v5/v6 `buf` path, which this project never calls. Moving uuid to dependencies was required by AAP 0.4.2 and does not change that."
+        },
+        {
+            "key": "advisory:1119502:qs",
+            "package": "qs",
+            "severity": "moderate",
+            "title": "qs has a remotely triggerable DoS: qs.stringify crashes with TypeError on null/undefined entries in comma-format arrays when encodeValuesOnly is set",
+            "url": "https://github.com/advisories/GHSA-q8mj-m7cp-5q26",
+            "reason": "Query parsing is bounded before it reaches a handler: every route reads fixed, individually parsed fields and the server answers 431 on an oversized URL and 413 over the body limits, so the array/bracket-expansion DoS paths have no amplification here. Fixed in express 4.22.3+; tracked with the express bump."
+        },
+        {
+            "key": "advisory:1120583:@grpc/grpc-js",
+            "package": "@grpc/grpc-js",
+            "severity": "high",
+            "title": "@grpc/grpc-js: A malformed request can cause a server crash",
+            "url": "https://github.com/advisories/GHSA-5375-pq7m-f5r2",
+            "reason": "Never loaded at boot (module-load probe): the gRPC transport is Firestore-only and that consumer is unreachable dead code. Clears only with firebase-admin@14.4.0 (semver-major, out of scope)."
+        },
+        {
+            "key": "advisory:1120589:@grpc/grpc-js",
+            "package": "@grpc/grpc-js",
+            "severity": "high",
+            "title": "@grpc/grpc-js: An incoming malformed compressed message can cause a client or server crash",
+            "url": "https://github.com/advisories/GHSA-99f4-grh7-6pcq",
+            "reason": "Never loaded at boot (module-load probe): the gRPC transport is Firestore-only and that consumer is unreachable dead code. Clears only with firebase-admin@14.4.0 (semver-major, out of scope)."
+        },
+        {
+            "key": "advisory:1120745:form-data",
+            "package": "form-data",
+            "severity": "high",
+            "title": "form-data: CRLF injection in form-data via unescaped multipart field names and filenames",
+            "url": "https://github.com/advisories/GHSA-hmw2-7cc7-3qxx",
+            "reason": "Never loaded at boot (module-load probe): no code path in src/ or the CLI scripts builds a multipart body. Reachable only through firebase-admin's storage/gax stack, which this service does not call. Clears only with firebase-admin@14.4.0 (semver-major, out of scope)."
+        },
+        {
+            "key": "advisory:1123482:websocket-driver",
+            "package": "websocket-driver",
+            "severity": "moderate",
+            "title": "websocket-driver: Resource limit bypass via message compression",
+            "url": "https://github.com/advisories/GHSA-mp7j-qc5w-4988",
+            "reason": "Never loaded at boot (module-load probe): this server opens no WebSocket and faye-websocket is never required. Clears only with firebase-admin@14.4.0 (semver-major, out of scope)."
+        },
+        {
+            "key": "advisory:1123483:websocket-driver",
+            "package": "websocket-driver",
+            "severity": "critical",
+            "title": "websocket-driver: Message corruption via abuse of protocol length headers",
+            "url": "https://github.com/advisories/GHSA-xv26-6w52-cph6",
+            "reason": "Never loaded at boot (module-load probe): this server opens no WebSocket and faye-websocket is never required. Clears only with firebase-admin@14.4.0 (semver-major, out of scope)."
+        },
+        {
+            "key": "advisory:1123488:protobufjs",
+            "package": "protobufjs",
+            "severity": "high",
+            "title": "protobufjs: Denial of service through unbounded Any expansion during JSON conversion",
+            "url": "https://github.com/advisories/GHSA-wcpc-wj8m-hjx6",
+            "reason": "Never loaded at boot (module-load probe): gRPC is only used by the Firestore client, whose sole consumer (src/routes/migration.routes.ts) has its registration lines commented out. Clears only with firebase-admin@14.4.0 (semver-major, out of scope)."
+        },
+        {
+            "key": "advisory:1123492:protobufjs",
+            "package": "protobufjs",
+            "severity": "moderate",
+            "title": "protobufjs : Schema-derived names can shadow runtime-significant properties",
+            "url": "https://github.com/advisories/GHSA-f38q-mgvj-vph7",
+            "reason": "Never loaded at boot (module-load probe): gRPC is only used by the Firestore client, whose sole consumer (src/routes/migration.routes.ts) has its registration lines commented out. Clears only with firebase-admin@14.4.0 (semver-major, out of scope)."
+        },
+        {
+            "key": "advisory:1123964:protobufjs",
+            "package": "protobufjs",
+            "severity": "moderate",
+            "title": "protobufjs: Denial of Service via infinite loop in .proto option parsing",
+            "url": "https://github.com/advisories/GHSA-j3f2-48v5-ccww",
+            "reason": "Never loaded at boot (module-load probe): gRPC is only used by the Firestore client, whose sole consumer (src/routes/migration.routes.ts) has its registration lines commented out. Clears only with firebase-admin@14.4.0 (semver-major, out of scope)."
+        },
+        {
+            "key": "advisory:1123977:body-parser",
+            "package": "body-parser",
+            "severity": "low",
+            "title": "body-parser vulnerable to denial of service when invalid limit value silently disables size enforcement",
+            "url": "https://github.com/advisories/GHSA-v422-hmwv-36x6",
+            "reason": "The advisory needs an invalid `limit` value passed to the parser; src/app.ts configures only the three explicit limits (10mb, 1mb, default), all valid. Fixed in express 4.22.3+; tracked with the express bump."
+        },
+        {
+            "key": "advisory:1158507:qs",
+            "package": "qs",
+            "severity": "moderate",
+            "title": "qs: Denial of Service via Attacker Controlled isBuffer",
+            "url": "https://github.com/advisories/GHSA-4mjr-xmp4-gh2g",
+            "reason": "Query parsing is bounded before it reaches a handler: every route reads fixed, individually parsed fields and the server answers 431 on an oversized URL and 413 over the body limits, so the array/bracket-expansion DoS paths have no amplification here. Fixed in express 4.22.3+; tracked with the express bump."
+        },
+        {
+            "key": "indirect:@google-cloud/firestore",
+            "package": "@google-cloud/firestore",
+            "severity": "moderate",
+            "title": "affected through google-gax",
+            "url": "",
+            "reason": "Loads at boot but is unreachable dead code: its only consumer, src/routes/migration.routes.ts, has its registration lines commented out. Clears only with firebase-admin@14.4.0 (semver-major, out of scope)."
+        },
+        {
+            "key": "indirect:@google-cloud/storage",
+            "package": "@google-cloud/storage",
+            "severity": "moderate",
+            "title": "affected through fast-xml-parser, retry-request, teeny-request, uuid",
+            "url": "",
+            "reason": "Affected only through its own dependencies; this service never calls Cloud Storage. Clears only with firebase-admin@14.4.0 (semver-major, out of scope)."
+        },
+        {
+            "key": "indirect:express",
+            "package": "express",
+            "severity": "high",
+            "title": "affected through body-parser, path-to-regexp, qs",
+            "url": "",
+            "reason": "Affected only through body-parser, path-to-regexp and qs, each assessed on its own above. Fixed in express 4.22.3+; tracked with the express bump."
+        },
+        {
+            "key": "indirect:firebase-admin",
+            "package": "firebase-admin",
+            "severity": "moderate",
+            "title": "affected through @google-cloud/firestore",
+            "url": "",
+            "reason": "Affected only through @google-cloud/firestore, whose consumer is unreachable dead code. The fix is firebase-admin@14.4.0, a semver-major that removes the namespaced API this app uses at five call sites — recorded as a separately scoped follow-up in docs/meal-planning/release-and-recovery.md."
+        },
+        {
+            "key": "indirect:gaxios",
+            "package": "gaxios",
+            "severity": "moderate",
+            "title": "affected through uuid",
+            "url": "",
+            "reason": "Affected only through uuid, whose vulnerable v3/v5/v6 path this tree never calls. Clears only with firebase-admin@14.4.0 (semver-major, out of scope)."
+        },
+        {
+            "key": "indirect:google-gax",
+            "package": "google-gax",
+            "severity": "moderate",
+            "title": "affected through retry-request, uuid",
+            "url": "",
+            "reason": "Affected only through retry-request and uuid; the gax transport is Firestore-only and that consumer is unreachable dead code. Clears only with firebase-admin@14.4.0 (semver-major, out of scope)."
+        },
+        {
+            "key": "indirect:retry-request",
+            "package": "retry-request",
+            "severity": "moderate",
+            "title": "affected through teeny-request",
+            "url": "",
+            "reason": "Affected only through teeny-request, in the Cloud Storage path this service never calls. Clears only with firebase-admin@14.4.0 (semver-major, out of scope)."
+        },
+        {
+            "key": "indirect:teeny-request",
+            "package": "teeny-request",
+            "severity": "moderate",
+            "title": "affected through uuid",
+            "url": "",
+            "reason": "Affected only through uuid, in the Cloud Storage path this service never calls. Clears only with firebase-admin@14.4.0 (semver-major, out of scope)."
+        }
+    ]
+}
