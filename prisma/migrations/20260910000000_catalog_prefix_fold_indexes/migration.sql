@@ -1,0 +1,111 @@
+-- Search portability: index the ASCII fold the prefix branches now compare on,
+-- for all three columns they read, and drop the lower(alias) index they no
+-- longer use.
+--
+-- WHAT WAS WRONG. `catalog.service.ts::catalogMatchSet` built its LIKE pattern
+-- with JavaScript `toLowerCase()` (Unicode full case folding) while folding
+-- `display_name`, `canonical_name` and `alias` with PostgreSQL `lower()`
+-- (resolved through the database's collation). Those are different functions
+-- outside A-Z: `'MURNİX'.toLowerCase()` is `murni` + U+0307 + `x`, `lower`
+-- answers `murnix` under en_US.utf8 and something else again under ICU or C. A
+-- prefix branch is the ONLY branch a partial query can match — a stemmed query
+-- has no prefix semantics — so a food whose name carries a non-ASCII uppercase
+-- letter disappeared from a partial search entirely rather than being
+-- mis-ranked, and which queries were affected was a property of the server.
+-- Agent Action Plan §0.9.3 requires two independently loaded databases to
+-- produce identical ranks and page sequences, so this was a portability defect.
+--
+-- The head-noun path had the same defect and was fixed by folding both sides
+-- through one ASCII-only map (`foldSearchAscii` in `catalog.logic.ts`,
+-- `asciiFoldOf` in `catalog.service.ts`). The prefix branches could not take
+-- that fix while the only index available was on `lower(alias)`: writing
+-- `translate(alias, …) LIKE …` against it stops matching the indexed
+-- expression, and the range scan becomes a sequential read of every published
+-- alias. These three indexes are what let the branches fold the same way the
+-- rest of the scorer does.
+--
+-- WHY A NEW LEDGER ENTRY RATHER THAN AN EDIT TO 20260908000000_meal_planning.
+-- That migration's checksum is recorded in `_prisma_migrations` in every
+-- database already brought up to it, and `src/__tests__/setup/testDb.ts`
+-- refuses a database whose recorded checksum differs from the file on disk — so
+-- editing it would break every developer's and every CI database rather than
+-- migrate them. 20260909000000_usda_cache_http_status is the in-repo precedent
+-- for a follow-up entry.
+--
+-- WHY `translate` RATHER THAN `lower`. `translate()` is a character-for-
+-- character map over the two argument strings and takes no locale input at all
+-- — no ctype, no collation — so it answers the same thing on every server and
+-- is exactly what `foldSearchAscii` computes in JavaScript. The two argument
+-- strings here are the same 26 letters that function folds, which is what makes
+-- the indexed expression and the bound pattern the same fold. Everything
+-- outside A-Z passes through unchanged on both sides and is normalised by
+-- `to_tsvector`/`plainto_tsquery` at the point of comparison, which applies one
+-- text-search configuration to both halves of it.
+--
+-- WHY `text_pattern_ops`, on every one of the three. A btree derives the `>=`
+-- and `<` range bounds a left-anchored LIKE becomes only when the indexed
+-- comparison is byte order — a `*_pattern_ops` operator class, or a column
+-- collation of C. The databases this project creates are en_US.utf8, and the
+-- one the catalog service's own collation suite creates is ICU `und`, so
+-- neither gives that for free; under the default `text_ops` the planner refuses
+-- the index even with `enable_seqscan = off`, which makes the class a
+-- correctness property of these indexes rather than a tuning preference. The
+-- class still serves `=`, `<` and `>`, so no second `text_ops` index is needed
+-- beside it. `src/__tests__/api/catalogCollation.test.ts` pins the class out of
+-- `pg_opclass`, pins the plan, and reads the index-scan counters of a real
+-- `searchPublishedFoods` call.
+--
+-- WHY THE TWO catalog_foods INDEXES ARE PARTIAL. Their branch's own predicate
+-- is `publication_status = 'published'` — search surfaces no other status — so
+-- the partial predicate matches the query exactly and the index stays the size
+-- of the published catalog rather than of every candidate, quarantined and
+-- retired row the pipeline has ever written. The alias index is not partial:
+-- publication is a column of `catalog_foods`, not of `catalog_food_aliases`,
+-- and the alias branch reaches it through the join rather than through a
+-- predicate an index on this table could carry.
+--
+-- WHY THE lower(alias) INDEX IS DROPPED RATHER THAN KEPT BESIDE THEM. After
+-- this change nothing in the repository compares `lower(alias)` at all: the one
+-- predicate it existed for is now the folded one, and no caller in `src/` or
+-- `scripts/` reads that expression by equality or by range either. Keeping it
+-- would be dead DDL that every catalog load and every alias write pays to
+-- maintain.
+--
+-- WHY NO prisma/manual-migrations/ REFERENCE COPY IS ADDED FOR THIS ENTRY, AND
+-- THE ONE STATEMENT THAT GAINED A GUARD THERE. That copy mirrors
+-- 20260908000000_meal_planning only, for the one operator procedure its README
+-- documents: an operator who applies the copy by hand then runs
+-- `prisma migrate resolve --applied 20260908000000_meal_planning` followed by
+-- `prisma migrate deploy`, and that deploy applies this entry the ordinary way.
+-- 20260909000000_usda_cache_http_status already takes the same path.
+--
+-- The copy keeps its `idx_catalog_food_aliases_lower_alias` statement, because
+-- removing it would break the equivalence Agent Action Plan 0.1.4 C3 requires of
+-- that file: applied to a pre-feature schema it has to reproduce
+-- 20260908000000_meal_planning, and that migration creates the index. What the
+-- statement gained instead is a context guard - it skips when
+-- `idx_catalog_food_aliases_fold_alias` already exists - so the copy applied on
+-- top of a fully deployed ledger does not resurrect the index this entry has
+-- just dropped, and stays the no-op the first of 0.9.1's two orders requires.
+--
+-- `describe('migration ledgers')` in `src/__tests__/api/compat.test.ts` measures
+-- both halves of that, and the second is why the guard is not self-certifying:
+-- it compares one database brought up on 20260908000000_meal_planning alone
+-- against another brought up on the copy alone - before this entry runs on
+-- either, so this entry cannot supply the index to both sides and make the
+-- comparison vacuous - and it pins the `lower(alias)` expression and the
+-- `text_pattern_ops` class positively on both. The final convergence on the
+-- three indexes below and on no `lower(alias)` index is then compared index for
+-- index and dump for dump in both orders.
+
+-- CreateIndex
+CREATE INDEX "idx_catalog_food_aliases_fold_alias" ON "catalog_food_aliases"(translate("alias", 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') text_pattern_ops);
+
+-- CreateIndex
+CREATE INDEX "idx_catalog_foods_fold_display_name" ON "catalog_foods"(translate("display_name", 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') text_pattern_ops) WHERE "publication_status" = 'published';
+
+-- CreateIndex
+CREATE INDEX "idx_catalog_foods_fold_canonical_name" ON "catalog_foods"(translate("canonical_name", 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') text_pattern_ops) WHERE "publication_status" = 'published';
+
+-- DropIndex
+DROP INDEX IF EXISTS "idx_catalog_food_aliases_lower_alias";

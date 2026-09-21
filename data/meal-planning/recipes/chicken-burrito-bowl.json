@@ -1,0 +1,114 @@
+{
+  "slug": "chicken-burrito-bowl",
+  "name": "Chicken burrito bowl",
+  "description": "A hearty bowl of seared spiced chicken over brown rice and black beans, finished with salsa, avocado and a squeeze of lime.",
+  "iconKey": "bowl",
+  "instructions": [
+    "Season the chicken breast all over with the chili powder and cumin.",
+    "Warm the olive oil in a skillet over medium-high heat, then sear the chicken 6 to 7 minutes per side until cooked through.",
+    "Let the chicken rest for 5 minutes, then slice it into strips.",
+    "Warm the brown rice and black beans, then divide them between two bowls.",
+    "Top each bowl with the sliced chicken, salsa and avocado, then halve the lime and squeeze it over both."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 bowl",
+  "prepMinutes": 10,
+  "cookMinutes": 15,
+  "mealSlots": [
+    "lunch",
+    "dinner"
+  ],
+  "dietTags": [
+    "gluten_free"
+  ],
+  "allergenTags": [],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": [
+    "gluten_free",
+    "dairy_free"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:171077",
+      "quantity": 10,
+      "unit": "oz",
+      "gramWeight": 282.5,
+      "displayText": "10 oz",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169704",
+      "quantity": 1.5,
+      "unit": "cup",
+      "gramWeight": 303,
+      "displayText": "1½ cups",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:175238",
+      "quantity": 0.67,
+      "unit": "cup",
+      "gramWeight": 160.8,
+      "displayText": "⅔ cup",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171705",
+      "quantity": 0.5,
+      "unit": "each",
+      "gramWeight": 100.5,
+      "displayText": "½",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:174524",
+      "quantity": 8,
+      "unit": "tbsp",
+      "gramWeight": 144,
+      "displayText": "8 tbsp",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168155",
+      "quantity": 1,
+      "unit": "each",
+      "gramWeight": 67,
+      "displayText": "1",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 1,
+      "unit": "tbsp",
+      "gramWeight": 13.5,
+      "displayText": "1 tbsp",
+      "sortOrder": 6,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171319",
+      "quantity": 2,
+      "unit": "tsp",
+      "gramWeight": 5.4,
+      "displayText": "2 tsp",
+      "sortOrder": 7,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170923",
+      "quantity": 1,
+      "unit": "tsp",
+      "gramWeight": 2.1,
+      "displayText": "1 tsp",
+      "sortOrder": 8,
+      "isOptional": false
+    }
+  ]
+}

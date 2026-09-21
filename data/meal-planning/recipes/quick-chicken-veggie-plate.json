@@ -1,0 +1,107 @@
+{
+  "slug": "quick-chicken-veggie-plate",
+  "name": "Chicken and vegetable quick plate",
+  "description": "Cooked chicken breast warmed through garlicky zucchini and red bell pepper, served over white rice in fifteen minutes.",
+  "iconKey": "fork_knife",
+  "instructions": [
+    "Slice the zucchini into half-moons and chop the bell pepper.",
+    "Warm the olive oil in a wide skillet over medium-high heat, add the garlic and cook it for 30 seconds.",
+    "Add the zucchini and the bell pepper and cook for 5 minutes, until they are tender and lightly coloured.",
+    "Stir in the diced cooked chicken breast, the salt and the black pepper and heat through for 3 minutes.",
+    "Serve the chicken and vegetables over the warm white rice."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 plate",
+  "prepMinutes": 5,
+  "cookMinutes": 10,
+  "mealSlots": [
+    "lunch",
+    "dinner"
+  ],
+  "dietTags": [
+    "gluten_free"
+  ],
+  "allergenTags": [],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "dairy_free",
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:171477",
+      "quantity": 1.5,
+      "unit": "cup",
+      "gramWeight": 210.0,
+      "displayText": "1½ cups, diced",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169757",
+      "quantity": 1.75,
+      "unit": "cup",
+      "gramWeight": 276.5,
+      "displayText": "1¾ cups",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169291",
+      "quantity": 1,
+      "unit": "cup",
+      "gramWeight": 124.0,
+      "displayText": "1 cup, sliced",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170108",
+      "quantity": 0.75,
+      "unit": "cup",
+      "gramWeight": 111.75,
+      "displayText": "¾ cup",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 1,
+      "unit": "tbsp",
+      "gramWeight": 13.5,
+      "displayText": "1 tbsp",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169230",
+      "quantity": 2,
+      "unit": "clove",
+      "gramWeight": 6.0,
+      "displayText": "2 cloves",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170931",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 1.15,
+      "displayText": "½ tsp",
+      "sortOrder": 6,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 3.0,
+      "displayText": "½ tsp",
+      "sortOrder": 7,
+      "isOptional": false
+    }
+  ]
+}

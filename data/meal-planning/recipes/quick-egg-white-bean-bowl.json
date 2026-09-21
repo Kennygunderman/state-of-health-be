@@ -1,0 +1,110 @@
+{
+  "slug": "quick-egg-white-bean-bowl",
+  "name": "Egg white and black bean breakfast bowl",
+  "description": "Soft-set egg whites folded through black beans, rice and red bell pepper with salsa and spinach, in fifteen minutes.",
+  "iconKey": "bowl",
+  "instructions": [
+    "Chop the bell pepper, then drain and rinse the black beans.",
+    "Warm the olive oil in a skillet over medium heat, add the bell pepper and cook for 3 minutes.",
+    "Add the black beans and the warm white rice and heat through for 2 minutes, then season with the salt.",
+    "Push the mixture to one side of the pan, pour the egg whites into the clear half and stir them gently for 2 minutes, until they set.",
+    "Fold the spinach through until it wilts, divide between two bowls and spoon the salsa over the top."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 bowl",
+  "prepMinutes": 5,
+  "cookMinutes": 10,
+  "mealSlots": [
+    "breakfast"
+  ],
+  "dietTags": [
+    "gluten_free",
+    "pescatarian",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "eggs"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "dairy_free",
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:172183",
+      "quantity": 10,
+      "unit": "each",
+      "gramWeight": 330.0,
+      "displayText": "10",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:175238",
+      "quantity": 1,
+      "unit": "cup",
+      "gramWeight": 240.0,
+      "displayText": "1 cup",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169757",
+      "quantity": 0.25,
+      "unit": "cup",
+      "gramWeight": 39.5,
+      "displayText": "¼ cup",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170108",
+      "quantity": 0.5,
+      "unit": "cup",
+      "gramWeight": 74.5,
+      "displayText": "½ cup",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168462",
+      "quantity": 2,
+      "unit": "cup",
+      "gramWeight": 60.0,
+      "displayText": "2 cups",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 1.25,
+      "unit": "tbsp",
+      "gramWeight": 16.875,
+      "displayText": "1¼ tbsp",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:174524",
+      "quantity": 4,
+      "unit": "tbsp",
+      "gramWeight": 72.0,
+      "displayText": "4 tbsp",
+      "sortOrder": 6,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 3.0,
+      "displayText": "½ tsp",
+      "sortOrder": 7,
+      "isOptional": false
+    }
+  ]
+}

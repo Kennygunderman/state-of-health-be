@@ -1,0 +1,103 @@
+{
+  "slug": "lentil-tofu-power-bowl",
+  "name": "Lentil and tofu power bowl",
+  "description": "Cooked lentils and seared tofu piled over broccoli and spinach with a lemon and olive oil dressing — the protein-dense plant bowl the planner leans on.",
+  "iconKey": "bowl",
+  "instructions": [
+    "Press the tofu dry, cut it into cubes and sear it in half the olive oil over medium-high heat for 5 minutes, turning once, until golden on two sides.",
+    "Steam the broccoli for 4 minutes, until bright green and just tender.",
+    "Warm the lentils through in the same pan for 2 minutes, then fold in the spinach and let it wilt off the heat.",
+    "Whisk the squeezed lemon with the remaining olive oil and the salt.",
+    "Divide the lentils and spinach between two bowls, top with the tofu and broccoli, and spoon the dressing over."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 bowl",
+  "prepMinutes": 10,
+  "cookMinutes": 12,
+  "mealSlots": [
+    "lunch",
+    "dinner"
+  ],
+  "dietTags": [
+    "gluten_free",
+    "pescatarian",
+    "vegan",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "soy"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "dairy_free",
+    "vegan"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:172421",
+      "quantity": 2,
+      "unit": "cup",
+      "gramWeight": 396,
+      "displayText": "2 cups",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:172448",
+      "quantity": 375,
+      "unit": "g",
+      "gramWeight": 375,
+      "displayText": "375 g",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170379",
+      "quantity": 1.5,
+      "unit": "cup",
+      "gramWeight": 132,
+      "displayText": "1½ cups, chopped",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168462",
+      "quantity": 3,
+      "unit": "cup",
+      "gramWeight": 90,
+      "displayText": "3 cups",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 0.75,
+      "unit": "tbsp",
+      "gramWeight": 10,
+      "displayText": "¾ tbsp",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:167746",
+      "quantity": 0.25,
+      "unit": "each",
+      "gramWeight": 21,
+      "displayText": "¼ lemon, juiced",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 3,
+      "displayText": "½ tsp",
+      "sortOrder": 6,
+      "isOptional": false
+    }
+  ]
+}

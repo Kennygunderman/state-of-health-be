@@ -8,3 +8,8 @@ coverage
 *.log
 .github
 prisma/manual-migrations
+scripts
+data
+docs
+jest.config.ts
+tsconfig.*.json

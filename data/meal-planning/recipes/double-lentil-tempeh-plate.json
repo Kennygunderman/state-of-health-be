@@ -1,0 +1,119 @@
+{
+  "slug": "double-lentil-tempeh-plate",
+  "name": "Double lentil and tempeh plate",
+  "description": "A double portion of cooked lentils under browned tempeh with zucchini, tomato, garlic and torn basil — two large legume-built plates, with the olive oil kept to about a teaspoon each.",
+  "iconKey": "dome",
+  "instructions": [
+    "Cube the tempeh and brown it in the olive oil over medium-high heat for 4 minutes, turning once.",
+    "Add the garlic and the sliced zucchini and cook for 3 minutes, until the zucchini softens.",
+    "Stir in the cooked lentils, the chopped tomato, the salt and the black pepper, and warm through for 2 minutes.",
+    "Divide between two large plates and scatter the torn basil over both."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 large plate",
+  "prepMinutes": 5,
+  "cookMinutes": 9,
+  "mealSlots": [
+    "lunch",
+    "dinner"
+  ],
+  "dietTags": [
+    "pescatarian",
+    "vegan",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "soy"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": [
+    "high_protein",
+    "dairy_free",
+    "vegan",
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:172421",
+      "quantity": 3,
+      "unit": "cup",
+      "gramWeight": 594,
+      "displayText": "3 cups",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:174272",
+      "quantity": 374,
+      "unit": "g",
+      "gramWeight": 374,
+      "displayText": "374 g, cubed",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169291",
+      "quantity": 2.5,
+      "unit": "cup",
+      "gramWeight": 310,
+      "displayText": "2½ cups, sliced",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170457",
+      "quantity": 2,
+      "unit": "each",
+      "gramWeight": 246,
+      "displayText": "2 medium, chopped",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169230",
+      "quantity": 4,
+      "unit": "clove",
+      "gramWeight": 12,
+      "displayText": "4 cloves, minced",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:172232",
+      "quantity": 0.5,
+      "unit": "cup",
+      "gramWeight": 12,
+      "displayText": "½ cup, leaves",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 0.75,
+      "unit": "tbsp",
+      "gramWeight": 10,
+      "displayText": "¾ tbsp",
+      "sortOrder": 6,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 1,
+      "unit": "tsp",
+      "gramWeight": 6,
+      "displayText": "1 tsp",
+      "sortOrder": 7,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170931",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 1.2,
+      "displayText": "½ tsp",
+      "sortOrder": 8,
+      "isOptional": false
+    }
+  ]
+}

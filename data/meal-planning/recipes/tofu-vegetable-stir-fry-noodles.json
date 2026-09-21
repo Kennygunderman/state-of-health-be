@@ -1,0 +1,128 @@
+{
+  "slug": "tofu-vegetable-stir-fry-noodles",
+  "name": "Tofu and vegetable stir-fry noodles",
+  "description": "Seared tofu stir-fried with cabbage, carrot and mushrooms, tossed with noodles and a little sriracha — soy sauce is left out so the dish carries no wheat.",
+  "iconKey": "bowl_dash",
+  "instructions": [
+    "Cube the tofu, pat it dry and sear it in the canola oil over high heat for 5 minutes, turning once, until crisp at the edges.",
+    "Add the garlic, the mushrooms and the carrot and stir-fry for 3 minutes.",
+    "Add the cabbage and the salt and stir-fry for 2 minutes more, until the cabbage is just wilted.",
+    "Fold in the spinach, then the cooked pasta, tossing until everything is coated and hot.",
+    "Stir the sriracha through and divide between two bowls."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 bowl",
+  "prepMinutes": 10,
+  "cookMinutes": 12,
+  "mealSlots": [
+    "dinner"
+  ],
+  "dietTags": [
+    "pescatarian",
+    "vegan",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "soy",
+    "wheat"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 2,
+  "badges": [
+    "high_protein",
+    "dairy_free",
+    "vegan"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:172448",
+      "quantity": 500,
+      "unit": "g",
+      "gramWeight": 500,
+      "displayText": "500 g",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169737",
+      "quantity": 1,
+      "unit": "cup",
+      "gramWeight": 124,
+      "displayText": "1 cup, cooked",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169975",
+      "quantity": 2,
+      "unit": "cup",
+      "gramWeight": 178,
+      "displayText": "2 cups, shredded",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169251",
+      "quantity": 3,
+      "unit": "cup",
+      "gramWeight": 210,
+      "displayText": "3 cups, sliced",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170393",
+      "quantity": 2,
+      "unit": "each",
+      "gramWeight": 122,
+      "displayText": "2 carrots, sliced",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168462",
+      "quantity": 3,
+      "unit": "cup",
+      "gramWeight": 90,
+      "displayText": "3 cups",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:172336",
+      "quantity": 0.5,
+      "unit": "tbsp",
+      "gramWeight": 7,
+      "displayText": "½ tbsp",
+      "sortOrder": 6,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169230",
+      "quantity": 3,
+      "unit": "clove",
+      "gramWeight": 9,
+      "displayText": "3 cloves",
+      "sortOrder": 7,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171186",
+      "quantity": 2,
+      "unit": "tsp",
+      "gramWeight": 13,
+      "displayText": "2 tsp",
+      "sortOrder": 8,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 3,
+      "displayText": "½ tsp",
+      "sortOrder": 9,
+      "isOptional": false
+    }
+  ]
+}

@@ -1,5 +1,6 @@
 import { prisma } from '../prisma/client';
 import { CreateFoodPayload, FoodResponse } from '../types/nutrition';
+import { assertUserProvisioned } from './user.service';
 
 const FOOD_SOURCES = ['manual', 'label_scan', 'branded', 'seed'];
 
@@ -43,6 +44,15 @@ const mapFood = (food: FoodRow): FoodResponse => ({
 const seedStarterFoodsIfEmpty = async (userId: string): Promise<void> => {
     const existing = await prisma.foods.count({ where: { user_id: userId } });
     if (existing > 0) return;
+
+    // Asked only on the seeding path, after the count above has already
+    // established that this read is about to write: a library that holds rows
+    // returns on the line above and never pays for this query. An authenticated
+    // identity with no `users` row would otherwise reach `foods.user_id`'s
+    // foreign key, raise Prisma P2003 and turn a fetch into this route's 500,
+    // while `PUT /api/user/targets` answers `404 "User not found"` for the same
+    // caller. Guarding before `createMany` also keeps the refusal write-free.
+    await assertUserProvisioned(userId);
     await prisma.foods.createMany({
         data: STARTER_FOODS.map((food) => ({ ...food, user_id: userId, source: 'seed' })),
     });

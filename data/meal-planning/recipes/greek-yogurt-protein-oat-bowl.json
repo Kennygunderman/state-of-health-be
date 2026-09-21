@@ -1,0 +1,69 @@
+{
+  "slug": "greek-yogurt-protein-oat-bowl",
+  "name": "Greek yogurt protein oat bowl",
+  "description": "Thick plain Greek yogurt stirred with rolled oats, strawberries and sunflower seeds — a no-cook breakfast whose protein comes from the yogurt rather than from a pile of grain.",
+  "iconKey": "bowl",
+  "instructions": [
+    "Stir the rolled oats into the Greek yogurt and let it stand for 5 minutes so the oats soften.",
+    "Hull and halve the strawberries, then fold half of them through the yogurt.",
+    "Divide between two bowls, top with the remaining strawberries and scatter the sunflower seeds over each one."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 bowl",
+  "prepMinutes": 5,
+  "cookMinutes": 0,
+  "mealSlots": [
+    "breakfast"
+  ],
+  "dietTags": [
+    "pescatarian",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "milk"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 2,
+  "badges": [
+    "high_protein",
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:2705424",
+      "quantity": 2,
+      "unit": "cup",
+      "gramWeight": 490,
+      "displayText": "2 cups",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173904",
+      "quantity": 0.75,
+      "unit": "cup",
+      "gramWeight": 60.75,
+      "displayText": "¾ cup",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:167762",
+      "quantity": 1,
+      "unit": "cup",
+      "gramWeight": 152,
+      "displayText": "1 cup, halves",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170562",
+      "quantity": 3,
+      "unit": "tbsp",
+      "gramWeight": 26.25,
+      "displayText": "3 tbsp",
+      "sortOrder": 3,
+      "isOptional": false
+    }
+  ]
+}

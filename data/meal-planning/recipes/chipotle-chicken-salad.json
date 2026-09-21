@@ -1,0 +1,124 @@
+{
+  "slug": "chipotle-chicken-salad",
+  "name": "Chipotle chicken salad",
+  "description": "Seared chicken breast rubbed with chili powder and ground cumin, sliced over spinach with black beans, bell pepper, tomato and avocado, dressed with olive oil and lime.",
+  "iconKey": "salad",
+  "instructions": [
+    "Season the chicken breast all over with the chili powder, ground cumin and salt.",
+    "Sear the chicken in half the olive oil over medium-high heat, 6 to 7 minutes per side, then rest it and slice it thin.",
+    "Toss the spinach with the remaining olive oil and a squeeze of the lime.",
+    "Add the black beans, bell pepper, tomato and avocado, then fold everything together gently.",
+    "Top the salad with the sliced chicken and serve."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 bowl",
+  "prepMinutes": 12,
+  "cookMinutes": 18,
+  "mealSlots": ["lunch"],
+  "dietTags": ["gluten_free"],
+  "allergenTags": [],
+  "allergenStatus": "known",
+  "budgetTier": 2,
+  "badges": ["high_protein", "gluten_free", "dairy_free"],
+  "ingredients": [
+    {
+      "sourceKey": "usda:171077",
+      "quantity": 10,
+      "unit": "oz",
+      "gramWeight": 282.5,
+      "displayText": "10 oz",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168462",
+      "quantity": 6,
+      "unit": "cup",
+      "gramWeight": 180,
+      "displayText": "6 cups",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:175238",
+      "quantity": 0.5,
+      "unit": "cup",
+      "gramWeight": 120,
+      "displayText": "½ cup",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170108",
+      "quantity": 1,
+      "unit": "cup",
+      "gramWeight": 149,
+      "displayText": "1 cup",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170457",
+      "quantity": 1,
+      "unit": "each",
+      "gramWeight": 123,
+      "displayText": "1",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171705",
+      "quantity": 0.5,
+      "unit": "each",
+      "gramWeight": 100.5,
+      "displayText": "½",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 1.5,
+      "unit": "tbsp",
+      "gramWeight": 20.25,
+      "displayText": "1½ tbsp",
+      "sortOrder": 6,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168155",
+      "quantity": 0.5,
+      "unit": "each",
+      "gramWeight": 33.5,
+      "displayText": "½",
+      "sortOrder": 7,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171319",
+      "quantity": 1.5,
+      "unit": "tsp",
+      "gramWeight": 4.05,
+      "displayText": "1½ tsp",
+      "sortOrder": 8,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170923",
+      "quantity": 1,
+      "unit": "tsp",
+      "gramWeight": 2.1,
+      "displayText": "1 tsp",
+      "sortOrder": 9,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 3,
+      "displayText": "½ tsp",
+      "sortOrder": 10,
+      "isOptional": false
+    }
+  ]
+}

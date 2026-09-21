@@ -1,0 +1,106 @@
+{
+  "slug": "pork-tenderloin-rice-plate",
+  "name": "Pork tenderloin and brown rice plate",
+  "description": "Pork tenderloin medallions seared with garlic, carrot and broccoli and served over brown rice.",
+  "iconKey": "fork_knife",
+  "instructions": [
+    "Trim the pork tenderloin, cut it into medallions and season them with the salt and the black pepper.",
+    "Slice the carrot into coins and cut the broccoli into small florets.",
+    "Warm the olive oil in a skillet over medium-high heat and sear the pork for 3 minutes per side, until browned.",
+    "Add the garlic, the carrot and the broccoli to the pan, cover it and cook for 8 minutes, until the vegetables are tender and the pork is cooked through.",
+    "Serve the medallions and vegetables over the warm brown rice."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 plate",
+  "prepMinutes": 10,
+  "cookMinutes": 20,
+  "mealSlots": [
+    "lunch",
+    "dinner"
+  ],
+  "dietTags": [
+    "gluten_free"
+  ],
+  "allergenTags": [],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "dairy_free"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:168249",
+      "quantity": 11,
+      "unit": "oz",
+      "gramWeight": 310.75,
+      "displayText": "11 oz",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169704",
+      "quantity": 1.5,
+      "unit": "cup",
+      "gramWeight": 303.0,
+      "displayText": "1½ cups",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170379",
+      "quantity": 1,
+      "unit": "cup",
+      "gramWeight": 88.0,
+      "displayText": "1 cup",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170393",
+      "quantity": 2,
+      "unit": "each",
+      "gramWeight": 122.0,
+      "displayText": "2",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 1.25,
+      "unit": "tbsp",
+      "gramWeight": 16.875,
+      "displayText": "1¼ tbsp",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169230",
+      "quantity": 3,
+      "unit": "clove",
+      "gramWeight": 9.0,
+      "displayText": "3 cloves",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170931",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 1.15,
+      "displayText": "½ tsp",
+      "sortOrder": 6,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 3.0,
+      "displayText": "½ tsp",
+      "sortOrder": 7,
+      "isOptional": false
+    }
+  ]
+}

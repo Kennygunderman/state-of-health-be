@@ -1,0 +1,120 @@
+{
+  "slug": "mushroom-lentil-pasta",
+  "name": "Mushroom and lentil pasta",
+  "description": "A deep mushroom and lentil sauce with crumbled tofu standing in for ricotta, tossed through pasta with tomato, garlic and basil.",
+  "iconKey": "fork_knife",
+  "instructions": [
+    "Heat the olive oil in a large pan over medium-high heat and cook the mushrooms for 6 minutes, until browned and dry.",
+    "Add the garlic and the chopped tomato and cook for 3 minutes, until the tomato collapses.",
+    "Crumble in the tofu, add the lentils and the salt, and simmer for 4 minutes, until the sauce holds together.",
+    "Toss the cooked pasta through the sauce until every strand is coated.",
+    "Divide between two plates and scatter the torn basil over."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 plate",
+  "prepMinutes": 10,
+  "cookMinutes": 18,
+  "mealSlots": [
+    "lunch",
+    "dinner"
+  ],
+  "dietTags": [
+    "pescatarian",
+    "vegan",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "soy",
+    "wheat"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 2,
+  "badges": [
+    "high_protein",
+    "dairy_free",
+    "vegan"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:169737",
+      "quantity": 1,
+      "unit": "cup",
+      "gramWeight": 124,
+      "displayText": "1 cup, cooked",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169251",
+      "quantity": 6.5,
+      "unit": "cup",
+      "gramWeight": 455,
+      "displayText": "6½ cups, sliced",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:172421",
+      "quantity": 0.75,
+      "unit": "cup",
+      "gramWeight": 149,
+      "displayText": "¾ cup",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:172448",
+      "quantity": 425,
+      "unit": "g",
+      "gramWeight": 425,
+      "displayText": "425 g",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170457",
+      "quantity": 1.25,
+      "unit": "each",
+      "gramWeight": 154,
+      "displayText": "1¼ tomatoes, chopped",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 1,
+      "unit": "tbsp",
+      "gramWeight": 13.5,
+      "displayText": "1 tbsp",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169230",
+      "quantity": 3,
+      "unit": "clove",
+      "gramWeight": 9,
+      "displayText": "3 cloves",
+      "sortOrder": 6,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:172232",
+      "quantity": 0.33,
+      "unit": "cup",
+      "gramWeight": 8,
+      "displayText": "⅓ cup, leaves",
+      "sortOrder": 7,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 3,
+      "displayText": "½ tsp",
+      "sortOrder": 8,
+      "isOptional": false
+    }
+  ]
+}

@@ -1,0 +1,97 @@
+{
+  "slug": "hearty-turkey-rice-breakfast-bowl",
+  "name": "Hearty turkey and rice breakfast bowl",
+  "description": "Thin strips of turkey breast seared with red bell pepper and spinach, piled over a generous bowl of warm white rice in under fifteen minutes.",
+  "iconKey": "bowl",
+  "instructions": [
+    "Slice the turkey breast into thin strips and chop the bell pepper.",
+    "Warm the olive oil in a large skillet over medium-high heat, add the turkey breast in a single layer and cook it for 5 minutes, turning once, until it is cooked through.",
+    "Add the bell pepper and cook for 2 minutes.",
+    "Stir in the spinach with the salt and the black pepper and cook for 1 minute more, until the spinach has wilted.",
+    "Pile the warm white rice into one large bowl and spoon the turkey and vegetables over it."
+  ],
+  "yieldServings": 1,
+  "servingDescription": "1 large bowl",
+  "prepMinutes": 5,
+  "cookMinutes": 9,
+  "mealSlots": [
+    "breakfast"
+  ],
+  "dietTags": [
+    "gluten_free"
+  ],
+  "allergenTags": [],
+  "allergenStatus": "known",
+  "budgetTier": 2,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "dairy_free",
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:171098",
+      "quantity": 9,
+      "unit": "oz",
+      "gramWeight": 254.25,
+      "displayText": "9 oz",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169757",
+      "quantity": 1.75,
+      "unit": "cup",
+      "gramWeight": 276.5,
+      "displayText": "1¾ cups",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168462",
+      "quantity": 2,
+      "unit": "cup",
+      "gramWeight": 60.0,
+      "displayText": "2 cups",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170108",
+      "quantity": 0.5,
+      "unit": "cup",
+      "gramWeight": 74.5,
+      "displayText": "½ cup, chopped",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 1.5,
+      "unit": "tbsp",
+      "gramWeight": 20.25,
+      "displayText": "1½ tbsp",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170931",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 1.15,
+      "displayText": "½ tsp",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 3.0,
+      "displayText": "½ tsp",
+      "sortOrder": 6,
+      "isOptional": false
+    }
+  ]
+}

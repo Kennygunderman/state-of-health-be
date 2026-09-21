@@ -1,0 +1,118 @@
+{
+  "slug": "big-tuna-rice-power-plate",
+  "name": "Big tuna and rice power plate",
+  "description": "A large assembly plate: drained canned tuna flaked over warm white rice, with broccoli and red bell pepper softened in the microwave, spinach wilted in their heat, and olive oil and lemon poured over.",
+  "iconKey": "fork_knife",
+  "instructions": [
+    "Cover the broccoli and microwave it for 3 minutes, until bright green, then stir in the bell pepper and the spinach and leave them covered so the spinach wilts.",
+    "Warm the cooked white rice through and divide it between two plates.",
+    "Drain the tuna, flake it over the rice and pile the broccoli, the bell pepper and the spinach alongside.",
+    "Squeeze the lemon over both plates, pour the olive oil over and season with the salt and the black pepper."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 plate",
+  "prepMinutes": 8,
+  "cookMinutes": 4,
+  "mealSlots": [
+    "lunch",
+    "dinner"
+  ],
+  "dietTags": [
+    "gluten_free",
+    "pescatarian"
+  ],
+  "allergenTags": [
+    "fish"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "dairy_free",
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:171986",
+      "quantity": 15,
+      "unit": "oz",
+      "gramWeight": 425.1,
+      "displayText": "15 oz, drained",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169757",
+      "quantity": 3,
+      "unit": "cup",
+      "gramWeight": 474,
+      "displayText": "3 cups",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170379",
+      "quantity": 2.5,
+      "unit": "cup",
+      "gramWeight": 220,
+      "displayText": "2½ cups, chopped",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170108",
+      "quantity": 1.5,
+      "unit": "cup",
+      "gramWeight": 223.5,
+      "displayText": "1½ cups, chopped",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168462",
+      "quantity": 2,
+      "unit": "cup",
+      "gramWeight": 60,
+      "displayText": "2 cups",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 3.5,
+      "unit": "tbsp",
+      "gramWeight": 47.25,
+      "displayText": "3½ tbsp",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:167746",
+      "quantity": 0.5,
+      "unit": "each",
+      "gramWeight": 42,
+      "displayText": "½",
+      "sortOrder": 6,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 1,
+      "unit": "tsp",
+      "gramWeight": 6,
+      "displayText": "1 tsp",
+      "sortOrder": 7,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170931",
+      "quantity": 1,
+      "unit": "tsp",
+      "gramWeight": 2.3,
+      "displayText": "1 tsp",
+      "sortOrder": 8,
+      "isOptional": false
+    }
+  ]
+}

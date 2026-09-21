@@ -1,0 +1,102 @@
+{
+  "slug": "savory-lentil-breakfast-bowl",
+  "name": "Savoury lentil breakfast bowl",
+  "description": "Warm cooked lentils folded through garlicky tofu, mushrooms and wilted spinach — a savoury breakfast bowl built for protein rather than sugar.",
+  "iconKey": "bowl",
+  "instructions": [
+    "Warm the olive oil in a wide pan over medium heat and cook the garlic for 30 seconds, until fragrant.",
+    "Crumble in the tofu and cook for 4 minutes without stirring, so one side browns.",
+    "Add the mushrooms and the salt and cook for 4 minutes, until the mushrooms are golden and their liquid has gone.",
+    "Stir in the lentils and heat through for 2 minutes, then fold in the spinach and cook just until it wilts.",
+    "Spoon into two bowls and serve warm."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 bowl",
+  "prepMinutes": 8,
+  "cookMinutes": 12,
+  "mealSlots": [
+    "breakfast"
+  ],
+  "dietTags": [
+    "gluten_free",
+    "pescatarian",
+    "vegan",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "soy"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 2,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "dairy_free",
+    "vegan"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:172421",
+      "quantity": 1.5,
+      "unit": "cup",
+      "gramWeight": 297,
+      "displayText": "1½ cups",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:172448",
+      "quantity": 300,
+      "unit": "g",
+      "gramWeight": 300,
+      "displayText": "300 g",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169251",
+      "quantity": 1.5,
+      "unit": "cup",
+      "gramWeight": 105,
+      "displayText": "1½ cups, sliced",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168462",
+      "quantity": 3,
+      "unit": "cup",
+      "gramWeight": 90,
+      "displayText": "3 cups",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 0.5,
+      "unit": "tbsp",
+      "gramWeight": 6.75,
+      "displayText": "½ tbsp",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169230",
+      "quantity": 2,
+      "unit": "clove",
+      "gramWeight": 6,
+      "displayText": "2 cloves",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 3,
+      "displayText": "½ tsp",
+      "sortOrder": 6,
+      "isOptional": false
+    }
+  ]
+}

@@ -1,0 +1,109 @@
+{
+  "slug": "hearty-cod-potato-plate",
+  "name": "Hearty cod and potato plate",
+  "description": "Plain seared cod fillet on a bed of russet potato steamed in the microwave and crushed with olive oil, with broccoli browned in the fish pan and spinach folded in at the end.",
+  "iconKey": "fork_knife",
+  "instructions": [
+    "Dice the potato small, cover it and microwave for 8 minutes, until tender, then crush it roughly with half the olive oil and the salt.",
+    "Meanwhile season the cod fillet with the black pepper and sear it in the rest of the olive oil over medium-high heat, 3 minutes a side, until it flakes.",
+    "Add the broccoli to the pan for the last 2 minutes, then fold in the spinach until it wilts.",
+    "Divide the crushed potato between two plates, lay the cod and the broccoli on top and squeeze the lemon over."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 plate",
+  "prepMinutes": 4,
+  "cookMinutes": 10,
+  "mealSlots": [
+    "lunch",
+    "dinner"
+  ],
+  "dietTags": [
+    "gluten_free",
+    "pescatarian"
+  ],
+  "allergenTags": [
+    "fish"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 2,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "dairy_free",
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:171955",
+      "quantity": 20,
+      "unit": "oz",
+      "gramWeight": 566.8,
+      "displayText": "20 oz",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170027",
+      "quantity": 3.75,
+      "unit": "each",
+      "gramWeight": 798.75,
+      "displayText": "3¾ medium, diced",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170379",
+      "quantity": 3,
+      "unit": "cup",
+      "gramWeight": 264,
+      "displayText": "3 cups, chopped",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168462",
+      "quantity": 5,
+      "unit": "cup",
+      "gramWeight": 150,
+      "displayText": "5 cups",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 3.5,
+      "unit": "tbsp",
+      "gramWeight": 47.25,
+      "displayText": "3½ tbsp",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:167746",
+      "quantity": 0.5,
+      "unit": "each",
+      "gramWeight": 42,
+      "displayText": "½",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 1,
+      "unit": "tsp",
+      "gramWeight": 6,
+      "displayText": "1 tsp",
+      "sortOrder": 6,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170931",
+      "quantity": 1,
+      "unit": "tsp",
+      "gramWeight": 2.3,
+      "displayText": "1 tsp",
+      "sortOrder": 7,
+      "isOptional": false
+    }
+  ]
+}

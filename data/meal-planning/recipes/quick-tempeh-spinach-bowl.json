@@ -1,0 +1,101 @@
+{
+  "slug": "quick-tempeh-spinach-bowl",
+  "name": "Tempeh and spinach bowl",
+  "description": "Tempeh slabs seared with garlic over cooked lentils, finished with spinach wilted off the heat.",
+  "iconKey": "bowl",
+  "instructions": [
+    "Cut the tempeh into thin slabs and slice the garlic.",
+    "Warm the olive oil in a skillet over medium-high heat and sear the tempeh for 4 minutes per side, until browned.",
+    "Add the garlic for 30 seconds, then stir in the cooked lentils, the sriracha hot sauce and the salt and heat through.",
+    "Fold the spinach through the pan off the heat until it wilts, then divide it between two bowls."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 bowl",
+  "prepMinutes": 5,
+  "cookMinutes": 10,
+  "mealSlots": [
+    "lunch",
+    "dinner"
+  ],
+  "dietTags": [
+    "pescatarian",
+    "vegan",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "soy"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": [
+    "high_protein",
+    "dairy_free",
+    "vegan",
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:174272",
+      "quantity": 1,
+      "unit": "cup",
+      "gramWeight": 166.0,
+      "displayText": "1 cup",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:172421",
+      "quantity": 1.5,
+      "unit": "cup",
+      "gramWeight": 297.0,
+      "displayText": "1½ cups",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168462",
+      "quantity": 2,
+      "unit": "cup",
+      "gramWeight": 60.0,
+      "displayText": "2 cups",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 1,
+      "unit": "tsp",
+      "gramWeight": 4.5,
+      "displayText": "1 tsp",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169230",
+      "quantity": 3,
+      "unit": "clove",
+      "gramWeight": 9.0,
+      "displayText": "3 cloves",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171186",
+      "quantity": 2,
+      "unit": "tsp",
+      "gramWeight": 13.0,
+      "displayText": "2 tsp",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 3.0,
+      "displayText": "½ tsp",
+      "sortOrder": 6,
+      "isOptional": false
+    }
+  ]
+}

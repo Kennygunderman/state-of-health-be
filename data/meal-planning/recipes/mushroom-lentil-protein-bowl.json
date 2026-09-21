@@ -1,0 +1,93 @@
+{
+  "slug": "mushroom-lentil-protein-bowl",
+  "name": "Mushroom and lentil protein bowl",
+  "description": "A soy-free plant protein bowl for lunch or dinner: mushrooms seared hard in dry pans, warm cooked lentils and a large amount of wilted spinach, finished with sunflower seeds and torn basil.",
+  "iconKey": "bowl",
+  "instructions": [
+    "Set two wide non-stick pans over high heat, divide the mushrooms between them in a single layer and leave them undisturbed for 3 minutes so they brown rather than steam.",
+    "Stir once, add the salt, and cook for 3 minutes more until the pans are dry again.",
+    "Divide the lentils between the pans and warm them through for 2 minutes.",
+    "Fold in the spinach a large handful at a time and cook for 2 minutes, just until it collapses.",
+    "Divide between two bowls, then scatter the sunflower seeds and the torn basil over the top."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 bowl",
+  "prepMinutes": 5,
+  "cookMinutes": 10,
+  "mealSlots": [
+    "lunch",
+    "dinner"
+  ],
+  "dietTags": [
+    "gluten_free",
+    "pescatarian",
+    "vegan",
+    "vegetarian"
+  ],
+  "allergenTags": [],
+  "allergenStatus": "known",
+  "budgetTier": 2,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "dairy_free",
+    "vegan",
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:169251",
+      "quantity": 11.5,
+      "unit": "cup",
+      "gramWeight": 805,
+      "displayText": "11½ cups, sliced",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168462",
+      "quantity": 10.5,
+      "unit": "cup",
+      "gramWeight": 315,
+      "displayText": "10½ cups",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:172421",
+      "quantity": 270,
+      "unit": "g",
+      "gramWeight": 270,
+      "displayText": "270 g, warm",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170562",
+      "quantity": 65,
+      "unit": "g",
+      "gramWeight": 65,
+      "displayText": "65 g",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:172232",
+      "quantity": 1,
+      "unit": "cup",
+      "gramWeight": 24,
+      "displayText": "1 cup, leaves",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 1,
+      "unit": "tsp",
+      "gramWeight": 6,
+      "displayText": "1 tsp",
+      "sortOrder": 5,
+      "isOptional": false
+    }
+  ]
+}

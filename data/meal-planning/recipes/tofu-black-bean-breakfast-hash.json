@@ -1,0 +1,120 @@
+{
+  "slug": "tofu-black-bean-breakfast-hash",
+  "name": "Tofu and black bean breakfast hash",
+  "description": "Crumbled firm tofu browned with diced potato, mushrooms and peppers, finished with black beans and chili powder for a savoury high-protein start.",
+  "iconKey": "bowl_dash",
+  "instructions": [
+    "Dice the potato small and cook it in the olive oil in a wide nonstick pan over medium-high heat until the edges brown, about 8 minutes.",
+    "Add the onion, bell pepper and mushrooms and cook for 4 minutes, until they soften and release their liquid.",
+    "Crumble in the tofu, scatter over the chili powder and salt, and cook for 3 minutes, stirring once, so the tofu takes on colour.",
+    "Stir through the black beans and cook for 2 minutes more, until heated through.",
+    "Divide between two warm plates and serve straight away."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 plate",
+  "prepMinutes": 10,
+  "cookMinutes": 15,
+  "mealSlots": [
+    "breakfast"
+  ],
+  "dietTags": [
+    "gluten_free",
+    "pescatarian",
+    "vegan",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "soy"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 2,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "dairy_free",
+    "vegan"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:172448",
+      "quantity": 400,
+      "unit": "g",
+      "gramWeight": 400,
+      "displayText": "400 g",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:175238",
+      "quantity": 0.5,
+      "unit": "cup",
+      "gramWeight": 120,
+      "displayText": "½ cup, drained",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169251",
+      "quantity": 3.5,
+      "unit": "cup",
+      "gramWeight": 245,
+      "displayText": "3½ cups, sliced",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170027",
+      "quantity": 1,
+      "unit": "each",
+      "gramWeight": 120,
+      "displayText": "1 small potato",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170108",
+      "quantity": 0.75,
+      "unit": "cup",
+      "gramWeight": 112,
+      "displayText": "¾ cup, chopped",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170000",
+      "quantity": 0.5,
+      "unit": "cup",
+      "gramWeight": 80,
+      "displayText": "½ cup, chopped",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 0.5,
+      "unit": "tbsp",
+      "gramWeight": 6.75,
+      "displayText": "½ tbsp",
+      "sortOrder": 6,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171319",
+      "quantity": 1,
+      "unit": "tsp",
+      "gramWeight": 2.7,
+      "displayText": "1 tsp",
+      "sortOrder": 7,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 3,
+      "displayText": "½ tsp",
+      "sortOrder": 8,
+      "isOptional": false
+    }
+  ]
+}

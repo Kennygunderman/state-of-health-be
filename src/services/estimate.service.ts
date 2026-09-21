@@ -1,11 +1,68 @@
 import { EstimateItem, EstimateResponse, LabelScanResponse } from '../types/nutrition';
-import { GenericFoodCandidate, searchGenericFoods } from './usda.service';
-
-const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
-const REQUEST_TIMEOUT_MS = 30_000;
+import { GenericFoodCandidate, USDA_REQUEST_CALL_BUDGET_MS, searchGenericFoods } from './usda.service';
+import {
+    MessageContent,
+    OPENROUTER_REQUEST_TIMEOUT_MS,
+    OpenRouterError,
+    callOpenRouter,
+    getOpenRouterConfig,
+} from './openrouter.service';
 
 // Access control (kill switch, daily quota) lives in entitlement.service —
 // controllers call assertAndConsumeAiCall before invoking this service.
+
+// ---------------------------------------------------------------------------
+// The request's vendor budget.
+//
+// One estimate is up to three vendor steps — the model call, the USDA
+// candidate searches, and the grounding judge call — and each of them used to
+// carry its own deadline. Separate deadlines add up: a request could spend 30 s
+// on the estimate, then wait on USDA, then spend another 30 s on the judge,
+// while the mobile client abandoned it at 25 s and the user retried, paying for
+// a second estimate. Bounding one call is therefore not enough; what has to be
+// bounded is the request.
+//
+// So the budget below is started once per estimate and every vendor step draws
+// from the remainder: two model calls inside one budget cannot outlast one.
+// The size is the vendor boundary's own per-call ceiling, which is already
+// derived from the client's 25 s deadline (see
+// OPENROUTER_REQUEST_TIMEOUT_MS) — a single call may legitimately use the
+// whole request, and nothing may use more.
+// ---------------------------------------------------------------------------
+
+const VENDOR_BUDGET_MS = OPENROUTER_REQUEST_TIMEOUT_MS;
+
+/**
+ * The least the judge call is worth attempting with.
+ *
+ * Below this the classification would abort mid-flight, which costs a paid call
+ * and returns the ungrounded estimate anyway.
+ */
+const JUDGE_MIN_BUDGET_MS = 1_500;
+
+/**
+ * What grounding needs before it is worth starting: the USDA boundary's own
+ * worst case for one call (its attempts and backoff are bounded by that number,
+ * and the searches run in parallel, so it is the wall time of the whole
+ * candidate lookup) plus a judge call.
+ *
+ * Imported rather than restated, so the reserve cannot drift from the deadline
+ * the USDA boundary actually enforces.
+ */
+const GROUNDING_MIN_BUDGET_MS = USDA_REQUEST_CALL_BUDGET_MS + JUDGE_MIN_BUDGET_MS;
+
+interface VendorBudget {
+    /** Milliseconds left of the request's budget; never negative. */
+    remainingMs(): number;
+}
+
+const startVendorBudget = (totalMs: number = VENDOR_BUDGET_MS): VendorBudget => {
+    const startedAt = Date.now();
+
+    return {
+        remainingMs: (): number => Math.max(0, totalMs - (Date.now() - startedAt)),
+    };
+};
 
 export class EstimateFailedError extends Error {
     constructor(message: string) {
@@ -99,8 +156,6 @@ const LABEL_SCAN_JSON_SCHEMA = {
     },
 };
 
-type MessageContent = string | Array<{ type: string; text?: string; image_url?: { url: string } }>;
-
 const buildUserContent = (text?: string, imageBase64?: string): MessageContent => {
     if (!imageBase64) return text ?? '';
     const parts: Array<{ type: string; text?: string; image_url?: { url: string } }> = [];
@@ -109,72 +164,47 @@ const buildUserContent = (text?: string, imageBase64?: string): MessageContent =
     return parts;
 };
 
-// Not every routed model honors json_schema strictly — strip code fences and
-// parse the first {...} block as a fallback.
-const parseModelJson = (raw: string): any => {
-    try {
-        return JSON.parse(raw);
-    } catch {
-        const cleaned = raw.replace(/```(?:json)?/g, '');
-        const start = cleaned.indexOf('{');
-        const end = cleaned.lastIndexOf('}');
-        if (start === -1 || end <= start) {
-            throw new EstimateFailedError('Model returned unparseable output');
-        }
-        return JSON.parse(cleaned.slice(start, end + 1));
-    }
-};
-
-const callOpenRouter = async (
+// The OpenRouter transport lives in openrouter.service, which raises
+// OpenRouterError for every failure mode. The controller only maps
+// EstimateFailedError (→ 502), so every model call this service makes goes
+// through here: one translation point, not one per call site. The vendor error
+// already carries the exact message this endpoint has always returned —
+// including the HTTP status and the truncated response body — so it is passed
+// through verbatim rather than rebuilt per kind. Anything that is not a vendor
+// failure propagates untouched.
+//
+// The model output is returned as `unknown`: the vendor boundary validates the
+// transport and the JSON syntax, never the shape, so each call site below
+// narrows the fields it reads instead of trusting model-controlled data.
+//
+// `resolveModel` is a thunk and not a resolved string because reading the
+// vendor configuration can itself fail: an argument expression is evaluated
+// BEFORE this function is entered, so a call site that passed
+// `getOpenRouterConfig().judgeModel` directly would let an unconfigured key
+// raise a raw OpenRouterError outside the try below — past the one translation
+// point and out of this service untranslated. Invoked inside the try, that
+// failure becomes the same EstimateFailedError as every other vendor failure.
+// `fetchImpl` is the transport seam callOpenRouter already declares;
+// `undefined` leaves it using the global `fetch`.
+//
+// `timeoutMs` is what is left of the request's budget. Passing it — rather than
+// letting each call take the vendor default — is what makes the budget a
+// property of the request instead of a property of one call.
+const callModel = async (
     systemPrompt: string,
     userContent: MessageContent,
     jsonSchema: object,
-    modelOverride?: string,
-): Promise<any> => {
-    const apiKey = process.env.OPENROUTER_API_KEY;
-    if (!apiKey) {
-        throw new EstimateFailedError('OPENROUTER_API_KEY is not configured');
-    }
-    const model = modelOverride || process.env.OPENROUTER_MODEL || 'google/gemini-2.5-flash';
-
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    resolveModel?: () => string,
+    fetchImpl?: typeof fetch,
+    timeoutMs?: number,
+): Promise<unknown> => {
     try {
-        const response = await fetch(OPENROUTER_URL, {
-            method: 'POST',
-            signal: controller.signal,
-            headers: {
-                Authorization: `Bearer ${apiKey}`,
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-                model,
-                temperature: 0,
-                messages: [
-                    { role: 'system', content: systemPrompt },
-                    { role: 'user', content: userContent },
-                ],
-                response_format: { type: 'json_schema', json_schema: jsonSchema },
-            }),
-        });
-        if (!response.ok) {
-            const body = await response.text().catch(() => '');
-            throw new EstimateFailedError(`OpenRouter returned ${response.status}: ${body.slice(0, 300)}`);
-        }
-        const data = (await response.json()) as any;
-        const content = data?.choices?.[0]?.message?.content;
-        if (typeof content !== 'string' || !content.trim()) {
-            throw new EstimateFailedError('OpenRouter returned an empty completion');
-        }
-        return parseModelJson(content);
+        return await callOpenRouter(systemPrompt, userContent, jsonSchema, resolveModel?.(), fetchImpl, timeoutMs);
     } catch (error) {
-        if (error instanceof EstimateFailedError) throw error;
-        if ((error as Error).name === 'AbortError') {
-            throw new EstimateFailedError('OpenRouter request timed out');
+        if (error instanceof OpenRouterError) {
+            throw new EstimateFailedError(error.message);
         }
-        throw new EstimateFailedError(`OpenRouter request failed: ${(error as Error).message}`);
-    } finally {
-        clearTimeout(timeout);
+        throw error;
     }
 };
 
@@ -182,6 +212,26 @@ const toInt = (value: unknown): number => {
     const parsed = Math.round(Number(value));
     return Number.isFinite(parsed) ? Math.max(parsed, 0) : 0;
 };
+
+// Readers for model-controlled values. They reproduce exactly what the previous
+// optional-chained reads did: a non-record (including an array or null) has no
+// readable fields, a blank or non-string text field is absent, and an
+// unrecognised confidence falls back to 'medium' — a model is free to return
+// any of these and the endpoint's response must not change shape because of it.
+const asRecord = (value: unknown): Record<string, unknown> | undefined =>
+    typeof value === 'object' && value !== null && !Array.isArray(value)
+        ? (value as Record<string, unknown>)
+        : undefined;
+
+const readNonBlankString = (value: unknown): string | undefined =>
+    typeof value === 'string' && value.trim() ? value.trim() : undefined;
+
+const CONFIDENCE_LEVELS: readonly EstimateResponse['confidence'][] = ['low', 'medium', 'high'];
+
+const readConfidence = (value: unknown): EstimateResponse['confidence'] =>
+    typeof value === 'string' && (CONFIDENCE_LEVELS as readonly string[]).includes(value)
+        ? (value as EstimateResponse['confidence'])
+        : 'medium';
 
 const JUDGE_JSON_SCHEMA = {
     name: 'food_matches',
@@ -200,16 +250,41 @@ interface EstimateItemWithGrams extends EstimateItem {
     grams: number;
 }
 
+/**
+ * The collaborators an estimate may be given instead of the production ones.
+ *
+ * Declared for the same reason `callOpenRouter` declares its own `fetchImpl`
+ * parameter: the seam is part of the signature, so a unit test reaches the
+ * grounding path — including the judge round trip — without a database or a
+ * network, and without this module knowing it is under test. Both fields are
+ * optional and default to the real collaborator, so the request path
+ * (`nutrition.controller`) passes nothing and behaves exactly as before.
+ *
+ * `searchGenericFoods` is here rather than stubbed at the transport level
+ * because it reaches `usdaGet`, which reads the `usda_api_cache` table through
+ * Prisma before it ever looks at the USDA API key — a database connection no
+ * unit test may open (backend-architecture §11).
+ */
+export interface EstimateDependencies {
+    searchGenericFoods?: typeof searchGenericFoods;
+    fetchImpl?: typeof fetch;
+}
+
 // Ground LLM items in USDA generic-food data: search candidates per item, let
 // a judge call pick genuine matches, then scale per-100g values by the LLM's
 // gram estimate. Any failure falls back to the raw LLM values — grounding can
 // only replace numbers, never lose items or fail the estimate.
-const groundItemsInUsda = async (items: EstimateItemWithGrams[]): Promise<EstimateItem[]> => {
+const groundItemsInUsda = async (
+    items: EstimateItemWithGrams[],
+    deps: EstimateDependencies,
+    budget: VendorBudget,
+): Promise<EstimateItem[]> => {
+    const searchCandidates = deps.searchGenericFoods ?? searchGenericFoods;
     const candidateLists = await Promise.all(
         items.map(async (item) => {
             if (item.grams <= 0) return [];
             try {
-                return await searchGenericFoods(item.name);
+                return await searchCandidates(item.name);
             } catch (error) {
                 console.warn(`USDA candidate search failed for "${item.name}":`, (error as Error).message);
                 return [];
@@ -217,6 +292,15 @@ const groundItemsInUsda = async (items: EstimateItemWithGrams[]): Promise<Estima
         }),
     );
     if (candidateLists.every((candidates) => candidates.length === 0)) return items;
+
+    // The searches have spent part of the budget. Starting a judge call with
+    // less than it needs would pay for a classification that aborts before it
+    // answers, and the outcome either way is the model's own numbers.
+    const judgeBudgetMs = budget.remainingMs();
+    if (judgeBudgetMs < JUDGE_MIN_BUDGET_MS) {
+        console.warn(`Grounding judge skipped: ${judgeBudgetMs}ms of the request budget left`);
+        return items;
+    }
 
     const judgeInput = items.map((item, index) => ({
         item: `${item.name} (${item.quantityText}, ~${item.grams}g)`,
@@ -229,14 +313,22 @@ const groundItemsInUsda = async (items: EstimateItemWithGrams[]): Promise<Estima
     }));
     // The judge is a classification task — it gets its own model tuned for
     // consistency (gemini-flash via OpenRouter routes across providers and
-    // flip-flops on borderline matches even at temperature 0).
-    const judged = await callOpenRouter(
+    // flip-flops on borderline matches even at temperature 0). Which model that
+    // is belongs to the vendor boundary and is asked for here rather than
+    // decided here: `getOpenRouterConfig().judgeModel` resolves
+    // ESTIMATE_JUDGE_MODEL once at module load for every consumer of it
+    // (backend-architecture §9), so this service never branches on the
+    // environment.
+    const judged = await callModel(
         JUDGE_SYSTEM_PROMPT,
         JSON.stringify(judgeInput, null, 2),
         JUDGE_JSON_SCHEMA,
-        process.env.ESTIMATE_JUDGE_MODEL || 'openai/gpt-4o-mini',
+        () => getOpenRouterConfig().judgeModel,
+        deps.fetchImpl,
+        judgeBudgetMs,
     );
-    const matches: unknown[] = Array.isArray(judged?.matches) ? judged.matches : [];
+    const judgedMatches = asRecord(judged)?.matches;
+    const matches: unknown[] = Array.isArray(judgedMatches) ? judgedMatches : [];
     if (matches.length !== items.length) {
         console.warn(`Grounding judge returned ${matches.length} matches for ${items.length} items; skipping`);
         return items;
@@ -281,34 +373,69 @@ const groundItemsInUsda = async (items: EstimateItemWithGrams[]): Promise<Estima
     });
 };
 
-export const estimateMeal = async (text?: string, imageBase64?: string): Promise<EstimateResponse> => {
-    const parsed = await callOpenRouter(
-        ESTIMATE_SYSTEM_PROMPT,
-        buildUserContent(text, imageBase64),
-        ESTIMATE_JSON_SCHEMA,
+// A model item is only usable when it is a record carrying a non-blank name;
+// anything else (null, a number, a string, an array, a nameless object) is
+// dropped, exactly as the previous name filter did. `quantityText` is passed
+// through untrimmed — only a string survives, everything else becomes ''.
+const toEstimateItem = (value: unknown): EstimateItemWithGrams | null => {
+    const item = asRecord(value);
+    if (!item) return null;
+    const name = readNonBlankString(item.name);
+    if (name === undefined) return null;
+    return {
+        name,
+        quantityText: typeof item.quantityText === 'string' ? item.quantityText : '',
+        grams: toInt(item.grams),
+        calories: toInt(item.calories),
+        protein: toInt(item.protein),
+        carbs: toInt(item.carbs),
+        fat: toInt(item.fat),
+        source: 'estimated' as const,
+        matchedTo: null,
+    };
+};
+
+export const estimateMeal = async (
+    text?: string,
+    imageBase64?: string,
+    deps: EstimateDependencies = {},
+): Promise<EstimateResponse> => {
+    const budget = startVendorBudget();
+    const parsed = asRecord(
+        await callModel(
+            ESTIMATE_SYSTEM_PROMPT,
+            buildUserContent(text, imageBase64),
+            ESTIMATE_JSON_SCHEMA,
+            undefined,
+            deps.fetchImpl,
+            budget.remainingMs(),
+        ),
     );
 
-    let items: EstimateItem[] = (Array.isArray(parsed?.items) ? parsed.items : [])
-        .filter((item: any) => item && typeof item.name === 'string' && item.name.trim())
-        .map((item: any) => ({
-            name: item.name.trim(),
-            quantityText: typeof item.quantityText === 'string' ? item.quantityText : '',
-            grams: toInt(item.grams),
-            calories: toInt(item.calories),
-            protein: toInt(item.protein),
-            carbs: toInt(item.carbs),
-            fat: toInt(item.fat),
-            source: 'estimated' as const,
-            matchedTo: null,
-        }));
+    const parsedItems = parsed?.items;
+    const modelItems: unknown[] = Array.isArray(parsedItems) ? parsedItems : [];
+    let items: EstimateItem[] = modelItems
+        .map(toEstimateItem)
+        .filter((item): item is EstimateItemWithGrams => item !== null);
     if (items.length === 0) {
         throw new EstimateFailedError('Model returned no food items');
     }
 
     // Ground in USDA unless disabled; never let grounding break the estimate.
-    if (process.env.ESTIMATE_GROUNDING !== 'off') {
+    //
+    // The budget check is a third reason to skip, alongside the kill switch and
+    // a failure: grounding is a refinement the client is waiting on, so once
+    // the estimate itself has consumed the request's budget the honest answer
+    // is the estimate the model already produced, delivered in time, rather
+    // than a better one the client will never see.
+    const groundingBudgetMs = budget.remainingMs();
+    if (process.env.ESTIMATE_GROUNDING === 'off') {
+        // Disabled: nothing to report.
+    } else if (groundingBudgetMs < GROUNDING_MIN_BUDGET_MS) {
+        console.warn(`USDA grounding skipped: ${groundingBudgetMs}ms of the request budget left`);
+    } else {
         try {
-            items = await groundItemsInUsda(items as EstimateItemWithGrams[]);
+            items = await groundItemsInUsda(items as EstimateItemWithGrams[], deps, budget);
         } catch (error) {
             console.error('USDA grounding failed, using raw LLM estimate:', (error as Error).message);
         }
@@ -325,28 +452,28 @@ export const estimateMeal = async (text?: string, imageBase64?: string): Promise
             }),
             { calories: 0, protein: 0, carbs: 0, fat: 0 },
         ),
-        confidence: ['low', 'medium', 'high'].includes(parsed?.confidence) ? parsed.confidence : 'medium',
-        notes: typeof parsed?.notes === 'string' && parsed.notes.trim() ? parsed.notes.trim() : null,
+        confidence: readConfidence(parsed?.confidence),
+        notes: readNonBlankString(parsed?.notes) ?? null,
     };
 };
 
+// One model call and no grounding, so the vendor default is already this
+// request's whole budget and there is nothing to share it with — the deadline
+// the client is promised holds without any arithmetic here.
 export const scanLabel = async (imageBase64: string): Promise<LabelScanResponse> => {
-    const parsed = await callOpenRouter(
-        LABEL_SCAN_SYSTEM_PROMPT,
-        buildUserContent(undefined, imageBase64),
-        LABEL_SCAN_JSON_SCHEMA,
+    const parsed = asRecord(
+        await callModel(LABEL_SCAN_SYSTEM_PROMPT, buildUserContent(undefined, imageBase64), LABEL_SCAN_JSON_SCHEMA),
     );
 
     const servingAmount = Number(parsed?.servingAmount);
     return {
-        name: typeof parsed?.name === 'string' && parsed.name.trim() ? parsed.name.trim() : null,
+        name: readNonBlankString(parsed?.name) ?? null,
         servingAmount: Number.isFinite(servingAmount) && servingAmount > 0 ? servingAmount : null,
-        servingUnit:
-            typeof parsed?.servingUnit === 'string' && parsed.servingUnit.trim() ? parsed.servingUnit.trim() : null,
+        servingUnit: readNonBlankString(parsed?.servingUnit) ?? null,
         calories: toInt(parsed?.calories),
         protein: toInt(parsed?.protein),
         carbs: toInt(parsed?.carbs),
         fat: toInt(parsed?.fat),
-        confidence: ['low', 'medium', 'high'].includes(parsed?.confidence) ? parsed.confidence : 'medium',
+        confidence: readConfidence(parsed?.confidence),
     };
 };

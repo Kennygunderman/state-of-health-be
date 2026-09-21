@@ -1,0 +1,449 @@
+{
+  "release_id": "v1",
+  "manifest_version": "v1",
+  "coverage_plan_version": "v1",
+  "generated_at": "2026-09-18T17:06:19.921Z",
+  "produced_by": "pipeline",
+  "files": [
+    {
+      "path": "foods.jsonl",
+      "name": "foods.jsonl",
+      "sha256": "7cfed09ff6e2c267ff618b0251ddc3e8ec72e77d19306ad884501b56c3ece134",
+      "row_count": 10928,
+      "bytes": 13249444
+    },
+    {
+      "path": "aliases.jsonl",
+      "name": "aliases.jsonl",
+      "sha256": "25e4f8233c83a5166dbd494f60a52e6a920a4284e8e515c1c634a0f142c4dc2e",
+      "row_count": 15777,
+      "bytes": 908946
+    },
+    {
+      "path": "portions.jsonl",
+      "name": "portions.jsonl",
+      "sha256": "5ba0126907e513f688e5bbb3230e209792b027b82fdc53cb1f3b568ba7900565",
+      "row_count": 31537,
+      "bytes": 4746200
+    },
+    {
+      "path": "components.jsonl",
+      "name": "components.jsonl",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "row_count": 0,
+      "bytes": 0
+    },
+    {
+      "path": "validation-records.jsonl",
+      "name": "validation-records.jsonl",
+      "sha256": "81f9ee55332ae5b9ffab9e7100e6a64d0397ecd0a989c83ed986d4de77cbc3ac",
+      "row_count": 10928,
+      "bytes": 63991825
+    }
+  ],
+  "counts": {
+    "foods": 10928,
+    "published_foods": 10928,
+    "aliases": 15777,
+    "portions": 31537,
+    "components": 0,
+    "published_ingredient_derived": 0,
+    "validation_records": 10928
+  },
+  "source_datasets": [
+    {
+      "name": "Foundation",
+      "version": "Foundation 2026-04",
+      "versions_present": [
+        "Foundation 2019-04",
+        "Foundation 2019-12",
+        "Foundation 2020-04",
+        "Foundation 2020-10",
+        "Foundation 2021-10",
+        "Foundation 2022-04",
+        "Foundation 2022-10",
+        "Foundation 2023-04",
+        "Foundation 2023-10",
+        "Foundation 2024-04",
+        "Foundation 2024-10",
+        "Foundation 2025-04",
+        "Foundation 2025-12",
+        "Foundation 2026-04"
+      ],
+      "retrieved_at": "2026-09-18T16:19:05.638Z",
+      "public_domain": true,
+      "notes": "USDA FoodData Central. Public domain, which is the basis on which this release redistributes its descriptions, portions and nutrient values."
+    },
+    {
+      "name": "SR Legacy",
+      "version": "SR Legacy 2019-04",
+      "versions_present": [
+        "SR Legacy 2019-04"
+      ],
+      "retrieved_at": "2026-09-18T16:39:45.737Z",
+      "public_domain": true,
+      "notes": "USDA FoodData Central. Public domain, which is the basis on which this release redistributes its descriptions, portions and nutrient values."
+    },
+    {
+      "name": "Survey (FNDDS)",
+      "version": "Survey (FNDDS) 2024-10",
+      "versions_present": [
+        "Survey (FNDDS) 2024-10"
+      ],
+      "retrieved_at": "2026-09-18T16:56:28.080Z",
+      "public_domain": true,
+      "notes": "USDA FoodData Central. Public domain, which is the basis on which this release redistributes its descriptions, portions and nutrient values."
+    }
+  ],
+  "model_versions": {
+    "generation_model": null,
+    "review_model": null,
+    "prompt_version": null,
+    "generation_prompt_version": null,
+    "review_prompt_version": null,
+    "generation_models": [],
+    "review_models": [],
+    "generation_prompt_versions": [],
+    "review_prompt_versions": [],
+    "ai_generated_foods": 0,
+    "reviewed_foods": 0
+  },
+  "coverage": {
+    "coverage_plan_version": "v1",
+    "published_target_total": 11010,
+    "published_actual_total": 10928,
+    "published_total": 10928,
+    "shortfall_total": 2361,
+    "published_gap_to_total": 82,
+    "categories": [
+      {
+        "category": "produce_vegetable",
+        "published": 1424,
+        "published_actual": 1424,
+        "published_target": 1200,
+        "shortfall": 0
+      },
+      {
+        "category": "produce_fruit",
+        "published": 728,
+        "published_actual": 728,
+        "published_target": 700,
+        "shortfall": 0
+      },
+      {
+        "category": "protein_meat",
+        "published": 2181,
+        "published_actual": 2181,
+        "published_target": 700,
+        "shortfall": 0
+      },
+      {
+        "category": "protein_poultry",
+        "published": 492,
+        "published_actual": 492,
+        "published_target": 400,
+        "shortfall": 0
+      },
+      {
+        "category": "protein_seafood",
+        "published": 558,
+        "published_actual": 558,
+        "published_target": 600,
+        "shortfall": 42
+      },
+      {
+        "category": "protein_egg",
+        "published": 58,
+        "published_actual": 58,
+        "published_target": 60,
+        "shortfall": 2
+      },
+      {
+        "category": "protein_plant",
+        "published": 38,
+        "published_actual": 38,
+        "published_target": 350,
+        "shortfall": 312
+      },
+      {
+        "category": "dairy",
+        "published": 371,
+        "published_actual": 371,
+        "published_target": 600,
+        "shortfall": 229
+      },
+      {
+        "category": "dairy_alternative",
+        "published": 52,
+        "published_actual": 52,
+        "published_target": 250,
+        "shortfall": 198
+      },
+      {
+        "category": "grain",
+        "published": 537,
+        "published_actual": 537,
+        "published_target": 600,
+        "shortfall": 63
+      },
+      {
+        "category": "bread_bakery",
+        "published": 765,
+        "published_actual": 765,
+        "published_target": 500,
+        "shortfall": 0
+      },
+      {
+        "category": "legume",
+        "published": 290,
+        "published_actual": 290,
+        "published_target": 250,
+        "shortfall": 0
+      },
+      {
+        "category": "nut_seed",
+        "published": 293,
+        "published_actual": 293,
+        "published_target": 350,
+        "shortfall": 57
+      },
+      {
+        "category": "oil_fat",
+        "published": 149,
+        "published_actual": 149,
+        "published_target": 150,
+        "shortfall": 1
+      },
+      {
+        "category": "condiment_sauce",
+        "published": 196,
+        "published_actual": 196,
+        "published_target": 700,
+        "shortfall": 504
+      },
+      {
+        "category": "spice_herb",
+        "published": 49,
+        "published_actual": 49,
+        "published_target": 300,
+        "shortfall": 251
+      },
+      {
+        "category": "beverage",
+        "published": 420,
+        "published_actual": 420,
+        "published_target": 600,
+        "shortfall": 180
+      },
+      {
+        "category": "snack",
+        "published": 233,
+        "published_actual": 233,
+        "published_target": 600,
+        "shortfall": 367
+      },
+      {
+        "category": "sweet",
+        "published": 550,
+        "published_actual": 550,
+        "published_target": 500,
+        "shortfall": 0
+      },
+      {
+        "category": "prepared_meal",
+        "published": 1499,
+        "published_actual": 1499,
+        "published_target": 1400,
+        "shortfall": 0
+      },
+      {
+        "category": "other",
+        "published": 45,
+        "published_actual": 45,
+        "published_target": 200,
+        "shortfall": 155
+      }
+    ],
+    "by_category": [
+      {
+        "category": "produce_vegetable",
+        "published": 1424,
+        "published_actual": 1424,
+        "published_target": 1200,
+        "shortfall": 0
+      },
+      {
+        "category": "produce_fruit",
+        "published": 728,
+        "published_actual": 728,
+        "published_target": 700,
+        "shortfall": 0
+      },
+      {
+        "category": "protein_meat",
+        "published": 2181,
+        "published_actual": 2181,
+        "published_target": 700,
+        "shortfall": 0
+      },
+      {
+        "category": "protein_poultry",
+        "published": 492,
+        "published_actual": 492,
+        "published_target": 400,
+        "shortfall": 0
+      },
+      {
+        "category": "protein_seafood",
+        "published": 558,
+        "published_actual": 558,
+        "published_target": 600,
+        "shortfall": 42
+      },
+      {
+        "category": "protein_egg",
+        "published": 58,
+        "published_actual": 58,
+        "published_target": 60,
+        "shortfall": 2
+      },
+      {
+        "category": "protein_plant",
+        "published": 38,
+        "published_actual": 38,
+        "published_target": 350,
+        "shortfall": 312
+      },
+      {
+        "category": "dairy",
+        "published": 371,
+        "published_actual": 371,
+        "published_target": 600,
+        "shortfall": 229
+      },
+      {
+        "category": "dairy_alternative",
+        "published": 52,
+        "published_actual": 52,
+        "published_target": 250,
+        "shortfall": 198
+      },
+      {
+        "category": "grain",
+        "published": 537,
+        "published_actual": 537,
+        "published_target": 600,
+        "shortfall": 63
+      },
+      {
+        "category": "bread_bakery",
+        "published": 765,
+        "published_actual": 765,
+        "published_target": 500,
+        "shortfall": 0
+      },
+      {
+        "category": "legume",
+        "published": 290,
+        "published_actual": 290,
+        "published_target": 250,
+        "shortfall": 0
+      },
+      {
+        "category": "nut_seed",
+        "published": 293,
+        "published_actual": 293,
+        "published_target": 350,
+        "shortfall": 57
+      },
+      {
+        "category": "oil_fat",
+        "published": 149,
+        "published_actual": 149,
+        "published_target": 150,
+        "shortfall": 1
+      },
+      {
+        "category": "condiment_sauce",
+        "published": 196,
+        "published_actual": 196,
+        "published_target": 700,
+        "shortfall": 504
+      },
+      {
+        "category": "spice_herb",
+        "published": 49,
+        "published_actual": 49,
+        "published_target": 300,
+        "shortfall": 251
+      },
+      {
+        "category": "beverage",
+        "published": 420,
+        "published_actual": 420,
+        "published_target": 600,
+        "shortfall": 180
+      },
+      {
+        "category": "snack",
+        "published": 233,
+        "published_actual": 233,
+        "published_target": 600,
+        "shortfall": 367
+      },
+      {
+        "category": "sweet",
+        "published": 550,
+        "published_actual": 550,
+        "published_target": 500,
+        "shortfall": 0
+      },
+      {
+        "category": "prepared_meal",
+        "published": 1499,
+        "published_actual": 1499,
+        "published_target": 1400,
+        "shortfall": 0
+      },
+      {
+        "category": "other",
+        "published": 45,
+        "published_actual": 45,
+        "published_target": 200,
+        "shortfall": 155
+      }
+    ]
+  },
+  "acceptance": {
+    "requirement_met": true,
+    "required_published_items": 10000,
+    "published_items": 10928,
+    "shortfall_against_requirement": 0,
+    "categories_below_target": 13,
+    "per_category_shortfall_total": 2361,
+    "every_category_meets_its_target": false,
+    "statement": "This release meets the catalog requirement: it publishes 10928 items against the required 10000, every one of them validated and carrying its own validation record. 13 of 21 categories are below their own published target by 2361 items in total; the per-category gaps are in coverage.by_category, stated exactly and never netted against the categories that overshoot theirs. The coverage plan’s per-category targets total more than the requirement by design (AAP §0.7.3), so a per-category gap is a coverage statement rather than a size one: it does not put the required published count at risk, and AAP §0.7.5 verifies that count — not the per-category targets — before the feature flag is enabled."
+  },
+  "evidence": {
+    "published_foods": 10928,
+    "assessed_records": 10928,
+    "complete_records": 10928,
+    "observed_status_min": 200,
+    "observed_status_max": 200,
+    "identity_sources": [
+      {
+        "identity_source": "usda",
+        "published_foods": 10928,
+        "assessed_records": 10928,
+        "observed_status_min": 200,
+        "observed_status_max": 200
+      }
+    ],
+    "gap_codes": [],
+    "source_cache_resolution": {
+      "required_records": 10928,
+      "resolved_records": 10928,
+      "cache_rows_read": 604
+    }
+  }
+}

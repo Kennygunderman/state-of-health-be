@@ -1,0 +1,113 @@
+{
+  "slug": "beef-vegetable-noodle-bowl",
+  "name": "Beef and vegetable pasta bowl",
+  "description": "Lean ground beef with mushrooms, carrot and broccoli tossed through cooked pasta in a single pan.",
+  "iconKey": "bowl",
+  "instructions": [
+    "Slice the mushrooms and the carrot and cut the broccoli into small florets.",
+    "Warm the olive oil in a wide pan over medium-high heat and brown the ground beef for 6 minutes, breaking it up as it cooks, then season it with the salt and the black pepper.",
+    "Add the garlic, the mushrooms, the carrot and the broccoli and cook for 6 minutes, until the vegetables are tender.",
+    "Toss the cooked pasta through the pan until everything is coated and hot.",
+    "Divide it between two bowls and serve."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 bowl",
+  "prepMinutes": 10,
+  "cookMinutes": 20,
+  "mealSlots": [
+    "dinner"
+  ],
+  "dietTags": [],
+  "allergenTags": [
+    "wheat"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": [
+    "high_protein",
+    "dairy_free"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:173110",
+      "quantity": 10,
+      "unit": "oz",
+      "gramWeight": 282.5,
+      "displayText": "10 oz",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169737",
+      "quantity": 2,
+      "unit": "cup",
+      "gramWeight": 248.0,
+      "displayText": "2 cups",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169251",
+      "quantity": 1,
+      "unit": "cup",
+      "gramWeight": 70.0,
+      "displayText": "1 cup, sliced",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170393",
+      "quantity": 2,
+      "unit": "each",
+      "gramWeight": 122.0,
+      "displayText": "2",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170379",
+      "quantity": 1,
+      "unit": "cup",
+      "gramWeight": 88.0,
+      "displayText": "1 cup",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 0.5,
+      "unit": "tbsp",
+      "gramWeight": 6.75,
+      "displayText": "½ tbsp",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169230",
+      "quantity": 3,
+      "unit": "clove",
+      "gramWeight": 9.0,
+      "displayText": "3 cloves",
+      "sortOrder": 6,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170931",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 1.15,
+      "displayText": "½ tsp",
+      "sortOrder": 7,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 3.0,
+      "displayText": "½ tsp",
+      "sortOrder": 8,
+      "isOptional": false
+    }
+  ]
+}

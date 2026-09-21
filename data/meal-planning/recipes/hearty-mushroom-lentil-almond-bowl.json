@@ -1,0 +1,103 @@
+{
+  "slug": "hearty-mushroom-lentil-almond-bowl",
+  "name": "Hearty mushroom, lentil and almond bowl",
+  "description": "A very large soy-free vegan breakfast bowl for a high calorie target: sixteen cups of sliced mushrooms browned in dry pans with garlic, warm cooked lentils and wilted spinach stirred through, finished with whole almonds. Tree nuts carry the fat here, so it suits a soy and peanut free plan.",
+  "iconKey": "bowl",
+  "instructions": [
+    "Set two wide non-stick pans over high heat and divide the mushrooms between them in a single layer, leaving them undisturbed for 4 minutes so they brown rather than steam.",
+    "Stir in the garlic, the salt and the black pepper and cook for 3 minutes more, until both pans are dry again.",
+    "Divide the lentils between the pans and warm them through for 2 minutes.",
+    "Fold in the spinach a handful at a time and cook for 1 minute, just until it collapses.",
+    "Tip everything into one very large bowl and scatter the almonds over the top."
+  ],
+  "yieldServings": 1,
+  "servingDescription": "1 large bowl",
+  "prepMinutes": 5,
+  "cookMinutes": 10,
+  "mealSlots": [
+    "breakfast"
+  ],
+  "dietTags": [
+    "gluten_free",
+    "pescatarian",
+    "vegan",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "tree_nuts"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 2,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "dairy_free",
+    "vegan",
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:169251",
+      "quantity": 16,
+      "unit": "cup",
+      "gramWeight": 1120,
+      "displayText": "16 cups, sliced",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:172421",
+      "quantity": 160,
+      "unit": "g",
+      "gramWeight": 160,
+      "displayText": "160 g, warm",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168462",
+      "quantity": 3,
+      "unit": "cup",
+      "gramWeight": 90,
+      "displayText": "3 cups",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170567",
+      "quantity": 2,
+      "unit": "oz",
+      "gramWeight": 56.7,
+      "displayText": "2 oz",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169230",
+      "quantity": 3,
+      "unit": "clove",
+      "gramWeight": 9,
+      "displayText": "3 cloves, minced",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 3,
+      "displayText": "½ tsp",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170931",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 1.15,
+      "displayText": "½ tsp",
+      "sortOrder": 6,
+      "isOptional": false
+    }
+  ]
+}

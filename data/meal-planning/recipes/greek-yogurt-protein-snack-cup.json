@@ -1,0 +1,69 @@
+{
+  "slug": "greek-yogurt-protein-snack-cup",
+  "name": "Greek yogurt protein cup",
+  "description": "A small cup of plain Greek yogurt with rolled oats, strawberries and sunflower seeds — enough protein to hold until the next meal without tipping into dessert.",
+  "iconKey": "bowl_dash",
+  "instructions": [
+    "Stir the rolled oats through the Greek yogurt.",
+    "Hull and slice the strawberries and fold them in.",
+    "Divide between two cups and scatter the sunflower seeds over the top."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 cup",
+  "prepMinutes": 5,
+  "cookMinutes": 0,
+  "mealSlots": [
+    "snack"
+  ],
+  "dietTags": [
+    "pescatarian",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "milk"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 2,
+  "badges": [
+    "high_protein",
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:2705424",
+      "quantity": 1,
+      "unit": "cup",
+      "gramWeight": 245,
+      "displayText": "1 cup",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173904",
+      "quantity": 0.25,
+      "unit": "cup",
+      "gramWeight": 20.25,
+      "displayText": "¼ cup",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:167762",
+      "quantity": 1,
+      "unit": "cup",
+      "gramWeight": 152,
+      "displayText": "1 cup, halves",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170562",
+      "quantity": 2,
+      "unit": "tbsp",
+      "gramWeight": 17.5,
+      "displayText": "2 tbsp",
+      "sortOrder": 3,
+      "isOptional": false
+    }
+  ]
+}

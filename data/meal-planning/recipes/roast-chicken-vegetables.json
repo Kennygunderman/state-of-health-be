@@ -1,0 +1,98 @@
+{
+  "slug": "roast-chicken-vegetables",
+  "name": "Roast chicken and vegetables",
+  "description": "A whole pan of chicken breast roasted over chunks of potato, carrot and onion in olive oil, rubbed with chili powder and finished with fresh dill.",
+  "iconKey": "cloche",
+  "instructions": [
+    "Heat the oven to 425°F, then cut the potato and carrot into large chunks and slice the onion thick.",
+    "Toss the potato, carrot, onion and garlic with two tablespoons of the olive oil and half of the chili powder, then spread them in a single layer in a roasting pan.",
+    "Rub the chicken breast with the remaining olive oil and chili powder and arrange it over the top.",
+    "Roast for 45 minutes, turning the pan once halfway through, until the chicken is cooked through and the potato edges are browned.",
+    "Let the chicken rest for 5 minutes, then slice it thickly.",
+    "Scatter the dill over the pan and divide everything between four plates."
+  ],
+  "yieldServings": 4,
+  "servingDescription": "1 plate",
+  "prepMinutes": 15,
+  "cookMinutes": 45,
+  "mealSlots": ["dinner"],
+  "dietTags": ["gluten_free"],
+  "allergenTags": [],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": ["high_protein", "gluten_free", "dairy_free"],
+  "ingredients": [
+    {
+      "sourceKey": "usda:171077",
+      "quantity": 24,
+      "unit": "oz",
+      "gramWeight": 678,
+      "displayText": "24 oz",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170027",
+      "quantity": 3,
+      "unit": "each",
+      "gramWeight": 639,
+      "displayText": "3",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170393",
+      "quantity": 5,
+      "unit": "each",
+      "gramWeight": 305,
+      "displayText": "5",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170000",
+      "quantity": 1.25,
+      "unit": "cups",
+      "gramWeight": 200,
+      "displayText": "1¼ cups",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169230",
+      "quantity": 5,
+      "unit": "cloves",
+      "gramWeight": 15,
+      "displayText": "5 cloves",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 3,
+      "unit": "tbsp",
+      "gramWeight": 40.5,
+      "displayText": "3 tbsp",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:172233",
+      "quantity": 6,
+      "unit": "g",
+      "gramWeight": 6,
+      "displayText": "6 g",
+      "sortOrder": 6,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171319",
+      "quantity": 1.5,
+      "unit": "tsp",
+      "gramWeight": 4.05,
+      "displayText": "1½ tsp",
+      "sortOrder": 7,
+      "isOptional": false
+    }
+  ]
+}

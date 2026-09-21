@@ -1,0 +1,84 @@
+{
+  "slug": "edamame-protein-snack-bowl",
+  "name": "Edamame protein snack bowl",
+  "description": "Shelled edamame tossed cold with cooked lentils, grated carrot and lemon — a savoury snack that carries real protein instead of sugar.",
+  "iconKey": "bowl",
+  "instructions": [
+    "Tip the edamame into a bowl with the cooked lentils.",
+    "Grate the carrot over the top.",
+    "Squeeze the lemon over, add the salt and turn everything together.",
+    "Serve cold."
+  ],
+  "yieldServings": 1,
+  "servingDescription": "1 bowl",
+  "prepMinutes": 8,
+  "cookMinutes": 0,
+  "mealSlots": [
+    "snack"
+  ],
+  "dietTags": [
+    "gluten_free",
+    "pescatarian",
+    "vegan",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "soy"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 2,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "dairy_free",
+    "vegan",
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:169282",
+      "quantity": 0.5,
+      "unit": "cup",
+      "gramWeight": 128,
+      "displayText": "½ cup, shelled",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:172421",
+      "quantity": 0.33,
+      "unit": "cup",
+      "gramWeight": 65,
+      "displayText": "⅓ cup",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170393",
+      "quantity": 0.5,
+      "unit": "each",
+      "gramWeight": 30,
+      "displayText": "½ carrot, grated",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:167746",
+      "quantity": 0.125,
+      "unit": "each",
+      "gramWeight": 10,
+      "displayText": "⅛ lemon",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 1,
+      "unit": "g",
+      "gramWeight": 1,
+      "displayText": "1 g",
+      "sortOrder": 4,
+      "isOptional": false
+    }
+  ]
+}

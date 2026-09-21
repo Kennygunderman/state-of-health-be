@@ -1,0 +1,82 @@
+{
+  "slug": "high-protein-soy-oat-porridge",
+  "name": "High-protein soy and oat porridge",
+  "description": "Rolled oats simmered in tofu blended with unsweetened soy milk, which carries the protein a plain oat bowl cannot, then topped with strawberries.",
+  "iconKey": "bowl",
+  "instructions": [
+    "Blend the tofu with the soy milk until completely smooth.",
+    "Pour the blend into a small pan, add the rolled oats and the salt, and bring to a gentle simmer over medium heat.",
+    "Cook for 6 minutes, stirring often, until the porridge is thick and the oats are tender.",
+    "Spoon into a bowl and top with the halved strawberries."
+  ],
+  "yieldServings": 1,
+  "servingDescription": "1 bowl",
+  "prepMinutes": 5,
+  "cookMinutes": 8,
+  "mealSlots": [
+    "breakfast"
+  ],
+  "dietTags": [
+    "pescatarian",
+    "vegan",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "soy"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 2,
+  "badges": [
+    "high_protein",
+    "dairy_free",
+    "vegan",
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:172448",
+      "quantity": 225,
+      "unit": "g",
+      "gramWeight": 225,
+      "displayText": "225 g",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:175215",
+      "quantity": 0.67,
+      "unit": "cup",
+      "gramWeight": 162,
+      "displayText": "⅔ cup",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173904",
+      "quantity": 0.5,
+      "unit": "cup",
+      "gramWeight": 40.5,
+      "displayText": "½ cup",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:167762",
+      "quantity": 0.5,
+      "unit": "cup",
+      "gramWeight": 76,
+      "displayText": "½ cup, halves",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 1,
+      "unit": "g",
+      "gramWeight": 1,
+      "displayText": "1 g",
+      "sortOrder": 4,
+      "isOptional": false
+    }
+  ]
+}

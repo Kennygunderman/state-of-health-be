@@ -1,0 +1,69 @@
+{
+  "slug": "hearty-yogurt-oat-protein-bowl",
+  "name": "Hearty yogurt and oat protein bowl",
+  "description": "A no-cook bowl built for a large breakfast: plain greek yogurt thickened with rolled oats, halved strawberries folded through and scattered over, and sunflower seeds for crunch.",
+  "iconKey": "bowl",
+  "instructions": [
+    "Stir the rolled oats into the greek yogurt and leave it to stand for 5 minutes so the oats soften.",
+    "Hull and halve the strawberries, then fold half of them through the yogurt.",
+    "Spoon into two bowls, scatter the remaining strawberries over the top and finish each bowl with the sunflower seeds."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 bowl",
+  "prepMinutes": 5,
+  "cookMinutes": 0,
+  "mealSlots": [
+    "breakfast"
+  ],
+  "dietTags": [
+    "pescatarian",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "milk"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 2,
+  "badges": [
+    "high_protein",
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:2705424",
+      "quantity": 3.75,
+      "unit": "cup",
+      "gramWeight": 918.75,
+      "displayText": "3¾ cups",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173904",
+      "quantity": 1.5,
+      "unit": "cup",
+      "gramWeight": 121.5,
+      "displayText": "1½ cups",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:167762",
+      "quantity": 3.5,
+      "unit": "cup",
+      "gramWeight": 532,
+      "displayText": "3½ cups, halves",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170562",
+      "quantity": 80,
+      "unit": "g",
+      "gramWeight": 80,
+      "displayText": "80 g",
+      "sortOrder": 3,
+      "isOptional": false
+    }
+  ]
+}

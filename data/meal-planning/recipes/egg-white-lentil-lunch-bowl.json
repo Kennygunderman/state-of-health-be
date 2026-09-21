@@ -1,0 +1,110 @@
+{
+  "slug": "egg-white-lentil-lunch-bowl",
+  "name": "Egg white and lentil bowl",
+  "description": "Cooked lentils warmed with cumin, tomato and bell pepper, soft-set egg whites stirred through and spinach wilted in at the end.",
+  "iconKey": "bowl",
+  "instructions": [
+    "Warm the olive oil in a wide skillet over medium heat, add the bell pepper and cook until it softens, about 4 minutes.",
+    "Stir in the ground cumin and the tomato and cook for 1 minute more.",
+    "Add the cooked lentils, heat them through and season with the salt.",
+    "Push the lentils to one side of the pan, pour the egg white into the clear side and stir until it just sets, then fold the two together.",
+    "Fold in the spinach until it wilts, then divide between two bowls."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 bowl",
+  "prepMinutes": 10,
+  "cookMinutes": 12,
+  "mealSlots": [
+    "lunch",
+    "dinner"
+  ],
+  "dietTags": [
+    "gluten_free",
+    "pescatarian",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "eggs"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "dairy_free"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:172183",
+      "quantity": 10,
+      "unit": "each",
+      "gramWeight": 330,
+      "displayText": "10",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:172421",
+      "quantity": 1.5,
+      "unit": "cup",
+      "gramWeight": 297,
+      "displayText": "1½ cups",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168462",
+      "quantity": 3,
+      "unit": "cup",
+      "gramWeight": 90,
+      "displayText": "3 cups",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170108",
+      "quantity": 1,
+      "unit": "cup",
+      "gramWeight": 149,
+      "displayText": "1 cup, chopped",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170457",
+      "quantity": 1,
+      "unit": "each",
+      "gramWeight": 123,
+      "displayText": "1 medium",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 1.5,
+      "unit": "tbsp",
+      "gramWeight": 20.25,
+      "displayText": "1½ tbsp",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170923",
+      "quantity": 1,
+      "unit": "tsp",
+      "gramWeight": 2.1,
+      "displayText": "1 tsp",
+      "sortOrder": 6,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 3,
+      "displayText": "½ tsp",
+      "sortOrder": 7,
+      "isOptional": false
+    }
+  ]
+}

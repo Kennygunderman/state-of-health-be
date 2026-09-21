@@ -1,0 +1,103 @@
+{
+  "slug": "big-tofu-vegetable-rice-bowl",
+  "name": "Big tofu and vegetable rice bowl",
+  "description": "Seared firm tofu with broccoli, mushrooms and carrot over cooked white rice, finished with sriracha — one pan and a pot of rice make two very large bowls, each carrying the top of the calorie band.",
+  "iconKey": "bowl",
+  "instructions": [
+    "Cut the tofu into thick cubes and sear it in a large dry non-stick pan over medium-high heat for 6 minutes, turning twice, until browned on several sides.",
+    "Add the sliced mushrooms, the broccoli florets and the grated carrot, cover the pan and cook for 4 minutes, until the broccoli is bright and just tender.",
+    "Season with the salt and stir the sriracha through the pan.",
+    "Divide the cooked white rice between two large bowls and pile the tofu, mushrooms, broccoli and carrot on top."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 large bowl",
+  "prepMinutes": 5,
+  "cookMinutes": 10,
+  "mealSlots": [
+    "lunch",
+    "dinner"
+  ],
+  "dietTags": [
+    "gluten_free",
+    "pescatarian",
+    "vegan",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "soy"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 2,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "dairy_free",
+    "vegan",
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:172448",
+      "quantity": 1260,
+      "unit": "g",
+      "gramWeight": 1260,
+      "displayText": "1260 g, cubed",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169757",
+      "quantity": 2,
+      "unit": "cup",
+      "gramWeight": 316,
+      "displayText": "2 cups",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170379",
+      "quantity": 2.5,
+      "unit": "cup",
+      "gramWeight": 220,
+      "displayText": "2½ cups, chopped",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169251",
+      "quantity": 4,
+      "unit": "cup",
+      "gramWeight": 280,
+      "displayText": "4 cups, sliced",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170393",
+      "quantity": 2,
+      "unit": "each",
+      "gramWeight": 122,
+      "displayText": "2 medium, grated",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171186",
+      "quantity": 4,
+      "unit": "tsp",
+      "gramWeight": 26,
+      "displayText": "4 tsp",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 1,
+      "unit": "tsp",
+      "gramWeight": 6,
+      "displayText": "1 tsp",
+      "sortOrder": 6,
+      "isOptional": false
+    }
+  ]
+}

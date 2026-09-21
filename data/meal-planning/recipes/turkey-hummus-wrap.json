@@ -1,0 +1,69 @@
+{
+  "slug": "turkey-hummus-wrap",
+  "name": "Turkey and hummus wrap",
+  "description": "Sliced turkey and hummus folded into cabbage leaves with spinach and tomato, for a cold lunch that needs no cooking.",
+  "iconKey": "wrap",
+  "instructions": [
+    "Pat the cabbage leaves dry and lay them flat, overlapping their edges into one wide surface.",
+    "Spread the hummus across the leaves, leaving a clean border at each end.",
+    "Layer the turkey, spinach, and tomato down the middle, tuck the sides in, and fold it over itself tightly from one long edge.",
+    "Cut it in half on the diagonal and serve cold."
+  ],
+  "yieldServings": 1,
+  "servingDescription": "1 wrap",
+  "prepMinutes": 10,
+  "cookMinutes": 0,
+  "mealSlots": ["lunch"],
+  "dietTags": [],
+  "allergenTags": ["sesame"],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": ["high_protein", "dairy_free", "quick"],
+  "ingredients": [
+    {
+      "sourceKey": "usda:169975",
+      "quantity": 80,
+      "unit": "g",
+      "gramWeight": 80,
+      "displayText": "80 g",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:172941",
+      "quantity": 4,
+      "unit": "oz",
+      "gramWeight": 113,
+      "displayText": "4 oz",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:174289",
+      "quantity": 2,
+      "unit": "tbsp",
+      "gramWeight": 30,
+      "displayText": "2 tbsp",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168462",
+      "quantity": 1,
+      "unit": "cup",
+      "gramWeight": 30,
+      "displayText": "1 cup",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170457",
+      "quantity": 0.5,
+      "unit": "each",
+      "gramWeight": 61.5,
+      "displayText": "½",
+      "sortOrder": 4,
+      "isOptional": false
+    }
+  ]
+}

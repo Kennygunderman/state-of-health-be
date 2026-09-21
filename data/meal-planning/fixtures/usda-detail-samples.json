@@ -1,0 +1,2947 @@
+{
+  "fixtureVersion": "v1",
+  "description": "Hand-written recordings of USDA FoodData Central response shapes, so the USDA vendor boundary and the catalog import can be tested with no network call.",
+  "licenceBasis": "USDA FoodData Central is public domain with no retention restrictions. That is what makes committing recorded response shapes, and the snapshot-at-log-time storage model built on them, legal for this data source; it is recorded in the same words on src/services/usda.service.ts and on the usda_api_cache Prisma model. No other provider's data appears in this file, so no other provider's terms apply to it.",
+  "syntheticDataNotice": "Every sample is structurally faithful but nutritionally illustrative. Field names, nesting, types and per-dataset shape differences were checked against live responses; the numbers were not. Nutrient values, gram weights, serving sizes, descriptions and brand names are invented, chosen for clean arithmetic in assertions, and describe no real food or real manufacturer. No fdcId here identifies a real USDA record. Nothing in this file is a nutrition source of truth: it must never be loaded into catalog_foods, a release, or any database, and it is not evidence that any number is verified.",
+  "determinism": "No value is derived from the current time and none is random. Every fdcId is a fixed integer, every nutrient a fixed number, and the few dates are fixed ISO-8601 or fixed USDA-style strings carried only for structural fidelity.",
+  "secretsPolicy": "This file holds no credential of any kind: no vendor key, no authorization header value, no database connection string and no URL carrying credentials. It must never gain one. USDA requests are authenticated at request time from the USDA_API_KEY environment variable, whose production value lives in Coolify and never in a checked-in file; that variable NAME is the only credential-adjacent string in this document and it carries no value, matching how the sibling usda-manifest.v1.json records it. The endpoints block below therefore lists bare paths with their non-secret parameters separated out, so no sample ever contains a fully-formed authenticated URL. A scan of this file should look for credential VALUES, because the environment-variable name necessarily appears.",
+  "readingGuide": {
+    "sampleEnvelope": "Every named sample is an envelope. The `payload` member, and only `payload`, is the vendor JSON: it is what the service receives and what a usda_api_cache row stores. Every sibling of `payload` (note, endpoint, consumedBy, expectedOutcome, expected*, ...) is fixture annotation written for the reader and the assertion, and must never be passed to the service or treated as a USDA field.",
+    "vendorFieldNames": "Inside `payload`, USDA's own camelCase field names are kept verbatim. This is a vendor payload, not a snake_case database row and not a camelCase wire DTO, so the repository's snake_case/camelCase boundary rule does not apply here and these names must not be normalised into either convention.",
+    "payloadTrimming": "Payloads are faithful in every field the shipped service or the catalog import reads, plus enough surrounding context to be recognisable. Purely decorative response fields (score, allHighlightFields, foodAttributes, foodVersionIds, finalFoodInputFoods, microbes, foodUpdateLog and similar) are trimmed, because they carry no test value and would triple the size of this file. A sample is never trimmed of a field that changes an outcome.",
+    "perServingVsPer100g": "This is the distinction the whole file turns on, stated by the shipped client in its own header comment. Search results (/foods/search) carry per-100 g or per-100 ml nutrients that the service scales to one serving with value * servingSize / 100. Detail responses (/food/{fdcId}) carry labelNutrients that are ALREADY per serving and are never scaled. No sample mixes the two conventions, and a test built on a conflated sample would prove the wrong scaling.",
+    "searchNutrientShape": "In search results each foodNutrients entry is flat: {nutrientId, nutrientName, nutrientNumber, unitName, value}. The number lives in `value` and the selector is `nutrientNumber`.",
+    "detailFoodNutrientShape": "In detail responses foodNutrients entries are NOT the search shape. Each is {type: 'FoodNutrient', nutrient: {id, number, name, rank, unitName}, amount}, so the selector is nutrient.number and the number lives in `amount`. The shipped service never reads these (it uses labelNutrients), but the catalog import does: it takes per-100 g values from here and gram weights from foodPortions. Some entries are nutrient label-group rows carrying no `amount` at all (see detailFoodNutrientLabelRows), so an import must tolerate a missing amount rather than coerce it to zero.",
+    "detailFoodNutrientLabelRows": "Real generic detail responses begin with grouping rows such as nutrient.number '951' ('Proximates') that have isNutrientLabel true and no `amount`. They are included verbatim in the portion samples because an import that assumes every foodNutrients entry has a numeric amount breaks on them.",
+    "detailLabelNutrientKeys": "labelNutrients keys are protein, carbohydrates, fat and calories, each an object with a `value` member. The carbohydrate key is `carbohydrates` and NOT `carbs`: a reader grepping this file for a labelNutrients `carbs` key will correctly find none, and no sample carries a decoy one. `carbs` appears in this file only as the field name of the mapped response DTO, never as a vendor key.",
+    "nutrientNumberCoercion": "The service matches nutrients with String(nutrientNumber) === '203', so both a string and a JSON-number nutrientNumber resolve. Real USDA responses send a string, which is what almost every sample here uses; genericNumericNutrientNumbers sends JSON numbers to exercise the coercion and is a defensive-tolerance case, not the vendor norm.",
+    "portionLabelByDataset": "foodPortions differ per dataset, and the difference is load-bearing for gram-weight resolution. SR Legacy carries the label in `modifier` with the count in its own `amount` field. Foundation carries a real unit in measureUnit.name (cup, RACC) with the count in `amount` and any qualifier in `modifier` or `portionDescription`. Survey (FNDDS) carries the label in `portionDescription` with the count embedded at the start of that string and no `amount` field at all, and its `modifier` is a numeric measure code that is never a label. measureUnit id 9999 name 'undetermined' is USDA's placeholder for the datasets that keep the label in text.",
+    "grammaticalNote": "Descriptions are shaped like USDA descriptions (head noun first, qualifiers after commas) and every one begins with the word Fixture so no sample can be mistaken for a real record. Expected `name` values are the output of the service's titleCase, which lowercases the whole string and then capitalises each space-separated word; that turns an acronym into title case (LLC becomes Llc), which is the shipped behaviour and is pinned rather than corrected."
+  },
+  "endpoints": {
+    "genericSearch": {
+      "path": "/foods/search",
+      "params": {
+        "dataType": "Survey (FNDDS),SR Legacy,Foundation",
+        "pageSize": "6",
+        "pageNumber": "1"
+      },
+      "consumedBy": "searchGenericFoods",
+      "sampleGroup": "searchResponses",
+      "nutrientBasis": "per_100g"
+    },
+    "brandedSearch": {
+      "path": "/foods/search",
+      "params": {
+        "dataType": "Branded",
+        "pageSize": "20",
+        "pageNumber": "1"
+      },
+      "consumedBy": "searchBrandedFoods",
+      "sampleGroup": "searchResponses",
+      "nutrientBasis": "per_100g"
+    },
+    "foodDetail": {
+      "path": "/food/{fdcId}",
+      "params": {
+        "format": "full"
+      },
+      "consumedBy": "getBrandedFood, and the new getFoodDetail used by catalog-import-usda.ts",
+      "sampleGroup": "detailResponses and portionSamples",
+      "nutrientBasis": "labelNutrients are per_serving; foodNutrients are per_100g"
+    },
+    "foodDetailBatch": {
+      "path": "/foods",
+      "method": "POST",
+      "params": {
+        "format": "full"
+      },
+      "batchSize": 20,
+      "consumedBy": "the new getFoodsBatch used by catalog-import-usda.ts",
+      "sampleGroup": "detailResponses and portionSamples",
+      "note": "Returns an array of the same bare food objects the single detail endpoint returns, so the detail samples are valid batch-element samples too."
+    },
+    "dataTypeEncoding": "dataType values must be percent-encoded the way encodeURIComponent encodes them: the space in 'Survey (FNDDS)' becomes %20 and the parentheses are left unescaped. USDA answers 400 both when the space is sent as '+' and when the parentheses are escaped as %28/%29.",
+    "intermittentStatus": "USDA intermittently answers 400 to a request that succeeds when retried verbatim, which is why the shipped client retries 400 alongside 429 and 5xx for up to four physical attempts. Fixture-driven tests never observe this, which is precisely why the retry behaviour needs its own test rather than a fixture."
+  },
+  "nutrientNumbers": {
+    "protein": "203",
+    "fat": "204",
+    "carbs": "205",
+    "calories": "208",
+    "caloriesFallbackFormula": "4*protein + 4*carbs + 9*fat",
+    "caloriesFallbackScope": "Applied whenever nutrient 208 is absent. In the generic search path the fallback uses the per-100 g values, so its result is per 100 g. In the branded search path it uses the ALREADY-SCALED per-serving values, so scaling happens before the fallback, not after. In the detail path it uses labelNutrients, which are per serving already. Each of the three is pinned by its own sample."
+  },
+  "fdcIdRange": {
+    "min": 9000101,
+    "max": 9000611,
+    "policy": "All fdcId values are synthetic and sit in a fixed 9000xxx block, deliberately far above the real ids curated in usda-manifest.v1.json (167542 to 2710742), so a fixture id can never collide with or be mistaken for a real USDA record. Ids are unique across this whole file and grouped by purpose: 90001xx generic search, 90002xx branded search, 90003xx detail, 90004xx portions, 90005xx multi-food envelopes, 90006xx rejectable inputs.",
+    "zeroIdNote": "Every usable sample carries a non-zero id, because the service's !food?.fdcId guard treats a falsy id as unusable. The single exception is genericZeroFdcIdDropped, which carries an explicit 0 precisely to pin that guard, and it is deliberately outside the min-max block above.",
+    "portionIdRange": {
+      "min": 9100001,
+      "max": 9100503,
+      "note": "foodPortions entries carry their own USDA id, which is a portion id and not an fdcId. These use a separate synthetic 91000xx to 91005xx block so the two kinds of identifier can never be confused when reading a payload."
+    }
+  },
+  "dataTypes": [
+    "Foundation",
+    "SR Legacy",
+    "Survey (FNDDS)",
+    "Branded"
+  ],
+  "searchResponses": {
+    "genericFoundationComplete": {
+      "note": "Happy path for the generic search. A Foundation reference food carrying all four nutrients as per-100 g values with string nutrientNumbers, which is the real vendor serialization. Anchors the edge cases; proves nothing on its own.",
+      "endpoint": "/foods/search",
+      "consumedBy": "searchGenericFoods",
+      "expectedOutcome": "accepted",
+      "expectedCandidate": {
+        "fdcId": "9000101",
+        "description": "Fixture vegetable, leafy, raw",
+        "dataType": "Foundation",
+        "caloriesPer100g": 31,
+        "proteinPer100g": 2.5,
+        "carbsPer100g": 4.6,
+        "fatPer100g": 0.4
+      },
+      "expectedCandidateNote": "fdcId is returned as a string even though the payload carries an integer, and the generic path does not round: caloriesPer100g is whatever nutrient 208 carried.",
+      "payload": {
+        "totalHits": 1,
+        "currentPage": 1,
+        "totalPages": 1,
+        "foods": [
+          {
+            "fdcId": 9000101,
+            "description": "Fixture vegetable, leafy, raw",
+            "dataType": "Foundation",
+            "foodCategory": "Vegetables and Vegetable Products",
+            "publishedDate": "2024-04-18",
+            "foodNutrients": [
+              {
+                "nutrientId": 1003,
+                "nutrientName": "Protein",
+                "nutrientNumber": "203",
+                "unitName": "G",
+                "value": 2.5
+              },
+              {
+                "nutrientId": 1004,
+                "nutrientName": "Total lipid (fat)",
+                "nutrientNumber": "204",
+                "unitName": "G",
+                "value": 0.4
+              },
+              {
+                "nutrientId": 1005,
+                "nutrientName": "Carbohydrate, by difference",
+                "nutrientNumber": "205",
+                "unitName": "G",
+                "value": 4.6
+              },
+              {
+                "nutrientId": 1008,
+                "nutrientName": "Energy",
+                "nutrientNumber": "208",
+                "unitName": "KCAL",
+                "value": 31
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "genericSrLegacyComplete": {
+      "note": "Happy path for the second generic dataset. SR Legacy records are reference foods and carry the same per-100 g search shape as Foundation, so the only thing this pins that the Foundation sample does not is the dataType passthrough.",
+      "endpoint": "/foods/search",
+      "consumedBy": "searchGenericFoods",
+      "expectedOutcome": "accepted",
+      "expectedCandidate": {
+        "fdcId": "9000102",
+        "description": "Fixture grain, brown, cooked",
+        "dataType": "SR Legacy",
+        "caloriesPer100g": 112,
+        "proteinPer100g": 2.6,
+        "carbsPer100g": 23,
+        "fatPer100g": 0.9
+      },
+      "payload": {
+        "totalHits": 1,
+        "currentPage": 1,
+        "totalPages": 1,
+        "foods": [
+          {
+            "fdcId": 9000102,
+            "description": "Fixture grain, brown, cooked",
+            "dataType": "SR Legacy",
+            "foodCategory": "Cereal Grains and Pasta",
+            "ndbNumber": "99001",
+            "publishedDate": "2019-04-01",
+            "foodNutrients": [
+              {
+                "nutrientId": 1003,
+                "nutrientName": "Protein",
+                "nutrientNumber": "203",
+                "unitName": "G",
+                "value": 2.6
+              },
+              {
+                "nutrientId": 1004,
+                "nutrientName": "Total lipid (fat)",
+                "nutrientNumber": "204",
+                "unitName": "G",
+                "value": 0.9
+              },
+              {
+                "nutrientId": 1005,
+                "nutrientName": "Carbohydrate, by difference",
+                "nutrientNumber": "205",
+                "unitName": "G",
+                "value": 23
+              },
+              {
+                "nutrientId": 1008,
+                "nutrientName": "Energy",
+                "nutrientNumber": "208",
+                "unitName": "KCAL",
+                "value": 112
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "genericSurveyFnddsComplete": {
+      "note": "Happy path for the third generic dataset, and the one sample whose dataType string is itself the point. FNDDS records are as-eaten descriptions and carry a foodCode. The value must be exactly 'Survey (FNDDS)' with the space and both parentheses, because that string is sent in a query string and USDA answers 400 when the space is encoded as '+' or the parentheses are escaped.",
+      "endpoint": "/foods/search",
+      "consumedBy": "searchGenericFoods",
+      "expectedOutcome": "accepted",
+      "expectedCandidate": {
+        "fdcId": "9000103",
+        "description": "Fixture bread roll, plain",
+        "dataType": "Survey (FNDDS)",
+        "caloriesPer100g": 275,
+        "proteinPer100g": 9.4,
+        "carbsPer100g": 53.4,
+        "fatPer100g": 1.7
+      },
+      "payload": {
+        "totalHits": 1,
+        "currentPage": 1,
+        "totalPages": 1,
+        "foods": [
+          {
+            "fdcId": 9000103,
+            "description": "Fixture bread roll, plain",
+            "dataType": "Survey (FNDDS)",
+            "foodCode": "59000100",
+            "foodCategory": "Yeast breads",
+            "publishedDate": "2022-10-28",
+            "foodNutrients": [
+              {
+                "nutrientId": 1003,
+                "nutrientName": "Protein",
+                "nutrientNumber": "203",
+                "unitName": "G",
+                "value": 9.4
+              },
+              {
+                "nutrientId": 1004,
+                "nutrientName": "Total lipid (fat)",
+                "nutrientNumber": "204",
+                "unitName": "G",
+                "value": 1.7
+              },
+              {
+                "nutrientId": 1005,
+                "nutrientName": "Carbohydrate, by difference",
+                "nutrientNumber": "205",
+                "unitName": "G",
+                "value": 53.4
+              },
+              {
+                "nutrientId": 1008,
+                "nutrientName": "Energy",
+                "nutrientNumber": "208",
+                "unitName": "KCAL",
+                "value": 275
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "genericMissingCaloriesFallback": {
+      "note": "MANDATORY EDGE CASE. Nutrient 208 is absent, so the generic path falls back to 4*protein + 4*carbs + 9*fat. The three macro values were chosen so the sum is an exact integer and the assertion needs no floating-point tolerance. In this path the fallback runs on the per-100 g values, so its result is per 100 g and nothing is scaled.",
+      "endpoint": "/foods/search",
+      "consumedBy": "searchGenericFoods",
+      "expectedOutcome": "accepted",
+      "expectedCaloriesFromFallback": 118,
+      "expectedCaloriesFromFallbackWorking": "protein 5 * 4 = 20, carbs 20 * 4 = 80, fat 2 * 9 = 18; 20 + 80 + 18 = 118 kcal per 100 g",
+      "expectedCandidate": {
+        "fdcId": "9000104",
+        "description": "Fixture legume, boiled, drained",
+        "dataType": "SR Legacy",
+        "caloriesPer100g": 118,
+        "proteinPer100g": 5,
+        "carbsPer100g": 20,
+        "fatPer100g": 2
+      },
+      "payload": {
+        "totalHits": 1,
+        "currentPage": 1,
+        "totalPages": 1,
+        "foods": [
+          {
+            "fdcId": 9000104,
+            "description": "Fixture legume, boiled, drained",
+            "dataType": "SR Legacy",
+            "foodCategory": "Legumes and Legume Products",
+            "publishedDate": "2019-04-01",
+            "foodNutrients": [
+              {
+                "nutrientId": 1003,
+                "nutrientName": "Protein",
+                "nutrientNumber": "203",
+                "unitName": "G",
+                "value": 5
+              },
+              {
+                "nutrientId": 1004,
+                "nutrientName": "Total lipid (fat)",
+                "nutrientNumber": "204",
+                "unitName": "G",
+                "value": 2
+              },
+              {
+                "nutrientId": 1005,
+                "nutrientName": "Carbohydrate, by difference",
+                "nutrientNumber": "205",
+                "unitName": "G",
+                "value": 20
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "genericNumericNutrientNumbers": {
+      "note": "EDGE CASE. Every nutrientNumber is a JSON number rather than a string, which exercises the service's String(nutrientNumber) coercion on all four lookups at once. Real USDA responses send strings, so this is a defensive-tolerance sample and not a recording of the vendor norm; it exists so a future refactor to strict === on a string can never pass the suite.",
+      "endpoint": "/foods/search",
+      "consumedBy": "searchGenericFoods",
+      "expectedOutcome": "accepted",
+      "expectedCandidate": {
+        "fdcId": "9000107",
+        "description": "Fixture legume, sprouted, raw",
+        "dataType": "Foundation",
+        "caloriesPer100g": 100,
+        "proteinPer100g": 7,
+        "carbsPer100g": 12,
+        "fatPer100g": 3
+      },
+      "payload": {
+        "totalHits": 1,
+        "currentPage": 1,
+        "totalPages": 1,
+        "foods": [
+          {
+            "fdcId": 9000107,
+            "description": "Fixture legume, sprouted, raw",
+            "dataType": "Foundation",
+            "publishedDate": "2024-04-18",
+            "foodNutrients": [
+              {
+                "nutrientId": 1003,
+                "nutrientName": "Protein",
+                "nutrientNumber": 203,
+                "unitName": "G",
+                "value": 7
+              },
+              {
+                "nutrientId": 1004,
+                "nutrientName": "Total lipid (fat)",
+                "nutrientNumber": 204,
+                "unitName": "G",
+                "value": 3
+              },
+              {
+                "nutrientId": 1005,
+                "nutrientName": "Carbohydrate, by difference",
+                "nutrientNumber": 205,
+                "unitName": "G",
+                "value": 12
+              },
+              {
+                "nutrientId": 1008,
+                "nutrientName": "Energy",
+                "nutrientNumber": 208,
+                "unitName": "KCAL",
+                "value": 100
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "brandedComplete": {
+      "note": "Happy path for the branded search, and the sample that pins per-serving scaling. Search nutrients are per 100 g and servingSize is 170 g, so every value is multiplied by 1.7 and then rounded once. Fat is the interesting one: 0.4 per 100 g becomes 0.68 per serving and rounds to 1, so a test that skips the scaling step cannot accidentally match.",
+      "endpoint": "/foods/search",
+      "consumedBy": "searchBrandedFoods",
+      "expectedOutcome": "accepted",
+      "expectedUnroundedPerServing": {
+        "protein": 17,
+        "fat": 0.68,
+        "carbs": 6.12,
+        "calories": 100.3
+      },
+      "expectedUnroundedPerServingWorking": "protein 10 * 170 / 100 = 17, fat 0.4 * 170 / 100 = 0.68, carbs 3.6 * 170 / 100 = 6.12, calories 59 * 170 / 100 = 100.3",
+      "expectedBrandedFood": {
+        "id": "9000201",
+        "name": "Fixture Yogurt, Plain, Nonfat",
+        "brand": "Fixture Dairy Co.",
+        "servingText": "1 container",
+        "calories": 100,
+        "protein": 17,
+        "carbs": 6,
+        "fat": 1
+      },
+      "payload": {
+        "totalHits": 1,
+        "currentPage": 1,
+        "totalPages": 1,
+        "foods": [
+          {
+            "fdcId": 9000201,
+            "description": "Fixture yogurt, plain, nonfat",
+            "dataType": "Branded",
+            "brandName": "FIXTURE DAIRY CO.",
+            "brandOwner": "Fixture Dairy Holdings",
+            "gtinUpc": "00000000090201",
+            "ingredients": "CULTURED FIXTURE SKIM MILK.",
+            "servingSize": 170,
+            "servingSizeUnit": "g",
+            "householdServingFullText": "1 container",
+            "foodCategory": "Yogurt",
+            "marketCountry": "United States",
+            "publishedDate": "2023-06-14",
+            "foodNutrients": [
+              {
+                "nutrientId": 1003,
+                "nutrientName": "Protein",
+                "nutrientNumber": "203",
+                "unitName": "G",
+                "value": 10
+              },
+              {
+                "nutrientId": 1004,
+                "nutrientName": "Total lipid (fat)",
+                "nutrientNumber": "204",
+                "unitName": "G",
+                "value": 0.4
+              },
+              {
+                "nutrientId": 1005,
+                "nutrientName": "Carbohydrate, by difference",
+                "nutrientNumber": "205",
+                "unitName": "G",
+                "value": 3.6
+              },
+              {
+                "nutrientId": 1008,
+                "nutrientName": "Energy",
+                "nutrientNumber": "208",
+                "unitName": "KCAL",
+                "value": 59
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "brandedWithoutHouseholdServingText": {
+      "note": "EDGE CASE. householdServingFullText is absent, so servingText falls back to `${servingSize} ${servingSizeUnit.toLowerCase()}`. servingSizeUnit is deliberately uppercase 'G' so the lowercasing in that fallback is observable: the expected servingText is '30 g', not '30 G'. brandName is present here so this sample isolates the serving-text branch and nothing else.",
+      "endpoint": "/foods/search",
+      "consumedBy": "searchBrandedFoods",
+      "expectedOutcome": "accepted",
+      "expectedServingTextSource": "servingSize and servingSizeUnit fallback",
+      "expectedBrandedFood": {
+        "id": "9000202",
+        "name": "Fixture Crackers, Wheat",
+        "brand": "Fixture Snack Works",
+        "servingText": "30 g",
+        "calories": 180,
+        "protein": 6,
+        "carbs": 6,
+        "fat": 15
+      },
+      "expectedBrandedFoodWorking": "servingSize 30 scales per-100 g values by 0.3: protein 20 -> 6, fat 50 -> 15, carbs 20 -> 6, calories 600 -> 180; all four are exact so rounding changes nothing",
+      "payload": {
+        "totalHits": 1,
+        "currentPage": 1,
+        "totalPages": 1,
+        "foods": [
+          {
+            "fdcId": 9000202,
+            "description": "Fixture crackers, wheat",
+            "dataType": "Branded",
+            "brandName": "Fixture Snack Works",
+            "gtinUpc": "00000000090202",
+            "ingredients": "FIXTURE WHEAT FLOUR, FIXTURE VEGETABLE OIL, SALT.",
+            "servingSize": 30,
+            "servingSizeUnit": "G",
+            "foodCategory": "Crackers",
+            "marketCountry": "United States",
+            "publishedDate": "2023-06-14",
+            "foodNutrients": [
+              {
+                "nutrientId": 1003,
+                "nutrientName": "Protein",
+                "nutrientNumber": "203",
+                "unitName": "G",
+                "value": 20
+              },
+              {
+                "nutrientId": 1004,
+                "nutrientName": "Total lipid (fat)",
+                "nutrientNumber": "204",
+                "unitName": "G",
+                "value": 50
+              },
+              {
+                "nutrientId": 1005,
+                "nutrientName": "Carbohydrate, by difference",
+                "nutrientNumber": "205",
+                "unitName": "G",
+                "value": 20
+              },
+              {
+                "nutrientId": 1008,
+                "nutrientName": "Energy",
+                "nutrientNumber": "208",
+                "unitName": "KCAL",
+                "value": 600
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "brandedBrandOwnerOnlyAndUppercaseHouseholdServing": {
+      "note": "EDGE CASE for brand resolution and for householdServingFullText normalisation. brandName is absent, so brand resolves from brandOwner. The expected brand is 'Fixture Snacks Llc' because the service's titleCase lowercases the whole string before capitalising each word, so an acronym loses its casing; that is the shipped behaviour and this sample pins it rather than pretending it produces 'LLC'. householdServingFullText is uppercase '1 BAR', so the expected servingText is the trimmed, lowercased '1 bar'.",
+      "endpoint": "/foods/search",
+      "consumedBy": "searchBrandedFoods",
+      "expectedOutcome": "accepted",
+      "expectedBrandSource": "brandOwner",
+      "expectedBrandedFood": {
+        "id": "9000203",
+        "name": "Fixture Protein Bar, Chocolate",
+        "brand": "Fixture Snacks Llc",
+        "servingText": "1 bar",
+        "calories": 210,
+        "protein": 12,
+        "carbs": 24,
+        "fat": 6
+      },
+      "expectedBrandedFoodWorking": "servingSize 60 scales per-100 g values by 0.6: protein 20 -> 12, fat 10 -> 6, carbs 40 -> 24, calories 350 -> 210",
+      "payload": {
+        "totalHits": 1,
+        "currentPage": 1,
+        "totalPages": 1,
+        "foods": [
+          {
+            "fdcId": 9000203,
+            "description": "Fixture protein bar, chocolate",
+            "dataType": "Branded",
+            "brandOwner": "FIXTURE SNACKS LLC",
+            "gtinUpc": "00000000090203",
+            "ingredients": "FIXTURE PROTEIN BLEND, FIXTURE COCOA, CHICORY ROOT FIBER.",
+            "servingSize": 60,
+            "servingSizeUnit": "g",
+            "householdServingFullText": "1 BAR",
+            "foodCategory": "Nutritional Bars",
+            "marketCountry": "United States",
+            "publishedDate": "2023-06-14",
+            "foodNutrients": [
+              {
+                "nutrientId": 1003,
+                "nutrientName": "Protein",
+                "nutrientNumber": "203",
+                "unitName": "G",
+                "value": 20
+              },
+              {
+                "nutrientId": 1004,
+                "nutrientName": "Total lipid (fat)",
+                "nutrientNumber": "204",
+                "unitName": "G",
+                "value": 10
+              },
+              {
+                "nutrientId": 1005,
+                "nutrientName": "Carbohydrate, by difference",
+                "nutrientNumber": "205",
+                "unitName": "G",
+                "value": 40
+              },
+              {
+                "nutrientId": 1008,
+                "nutrientName": "Energy",
+                "nutrientNumber": "208",
+                "unitName": "KCAL",
+                "value": 350
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "brandedBlankBrandNameFallsBackToOwner": {
+      "note": "EDGE CASE. brandName is present but whitespace-only, so the service's trim() truthiness check must reject it and fall through to brandOwner. A naive `brandName ?? brandOwner` or a plain truthiness test on the raw string would return a blank brand here, which is exactly what this sample catches. servingSize is 100 so scaling is the identity and the brand branch is the only thing under test.",
+      "endpoint": "/foods/search",
+      "consumedBy": "searchBrandedFoods",
+      "expectedOutcome": "accepted",
+      "expectedBrandSource": "brandOwner, because brandName trims to empty",
+      "expectedBrandedFood": {
+        "id": "9000204",
+        "name": "Fixture Beverage, Citrus",
+        "brand": "Fixture Beverage Group",
+        "servingText": "100 g",
+        "calories": 80,
+        "protein": 5,
+        "carbs": 10,
+        "fat": 2
+      },
+      "payload": {
+        "totalHits": 1,
+        "currentPage": 1,
+        "totalPages": 1,
+        "foods": [
+          {
+            "fdcId": 9000204,
+            "description": "Fixture beverage, citrus",
+            "dataType": "Branded",
+            "brandName": "   ",
+            "brandOwner": "Fixture Beverage Group",
+            "gtinUpc": "00000000090204",
+            "servingSize": 100,
+            "servingSizeUnit": "g",
+            "foodCategory": "Fruit Juice",
+            "marketCountry": "United States",
+            "publishedDate": "2023-06-14",
+            "foodNutrients": [
+              {
+                "nutrientId": 1003,
+                "nutrientName": "Protein",
+                "nutrientNumber": "203",
+                "unitName": "G",
+                "value": 5
+              },
+              {
+                "nutrientId": 1004,
+                "nutrientName": "Total lipid (fat)",
+                "nutrientNumber": "204",
+                "unitName": "G",
+                "value": 2
+              },
+              {
+                "nutrientId": 1005,
+                "nutrientName": "Carbohydrate, by difference",
+                "nutrientNumber": "205",
+                "unitName": "G",
+                "value": 10
+              },
+              {
+                "nutrientId": 1008,
+                "nutrientName": "Energy",
+                "nutrientNumber": "208",
+                "unitName": "KCAL",
+                "value": 80
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "brandedNoBrandFieldsResolvesToNull": {
+      "note": "EDGE CASE. Neither brandName nor brandOwner is present, so brand must be null rather than an empty string or the description. Unusual in real branded data but explicitly handled by the service, so it is pinned. Also carries a parenthesised uppercase householdServingFullText to prove the lowercasing keeps the parentheses, and a servingSize of 240 ml that produces two values needing rounding in opposite directions (2.4 down to 2, 79.2 down to 79).",
+      "endpoint": "/foods/search",
+      "consumedBy": "searchBrandedFoods",
+      "expectedOutcome": "accepted",
+      "expectedBrandSource": "none; brand is null",
+      "expectedUnroundedPerServing": {
+        "protein": 2.4,
+        "fat": 2.4,
+        "carbs": 12,
+        "calories": 79.2
+      },
+      "expectedBrandedFood": {
+        "id": "9000205",
+        "name": "Fixture Soup, Vegetable",
+        "brand": null,
+        "servingText": "1 cup (240 ml)",
+        "calories": 79,
+        "protein": 2,
+        "carbs": 12,
+        "fat": 2
+      },
+      "payload": {
+        "totalHits": 1,
+        "currentPage": 1,
+        "totalPages": 1,
+        "foods": [
+          {
+            "fdcId": 9000205,
+            "description": "Fixture soup, vegetable",
+            "dataType": "Branded",
+            "gtinUpc": "00000000090205",
+            "servingSize": 240,
+            "servingSizeUnit": "ml",
+            "householdServingFullText": "1 CUP (240 ML)",
+            "foodCategory": "Prepared Soups",
+            "marketCountry": "United States",
+            "publishedDate": "2023-06-14",
+            "foodNutrients": [
+              {
+                "nutrientId": 1003,
+                "nutrientName": "Protein",
+                "nutrientNumber": "203",
+                "unitName": "G",
+                "value": 1
+              },
+              {
+                "nutrientId": 1004,
+                "nutrientName": "Total lipid (fat)",
+                "nutrientNumber": "204",
+                "unitName": "G",
+                "value": 1
+              },
+              {
+                "nutrientId": 1005,
+                "nutrientName": "Carbohydrate, by difference",
+                "nutrientNumber": "205",
+                "unitName": "G",
+                "value": 5
+              },
+              {
+                "nutrientId": 1008,
+                "nutrientName": "Energy",
+                "nutrientNumber": "208",
+                "unitName": "KCAL",
+                "value": 33
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "brandedMissingCaloriesFallback": {
+      "note": "MANDATORY EDGE CASE, and the one most easily got wrong. Nutrient 208 is absent from a BRANDED result, so the 4/4/9 fallback runs on the ALREADY-SCALED per-serving macros, not on the per-100 g values. Scaling first then applying 4/4/9 gives 130; applying 4/4/9 first then scaling gives the same 130 only because servingSize is a whole multiple, so the macros were chosen to make the intermediate values exact and the working is written out below to keep the order of operations explicit for the reader.",
+      "endpoint": "/foods/search",
+      "consumedBy": "searchBrandedFoods",
+      "expectedOutcome": "accepted",
+      "expectedCaloriesFromFallback": 130,
+      "expectedCaloriesFromFallbackWorking": "scale first: protein 4 * 2 = 8, carbs 10 * 2 = 20, fat 1 * 2 = 2; then 8 * 4 = 32, 20 * 4 = 80, 2 * 9 = 18; 32 + 80 + 18 = 130 kcal per serving",
+      "expectedBrandedFood": {
+        "id": "9000206",
+        "name": "Fixture Trail Mix, Unsalted",
+        "brand": "Fixture Pantry Foods",
+        "servingText": "1 package",
+        "calories": 130,
+        "protein": 8,
+        "carbs": 20,
+        "fat": 2
+      },
+      "payload": {
+        "totalHits": 1,
+        "currentPage": 1,
+        "totalPages": 1,
+        "foods": [
+          {
+            "fdcId": 9000206,
+            "description": "Fixture trail mix, unsalted",
+            "dataType": "Branded",
+            "brandName": "Fixture Pantry Foods",
+            "gtinUpc": "00000000090206",
+            "servingSize": 200,
+            "servingSizeUnit": "g",
+            "householdServingFullText": "1 package",
+            "foodCategory": "Snack Mixes",
+            "marketCountry": "United States",
+            "publishedDate": "2023-06-14",
+            "foodNutrients": [
+              {
+                "nutrientId": 1003,
+                "nutrientName": "Protein",
+                "nutrientNumber": "203",
+                "unitName": "G",
+                "value": 4
+              },
+              {
+                "nutrientId": 1004,
+                "nutrientName": "Total lipid (fat)",
+                "nutrientNumber": "204",
+                "unitName": "G",
+                "value": 1
+              },
+              {
+                "nutrientId": 1005,
+                "nutrientName": "Carbohydrate, by difference",
+                "nutrientNumber": "205",
+                "unitName": "G",
+                "value": 10
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "genericMissingProteinDropped": {
+      "note": "MANDATORY REJECTABLE. Nutrients 204, 205 and 208 are present but 203 is absent, so protein resolves to null and the whole food is dropped by the filter. The service requires protein, fat and carbs and never substitutes zero for a missing macro, because a silent zero would publish a wrong food rather than skip an incomplete one. Calories being present must not rescue it.",
+      "endpoint": "/foods/search",
+      "consumedBy": "searchGenericFoods",
+      "expectedOutcome": "dropped",
+      "expectedDropReason": "protein (nutrient 203) is absent, so a required macro is null",
+      "expectedResultLength": 0,
+      "payload": {
+        "totalHits": 1,
+        "currentPage": 1,
+        "totalPages": 1,
+        "foods": [
+          {
+            "fdcId": 9000601,
+            "description": "Fixture sauce, incomplete record",
+            "dataType": "SR Legacy",
+            "foodNutrients": [
+              {
+                "nutrientId": 1004,
+                "nutrientName": "Total lipid (fat)",
+                "nutrientNumber": "204",
+                "unitName": "G",
+                "value": 3
+              },
+              {
+                "nutrientId": 1005,
+                "nutrientName": "Carbohydrate, by difference",
+                "nutrientNumber": "205",
+                "unitName": "G",
+                "value": 9
+              },
+              {
+                "nutrientId": 1008,
+                "nutrientName": "Energy",
+                "nutrientNumber": "208",
+                "unitName": "KCAL",
+                "value": 63
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "genericMissingFoodNutrientsKeyDropped": {
+      "note": "MANDATORY REJECTABLE. The foodNutrients key is absent entirely, so the Array.isArray guard fails before any nutrient lookup runs. Distinct from an empty array: this one never reaches the per-nutrient code at all.",
+      "endpoint": "/foods/search",
+      "consumedBy": "searchGenericFoods, and searchBrandedFoods by the same guard",
+      "expectedOutcome": "dropped",
+      "expectedDropReason": "foodNutrients is absent, so Array.isArray(food.foodNutrients) is false",
+      "expectedResultLength": 0,
+      "payload": {
+        "totalHits": 1,
+        "currentPage": 1,
+        "totalPages": 1,
+        "foods": [
+          {
+            "fdcId": 9000602,
+            "description": "Fixture spice, no nutrient block",
+            "dataType": "SR Legacy",
+            "foodCategory": "Spices and Herbs"
+          }
+        ]
+      }
+    },
+    "genericEmptyFoodNutrientsDropped": {
+      "note": "REJECTABLE. foodNutrients is an empty array, so the Array.isArray guard PASSES and the food is dropped one step later, when every nutrient lookup returns null. It exists because the two failures are different code paths and a guard written as a truthiness test on length would conflate them.",
+      "endpoint": "/foods/search",
+      "consumedBy": "searchGenericFoods",
+      "expectedOutcome": "dropped",
+      "expectedDropReason": "foodNutrients is present but empty, so every lookup returns null",
+      "expectedResultLength": 0,
+      "payload": {
+        "totalHits": 1,
+        "currentPage": 1,
+        "totalPages": 1,
+        "foods": [
+          {
+            "fdcId": 9000603,
+            "description": "Fixture spice, empty nutrient block",
+            "dataType": "SR Legacy",
+            "foodNutrients": []
+          }
+        ]
+      }
+    },
+    "genericNonNumericNutrientValueDropped": {
+      "note": "REJECTABLE. Protein is present but its value is a non-numeric string, so Number() yields NaN, the Number.isFinite check rejects it and the food is dropped. Pins that a present-but-unusable nutrient is treated as missing rather than coerced to 0 or NaN, which would otherwise propagate into a stored snapshot.",
+      "endpoint": "/foods/search",
+      "consumedBy": "searchGenericFoods",
+      "expectedOutcome": "dropped",
+      "expectedDropReason": "protein value is not finite after Number() coercion",
+      "expectedResultLength": 0,
+      "payload": {
+        "totalHits": 1,
+        "currentPage": 1,
+        "totalPages": 1,
+        "foods": [
+          {
+            "fdcId": 9000604,
+            "description": "Fixture condiment, unusable value",
+            "dataType": "SR Legacy",
+            "foodNutrients": [
+              {
+                "nutrientId": 1003,
+                "nutrientName": "Protein",
+                "nutrientNumber": "203",
+                "unitName": "G",
+                "value": "unavailable"
+              },
+              {
+                "nutrientId": 1004,
+                "nutrientName": "Total lipid (fat)",
+                "nutrientNumber": "204",
+                "unitName": "G",
+                "value": 2
+              },
+              {
+                "nutrientId": 1005,
+                "nutrientName": "Carbohydrate, by difference",
+                "nutrientNumber": "205",
+                "unitName": "G",
+                "value": 6
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "genericNonStringDescriptionDropped": {
+      "note": "REJECTABLE. description is a JSON number rather than a string, so the typeof check fails. Pins that the guard is a type check and not a truthiness check: this value is truthy, so a `!food.description` test would wrongly accept it and then store a non-string name.",
+      "endpoint": "/foods/search",
+      "consumedBy": "searchGenericFoods, and searchBrandedFoods by the same guard",
+      "expectedOutcome": "dropped",
+      "expectedDropReason": "description is not a string",
+      "expectedResultLength": 0,
+      "payload": {
+        "totalHits": 1,
+        "currentPage": 1,
+        "totalPages": 1,
+        "foods": [
+          {
+            "fdcId": 9000605,
+            "description": 9000605,
+            "dataType": "SR Legacy",
+            "foodNutrients": [
+              {
+                "nutrientId": 1003,
+                "nutrientName": "Protein",
+                "nutrientNumber": "203",
+                "unitName": "G",
+                "value": 3
+              },
+              {
+                "nutrientId": 1004,
+                "nutrientName": "Total lipid (fat)",
+                "nutrientNumber": "204",
+                "unitName": "G",
+                "value": 1
+              },
+              {
+                "nutrientId": 1005,
+                "nutrientName": "Carbohydrate, by difference",
+                "nutrientNumber": "205",
+                "unitName": "G",
+                "value": 8
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "genericZeroFdcIdDropped": {
+      "note": "REJECTABLE. fdcId is 0, which is falsy, so the !food.fdcId guard rejects it. This is the only place in the file where 0 appears as an id, and it is here precisely to pin that the guard is falsy-based: every usable sample therefore uses a non-zero id.",
+      "endpoint": "/foods/search",
+      "consumedBy": "searchGenericFoods, and searchBrandedFoods by the same guard",
+      "expectedOutcome": "dropped",
+      "expectedDropReason": "fdcId is 0 and therefore falsy",
+      "expectedResultLength": 0,
+      "payload": {
+        "totalHits": 1,
+        "currentPage": 1,
+        "totalPages": 1,
+        "foods": [
+          {
+            "fdcId": 0,
+            "description": "Fixture food, unusable identifier",
+            "dataType": "SR Legacy",
+            "foodNutrients": [
+              {
+                "nutrientId": 1003,
+                "nutrientName": "Protein",
+                "nutrientNumber": "203",
+                "unitName": "G",
+                "value": 3
+              },
+              {
+                "nutrientId": 1004,
+                "nutrientName": "Total lipid (fat)",
+                "nutrientNumber": "204",
+                "unitName": "G",
+                "value": 1
+              },
+              {
+                "nutrientId": 1005,
+                "nutrientName": "Carbohydrate, by difference",
+                "nutrientNumber": "205",
+                "unitName": "G",
+                "value": 8
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "brandedZeroServingSizeDropped": {
+      "note": "MANDATORY REJECTABLE. servingSize is 0, which is finite but fails the servingSize <= 0 guard. It must be dropped rather than scaled, because scaling by zero would publish a zero-calorie food that looks legitimate.",
+      "endpoint": "/foods/search",
+      "consumedBy": "searchBrandedFoods",
+      "expectedOutcome": "dropped",
+      "expectedDropReason": "servingSize is 0, failing the servingSize <= 0 guard",
+      "expectedResultLength": 0,
+      "payload": {
+        "totalHits": 1,
+        "currentPage": 1,
+        "totalPages": 1,
+        "foods": [
+          {
+            "fdcId": 9000607,
+            "description": "Fixture drink mix, zero serving size",
+            "dataType": "Branded",
+            "brandName": "Fixture Pantry Foods",
+            "servingSize": 0,
+            "servingSizeUnit": "g",
+            "householdServingFullText": "1 scoop",
+            "foodNutrients": [
+              {
+                "nutrientId": 1003,
+                "nutrientName": "Protein",
+                "nutrientNumber": "203",
+                "unitName": "G",
+                "value": 10
+              },
+              {
+                "nutrientId": 1004,
+                "nutrientName": "Total lipid (fat)",
+                "nutrientNumber": "204",
+                "unitName": "G",
+                "value": 2
+              },
+              {
+                "nutrientId": 1005,
+                "nutrientName": "Carbohydrate, by difference",
+                "nutrientNumber": "205",
+                "unitName": "G",
+                "value": 70
+              },
+              {
+                "nutrientId": 1008,
+                "nutrientName": "Energy",
+                "nutrientNumber": "208",
+                "unitName": "KCAL",
+                "value": 340
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "brandedNegativeServingSizeDropped": {
+      "note": "REJECTABLE. servingSize is negative, the second half of the same <= 0 guard. Separate from the zero case so a guard mistakenly written as `=== 0` fails this sample instead of silently producing negative macros.",
+      "endpoint": "/foods/search",
+      "consumedBy": "searchBrandedFoods",
+      "expectedOutcome": "dropped",
+      "expectedDropReason": "servingSize is negative, failing the servingSize <= 0 guard",
+      "expectedResultLength": 0,
+      "payload": {
+        "totalHits": 1,
+        "currentPage": 1,
+        "totalPages": 1,
+        "foods": [
+          {
+            "fdcId": 9000608,
+            "description": "Fixture spread, negative serving size",
+            "dataType": "Branded",
+            "brandName": "Fixture Pantry Foods",
+            "servingSize": -10,
+            "servingSizeUnit": "g",
+            "foodNutrients": [
+              {
+                "nutrientId": 1003,
+                "nutrientName": "Protein",
+                "nutrientNumber": "203",
+                "unitName": "G",
+                "value": 5
+              },
+              {
+                "nutrientId": 1004,
+                "nutrientName": "Total lipid (fat)",
+                "nutrientNumber": "204",
+                "unitName": "G",
+                "value": 40
+              },
+              {
+                "nutrientId": 1005,
+                "nutrientName": "Carbohydrate, by difference",
+                "nutrientNumber": "205",
+                "unitName": "G",
+                "value": 20
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "brandedNonNumericServingSizeDropped": {
+      "note": "REJECTABLE. servingSize is a non-numeric string, so Number() yields NaN and the Number.isFinite guard rejects it before the <= 0 comparison is even meaningful (NaN <= 0 is false, so a finite check that was omitted would let this through and produce NaN macros).",
+      "endpoint": "/foods/search",
+      "consumedBy": "searchBrandedFoods",
+      "expectedOutcome": "dropped",
+      "expectedDropReason": "servingSize is not finite after Number() coercion",
+      "expectedResultLength": 0,
+      "payload": {
+        "totalHits": 1,
+        "currentPage": 1,
+        "totalPages": 1,
+        "foods": [
+          {
+            "fdcId": 9000609,
+            "description": "Fixture cereal, unusable serving size",
+            "dataType": "Branded",
+            "brandName": "Fixture Pantry Foods",
+            "servingSize": "about 1 cup",
+            "servingSizeUnit": "g",
+            "foodNutrients": [
+              {
+                "nutrientId": 1003,
+                "nutrientName": "Protein",
+                "nutrientNumber": "203",
+                "unitName": "G",
+                "value": 8
+              },
+              {
+                "nutrientId": 1004,
+                "nutrientName": "Total lipid (fat)",
+                "nutrientNumber": "204",
+                "unitName": "G",
+                "value": 4
+              },
+              {
+                "nutrientId": 1005,
+                "nutrientName": "Carbohydrate, by difference",
+                "nutrientNumber": "205",
+                "unitName": "G",
+                "value": 75
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "brandedMissingServingSizeUnitDropped": {
+      "note": "REJECTABLE. servingSize is usable but servingSizeUnit is absent, so the typeof guard rejects the food. Without the unit there is no honest serving-text fallback, which is why the guard exists rather than defaulting the unit to grams.",
+      "endpoint": "/foods/search",
+      "consumedBy": "searchBrandedFoods",
+      "expectedOutcome": "dropped",
+      "expectedDropReason": "servingSizeUnit is absent, so it is not a string",
+      "expectedResultLength": 0,
+      "payload": {
+        "totalHits": 1,
+        "currentPage": 1,
+        "totalPages": 1,
+        "foods": [
+          {
+            "fdcId": 9000610,
+            "description": "Fixture sauce, no serving unit",
+            "dataType": "Branded",
+            "brandName": "Fixture Pantry Foods",
+            "servingSize": 32,
+            "foodNutrients": [
+              {
+                "nutrientId": 1003,
+                "nutrientName": "Protein",
+                "nutrientNumber": "203",
+                "unitName": "G",
+                "value": 1
+              },
+              {
+                "nutrientId": 1004,
+                "nutrientName": "Total lipid (fat)",
+                "nutrientNumber": "204",
+                "unitName": "G",
+                "value": 1
+              },
+              {
+                "nutrientId": 1005,
+                "nutrientName": "Carbohydrate, by difference",
+                "nutrientNumber": "205",
+                "unitName": "G",
+                "value": 24
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "brandedMissingCarbsDropped": {
+      "note": "REJECTABLE. A branded record that clears every serving guard but is missing carbohydrate (nutrient 205), so a required macro is null after scaling and the food is dropped. The branded path has its own copy of the required-macro rule, so it needs its own sample: a test that only covers the generic path would not notice if this branch were removed.",
+      "endpoint": "/foods/search",
+      "consumedBy": "searchBrandedFoods",
+      "expectedOutcome": "dropped",
+      "expectedDropReason": "carbs (nutrient 205) is absent, so a required macro is null",
+      "expectedResultLength": 0,
+      "payload": {
+        "totalHits": 1,
+        "currentPage": 1,
+        "totalPages": 1,
+        "foods": [
+          {
+            "fdcId": 9000611,
+            "description": "Fixture jerky, incomplete record",
+            "dataType": "Branded",
+            "brandName": "Fixture Pantry Foods",
+            "servingSize": 28,
+            "servingSizeUnit": "g",
+            "householdServingFullText": "1 oz",
+            "foodNutrients": [
+              {
+                "nutrientId": 1003,
+                "nutrientName": "Protein",
+                "nutrientNumber": "203",
+                "unitName": "G",
+                "value": 33
+              },
+              {
+                "nutrientId": 1004,
+                "nutrientName": "Total lipid (fat)",
+                "nutrientNumber": "204",
+                "unitName": "G",
+                "value": 7
+              },
+              {
+                "nutrientId": 1008,
+                "nutrientName": "Energy",
+                "nutrientNumber": "208",
+                "unitName": "KCAL",
+                "value": 220
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "emptyFoodsArray": {
+      "note": "EDGE CASE at the envelope level. A well-formed response with no matches. The service must return an empty array, not throw and not treat it as a failure, because 'no results' is an ordinary outcome of a user's search term.",
+      "endpoint": "/foods/search",
+      "consumedBy": "searchGenericFoods and searchBrandedFoods",
+      "expectedOutcome": "empty result",
+      "expectedResultLength": 0,
+      "payload": {
+        "totalHits": 0,
+        "currentPage": 1,
+        "totalPages": 0,
+        "foods": []
+      }
+    },
+    "missingFoodsKey": {
+      "note": "EDGE CASE at the envelope level, distinct from an empty array. The foods key is absent entirely, so Array.isArray(data?.foods) is false and the service substitutes an empty array. This is the shape a truncated or unexpected response takes, and it must degrade to no results rather than throwing on undefined.map.",
+      "endpoint": "/foods/search",
+      "consumedBy": "searchGenericFoods and searchBrandedFoods",
+      "expectedOutcome": "empty result",
+      "expectedResultLength": 0,
+      "payload": {
+        "totalHits": 0,
+        "currentPage": 1,
+        "totalPages": 0
+      }
+    },
+    "mixedGenericEnvelope": {
+      "note": "EDGE CASE combining accepted and dropped foods in one envelope, which is what a real search returns. Proves the filter keeps the usable foods, drops the unusable ones and preserves the vendor's order among survivors, rather than failing the whole response because one entry is incomplete. The middle food is missing protein.",
+      "endpoint": "/foods/search",
+      "consumedBy": "searchGenericFoods",
+      "expectedOutcome": "partially accepted",
+      "expectedResultLength": 2,
+      "expectedAcceptedFdcIds": [
+        "9000501",
+        "9000503"
+      ],
+      "expectedDroppedFdcIds": [
+        9000502
+      ],
+      "payload": {
+        "totalHits": 3,
+        "currentPage": 1,
+        "totalPages": 1,
+        "foods": [
+          {
+            "fdcId": 9000501,
+            "description": "Fixture fruit, raw",
+            "dataType": "Foundation",
+            "foodNutrients": [
+              {
+                "nutrientId": 1003,
+                "nutrientName": "Protein",
+                "nutrientNumber": "203",
+                "unitName": "G",
+                "value": 1
+              },
+              {
+                "nutrientId": 1004,
+                "nutrientName": "Total lipid (fat)",
+                "nutrientNumber": "204",
+                "unitName": "G",
+                "value": 0.2
+              },
+              {
+                "nutrientId": 1005,
+                "nutrientName": "Carbohydrate, by difference",
+                "nutrientNumber": "205",
+                "unitName": "G",
+                "value": 14
+              },
+              {
+                "nutrientId": 1008,
+                "nutrientName": "Energy",
+                "nutrientNumber": "208",
+                "unitName": "KCAL",
+                "value": 58
+              }
+            ]
+          },
+          {
+            "fdcId": 9000502,
+            "description": "Fixture fruit, dried, incomplete record",
+            "dataType": "SR Legacy",
+            "foodNutrients": [
+              {
+                "nutrientId": 1004,
+                "nutrientName": "Total lipid (fat)",
+                "nutrientNumber": "204",
+                "unitName": "G",
+                "value": 0.5
+              },
+              {
+                "nutrientId": 1005,
+                "nutrientName": "Carbohydrate, by difference",
+                "nutrientNumber": "205",
+                "unitName": "G",
+                "value": 75
+              }
+            ]
+          },
+          {
+            "fdcId": 9000503,
+            "description": "Fixture fruit, cooked",
+            "dataType": "Survey (FNDDS)",
+            "foodCode": "63000100",
+            "foodNutrients": [
+              {
+                "nutrientId": 1003,
+                "nutrientName": "Protein",
+                "nutrientNumber": "203",
+                "unitName": "G",
+                "value": 0.5
+              },
+              {
+                "nutrientId": 1004,
+                "nutrientName": "Total lipid (fat)",
+                "nutrientNumber": "204",
+                "unitName": "G",
+                "value": 0.1
+              },
+              {
+                "nutrientId": 1005,
+                "nutrientName": "Carbohydrate, by difference",
+                "nutrientNumber": "205",
+                "unitName": "G",
+                "value": 20
+              },
+              {
+                "nutrientId": 1008,
+                "nutrientName": "Energy",
+                "nutrientNumber": "208",
+                "unitName": "KCAL",
+                "value": 80
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "mixedBrandedEnvelope": {
+      "note": "EDGE CASE combining accepted and dropped branded foods in one envelope. The middle food has a zero servingSize. Proves the branded filter behaves like the generic one and that each survivor is scaled by its OWN servingSize rather than by the first one seen: 9000511 scales by 0.5 and 9000513 by 1.5.",
+      "endpoint": "/foods/search",
+      "consumedBy": "searchBrandedFoods",
+      "expectedOutcome": "partially accepted",
+      "expectedResultLength": 2,
+      "expectedAcceptedIds": [
+        "9000511",
+        "9000513"
+      ],
+      "expectedDroppedFdcIds": [
+        9000512
+      ],
+      "expectedBrandedFoods": [
+        {
+          "id": "9000511",
+          "name": "Fixture Cheese, Semi-soft",
+          "brand": "Fixture Dairy Co.",
+          "servingText": "1 slice",
+          "calories": 150,
+          "protein": 12,
+          "carbs": 1,
+          "fat": 11
+        },
+        {
+          "id": "9000513",
+          "name": "Fixture Bread, Whole Grain",
+          "brand": "Fixture Bakehouse",
+          "servingText": "60 g",
+          "calories": 150,
+          "protein": 6,
+          "carbs": 27,
+          "fat": 2
+        }
+      ],
+      "expectedBrandedFoodsWorking": "9000511 servingSize 50 scales by 0.5: protein 24 -> 12, fat 22 -> 11, carbs 2 -> 1, calories 300 -> 150. 9000513 servingSize 60 scales by 0.6: protein 10 -> 6, fat 3 -> 1.8 which rounds to 2, carbs 45 -> 27, calories 250 -> 150.",
+      "payload": {
+        "totalHits": 3,
+        "currentPage": 1,
+        "totalPages": 1,
+        "foods": [
+          {
+            "fdcId": 9000511,
+            "description": "Fixture cheese, semi-soft",
+            "dataType": "Branded",
+            "brandName": "Fixture Dairy Co.",
+            "servingSize": 50,
+            "servingSizeUnit": "g",
+            "householdServingFullText": "1 SLICE",
+            "foodNutrients": [
+              {
+                "nutrientId": 1003,
+                "nutrientName": "Protein",
+                "nutrientNumber": "203",
+                "unitName": "G",
+                "value": 24
+              },
+              {
+                "nutrientId": 1004,
+                "nutrientName": "Total lipid (fat)",
+                "nutrientNumber": "204",
+                "unitName": "G",
+                "value": 22
+              },
+              {
+                "nutrientId": 1005,
+                "nutrientName": "Carbohydrate, by difference",
+                "nutrientNumber": "205",
+                "unitName": "G",
+                "value": 2
+              },
+              {
+                "nutrientId": 1008,
+                "nutrientName": "Energy",
+                "nutrientNumber": "208",
+                "unitName": "KCAL",
+                "value": 300
+              }
+            ]
+          },
+          {
+            "fdcId": 9000512,
+            "description": "Fixture seasoning, zero serving size",
+            "dataType": "Branded",
+            "brandName": "Fixture Pantry Foods",
+            "servingSize": 0,
+            "servingSizeUnit": "g",
+            "foodNutrients": [
+              {
+                "nutrientId": 1003,
+                "nutrientName": "Protein",
+                "nutrientNumber": "203",
+                "unitName": "G",
+                "value": 2
+              },
+              {
+                "nutrientId": 1004,
+                "nutrientName": "Total lipid (fat)",
+                "nutrientNumber": "204",
+                "unitName": "G",
+                "value": 1
+              },
+              {
+                "nutrientId": 1005,
+                "nutrientName": "Carbohydrate, by difference",
+                "nutrientNumber": "205",
+                "unitName": "G",
+                "value": 60
+              }
+            ]
+          },
+          {
+            "fdcId": 9000513,
+            "description": "Fixture bread, whole grain",
+            "dataType": "Branded",
+            "brandName": "Fixture Bakehouse",
+            "servingSize": 60,
+            "servingSizeUnit": "g",
+            "foodNutrients": [
+              {
+                "nutrientId": 1003,
+                "nutrientName": "Protein",
+                "nutrientNumber": "203",
+                "unitName": "G",
+                "value": 10
+              },
+              {
+                "nutrientId": 1004,
+                "nutrientName": "Total lipid (fat)",
+                "nutrientNumber": "204",
+                "unitName": "G",
+                "value": 3
+              },
+              {
+                "nutrientId": 1005,
+                "nutrientName": "Carbohydrate, by difference",
+                "nutrientNumber": "205",
+                "unitName": "G",
+                "value": 45
+              },
+              {
+                "nutrientId": 1008,
+                "nutrientName": "Energy",
+                "nutrientNumber": "208",
+                "unitName": "KCAL",
+                "value": 250
+              }
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "detailResponses": {
+    "brandedDetailComplete": {
+      "note": "Happy path for the detail endpoint. Each sample in this group is a BARE food object, because the detail endpoint returns the food at the top level and the service reads data.fdcId directly rather than data.foods[0]. labelNutrients are ALREADY per serving and must not be scaled: servingSize 60 g is present but is deliberately NOT a factor in any expected number here, so a test that wrongly applies value * servingSize / 100 cannot match. The extra label keys (saturatedFat, sodium, fiber and the rest) are carried because real responses include them and their presence proves the reader selects the right four.",
+      "endpoint": "/food/{fdcId}",
+      "params": {
+        "format": "full"
+      },
+      "consumedBy": "getBrandedFood",
+      "expectedOutcome": "accepted",
+      "nutrientBasis": "per_serving",
+      "expectedBrandedFood": {
+        "id": "9000301",
+        "name": "Fixture Granola Bar, Almond",
+        "brand": "Fixture Nutrition Co.",
+        "servingText": "1 bar",
+        "calories": 230,
+        "protein": 20,
+        "carbs": 24,
+        "fat": 8
+      },
+      "expectedBrandedFoodWorking": "labelNutrients are taken as-is: calories 230, protein 20, carbohydrates 24, fat 8. servingText comes from householdServingFullText '1 BAR', trimmed and lowercased to '1 bar'.",
+      "payload": {
+        "fdcId": 9000301,
+        "description": "Fixture granola bar, almond",
+        "dataType": "Branded",
+        "foodClass": "Branded",
+        "brandName": "FIXTURE NUTRITION CO.",
+        "brandOwner": "Fixture Nutrition Holdings",
+        "brandedFoodCategory": "Nutritional Bars",
+        "gtinUpc": "00000000090301",
+        "ingredients": "FIXTURE OATS, FIXTURE ALMONDS, HONEY, FIXTURE PROTEIN BLEND.",
+        "servingSize": 60,
+        "servingSizeUnit": "g",
+        "householdServingFullText": "1 BAR",
+        "packageWeight": "12 x 60 g",
+        "marketCountry": "United States",
+        "dataSource": "LI",
+        "publicationDate": "2023-06-14",
+        "modifiedDate": "2023-05-02",
+        "availableDate": "2023-05-02",
+        "labelNutrients": {
+          "fat": {
+            "value": 8
+          },
+          "saturatedFat": {
+            "value": 1.5
+          },
+          "transFat": {
+            "value": 0
+          },
+          "cholesterol": {
+            "value": 5
+          },
+          "sodium": {
+            "value": 140
+          },
+          "carbohydrates": {
+            "value": 24
+          },
+          "fiber": {
+            "value": 5
+          },
+          "sugars": {
+            "value": 9
+          },
+          "protein": {
+            "value": 20
+          },
+          "calcium": {
+            "value": 80
+          },
+          "iron": {
+            "value": 2
+          },
+          "potassium": {
+            "value": 210
+          },
+          "calories": {
+            "value": 230
+          }
+        }
+      }
+    },
+    "detailMissingCaloriesFallback": {
+      "note": "MANDATORY EDGE CASE. labelNutrients.calories is absent, so the detail path falls back to 4*protein + 4*carbs + 9*fat on the per-serving label values. No scaling is involved at any point, which is what distinguishes this fallback from the branded-search one. The three values were chosen so the sum is an exact integer.",
+      "endpoint": "/food/{fdcId}",
+      "params": {
+        "format": "full"
+      },
+      "consumedBy": "getBrandedFood",
+      "expectedOutcome": "accepted",
+      "nutrientBasis": "per_serving",
+      "expectedCaloriesFromFallback": 222,
+      "expectedCaloriesFromFallbackWorking": "protein 12 * 4 = 48, carbohydrates 30 * 4 = 120, fat 6 * 9 = 54; 48 + 120 + 54 = 222 kcal per serving",
+      "expectedBrandedFood": {
+        "id": "9000302",
+        "name": "Fixture Oatmeal Cup, Maple",
+        "brand": "Fixture Breakfast Co.",
+        "servingText": "1 pouch",
+        "calories": 222,
+        "protein": 12,
+        "carbs": 30,
+        "fat": 6
+      },
+      "payload": {
+        "fdcId": 9000302,
+        "description": "Fixture oatmeal cup, maple",
+        "dataType": "Branded",
+        "foodClass": "Branded",
+        "brandName": "Fixture Breakfast Co.",
+        "gtinUpc": "00000000090302",
+        "ingredients": "FIXTURE ROLLED OATS, MAPLE SUGAR, SALT.",
+        "servingSize": 70,
+        "servingSizeUnit": "g",
+        "householdServingFullText": "1 pouch",
+        "marketCountry": "United States",
+        "publicationDate": "2023-06-14",
+        "labelNutrients": {
+          "fat": {
+            "value": 6
+          },
+          "carbohydrates": {
+            "value": 30
+          },
+          "fiber": {
+            "value": 4
+          },
+          "protein": {
+            "value": 12
+          }
+        }
+      }
+    },
+    "detailMissingProteinReturnsNull": {
+      "note": "MANDATORY EDGE CASE. labelNutrients is present and carries carbohydrates, fat and calories, but protein is absent, so the service returns null for the WHOLE food rather than a record with a zero or missing macro. Calories being present must not rescue it. Note the outcome differs in kind from the search paths: there a bad food is filtered out of a list, here the single requested food resolves to null and the controller turns that into a 404.",
+      "endpoint": "/food/{fdcId}",
+      "params": {
+        "format": "full"
+      },
+      "consumedBy": "getBrandedFood",
+      "expectedOutcome": "null",
+      "expectedNullReason": "labelNutrients.protein is absent, so a required macro is null",
+      "payload": {
+        "fdcId": 9000303,
+        "description": "Fixture frozen entree, incomplete label",
+        "dataType": "Branded",
+        "foodClass": "Branded",
+        "brandName": "Fixture Frozen Foods",
+        "gtinUpc": "00000000090303",
+        "servingSize": 255,
+        "servingSizeUnit": "g",
+        "householdServingFullText": "1 tray",
+        "marketCountry": "United States",
+        "publicationDate": "2023-06-14",
+        "labelNutrients": {
+          "fat": {
+            "value": 14
+          },
+          "carbohydrates": {
+            "value": 48
+          },
+          "sodium": {
+            "value": 820
+          },
+          "calories": {
+            "value": 380
+          }
+        }
+      }
+    },
+    "detailEmptyLabelNutrientsReturnsNull": {
+      "note": "EDGE CASE observed in real branded data, not contrived: a branded detail record whose labelNutrients object is present but completely empty. Every lookup resolves to undefined, so the service returns null. Worth its own sample because a guard written as `if (!data.labelNutrients)` would pass this object through and then read undefined.value.",
+      "endpoint": "/food/{fdcId}",
+      "params": {
+        "format": "full"
+      },
+      "consumedBy": "getBrandedFood",
+      "expectedOutcome": "null",
+      "expectedNullReason": "labelNutrients is present but empty, so every macro lookup is undefined",
+      "payload": {
+        "fdcId": 9000304,
+        "description": "Fixture sparkling water, lime",
+        "dataType": "Branded",
+        "foodClass": "Branded",
+        "brandName": "Fixture Beverage Group",
+        "gtinUpc": "00000000090304",
+        "servingSize": 355,
+        "servingSizeUnit": "ml",
+        "householdServingFullText": "1 can",
+        "marketCountry": "United States",
+        "publicationDate": "2023-06-14",
+        "labelNutrients": {}
+      }
+    },
+    "detailNonNumericLabelValueReturnsNull": {
+      "note": "EDGE CASE. Every required key is present, but protein's value is a non-numeric string, so Number() yields NaN, the finite check rejects it and the food resolves to null. Pins that an unusable value is treated as missing rather than coerced, so NaN can never reach a stored snapshot or a rounded response field.",
+      "endpoint": "/food/{fdcId}",
+      "params": {
+        "format": "full"
+      },
+      "consumedBy": "getBrandedFood",
+      "expectedOutcome": "null",
+      "expectedNullReason": "labelNutrients.protein.value is not finite after Number() coercion",
+      "payload": {
+        "fdcId": 9000305,
+        "description": "Fixture sauce, unusable label value",
+        "dataType": "Branded",
+        "foodClass": "Branded",
+        "brandName": "Fixture Pantry Foods",
+        "gtinUpc": "00000000090305",
+        "servingSize": 30,
+        "servingSizeUnit": "g",
+        "householdServingFullText": "2 tbsp",
+        "marketCountry": "United States",
+        "publicationDate": "2023-06-14",
+        "labelNutrients": {
+          "fat": {
+            "value": 0.5
+          },
+          "carbohydrates": {
+            "value": 8
+          },
+          "protein": {
+            "value": "not measured"
+          },
+          "calories": {
+            "value": 35
+          }
+        }
+      }
+    },
+    "detailLabelNutrientWithoutValueMemberReturnsNull": {
+      "note": "EDGE CASE, distinct from the non-numeric one above. The carbohydrates key exists but the object has no `value` member at all, so entry?.value is undefined and Number(undefined) is NaN. Separate sample because the two failures arrive by different routes (absent member versus unusable member) and a reader debugging one will want the other to exist.",
+      "endpoint": "/food/{fdcId}",
+      "params": {
+        "format": "full"
+      },
+      "consumedBy": "getBrandedFood",
+      "expectedOutcome": "null",
+      "expectedNullReason": "labelNutrients.carbohydrates has no value member",
+      "payload": {
+        "fdcId": 9000306,
+        "description": "Fixture dressing, malformed label entry",
+        "dataType": "Branded",
+        "foodClass": "Branded",
+        "brandName": "Fixture Pantry Foods",
+        "gtinUpc": "00000000090306",
+        "servingSize": 30,
+        "servingSizeUnit": "g",
+        "householdServingFullText": "2 tbsp",
+        "marketCountry": "United States",
+        "publicationDate": "2023-06-14",
+        "labelNutrients": {
+          "fat": {
+            "value": 12
+          },
+          "carbohydrates": {},
+          "protein": {
+            "value": 1
+          },
+          "calories": {
+            "value": 120
+          }
+        }
+      }
+    },
+    "detailServingTextFromServingSize": {
+      "note": "EDGE CASE for the second serving-text branch. householdServingFullText is absent, so servingText is built from servingSize and servingSizeUnit. The unit is uppercase 'ML' so the lowercasing is observable, giving '240 ml'. This sample also carries neither brandName nor brandOwner, so it pins the detail path's brand-null branch at the same time.",
+      "endpoint": "/food/{fdcId}",
+      "params": {
+        "format": "full"
+      },
+      "consumedBy": "getBrandedFood",
+      "expectedOutcome": "accepted",
+      "nutrientBasis": "per_serving",
+      "expectedServingTextSource": "servingSize and servingSizeUnit fallback",
+      "expectedBrandedFood": {
+        "id": "9000307",
+        "name": "Fixture Oat Beverage, Unsweetened",
+        "brand": null,
+        "servingText": "240 ml",
+        "calories": 130,
+        "protein": 8,
+        "carbs": 12,
+        "fat": 5
+      },
+      "payload": {
+        "fdcId": 9000307,
+        "description": "Fixture oat beverage, unsweetened",
+        "dataType": "Branded",
+        "foodClass": "Branded",
+        "gtinUpc": "00000000090307",
+        "servingSize": 240,
+        "servingSizeUnit": "ML",
+        "marketCountry": "United States",
+        "publicationDate": "2023-06-14",
+        "labelNutrients": {
+          "fat": {
+            "value": 5
+          },
+          "carbohydrates": {
+            "value": 12
+          },
+          "protein": {
+            "value": 8
+          },
+          "calories": {
+            "value": 130
+          }
+        }
+      }
+    },
+    "detailBlankHouseholdServingFallsBackToServingSize": {
+      "note": "EDGE CASE. householdServingFullText is present but whitespace-only, so the trim() truthiness check must reject it and fall through to the servingSize branch, yielding '45 g'. A guard that tested the raw string for truthiness would return a blank servingText here.",
+      "endpoint": "/food/{fdcId}",
+      "params": {
+        "format": "full"
+      },
+      "consumedBy": "getBrandedFood",
+      "expectedOutcome": "accepted",
+      "nutrientBasis": "per_serving",
+      "expectedServingTextSource": "servingSize fallback, because householdServingFullText trims to empty",
+      "expectedBrandedFood": {
+        "id": "9000308",
+        "name": "Fixture Nut Butter, Smooth",
+        "brand": "Fixture Pantry Foods",
+        "servingText": "45 g",
+        "calories": 270,
+        "protein": 10,
+        "carbs": 8,
+        "fat": 23
+      },
+      "payload": {
+        "fdcId": 9000308,
+        "description": "Fixture nut butter, smooth",
+        "dataType": "Branded",
+        "foodClass": "Branded",
+        "brandName": "Fixture Pantry Foods",
+        "gtinUpc": "00000000090308",
+        "servingSize": 45,
+        "servingSizeUnit": "G",
+        "householdServingFullText": "   ",
+        "marketCountry": "United States",
+        "publicationDate": "2023-06-14",
+        "labelNutrients": {
+          "fat": {
+            "value": 23
+          },
+          "carbohydrates": {
+            "value": 8
+          },
+          "protein": {
+            "value": 10
+          },
+          "calories": {
+            "value": 270
+          }
+        }
+      }
+    },
+    "detailServingSizeWithoutUnitServingTextNull": {
+      "note": "EDGE CASE. servingSize is finite but servingSizeUnit is absent, so the second branch's typeof check fails and servingText resolves to null. Unlike the branded SEARCH path, a missing unit does NOT reject the food here: the record is still returned, with servingText null. That asymmetry between the two paths is the point of this sample.",
+      "endpoint": "/food/{fdcId}",
+      "params": {
+        "format": "full"
+      },
+      "consumedBy": "getBrandedFood",
+      "expectedOutcome": "accepted",
+      "nutrientBasis": "per_serving",
+      "expectedServingTextSource": "none; servingText is null",
+      "expectedBrandedFood": {
+        "id": "9000309",
+        "name": "Fixture Soup Concentrate, Tomato",
+        "brand": "Fixture Pantry Foods",
+        "servingText": null,
+        "calories": 90,
+        "protein": 2,
+        "carbs": 18,
+        "fat": 1
+      },
+      "payload": {
+        "fdcId": 9000309,
+        "description": "Fixture soup concentrate, tomato",
+        "dataType": "Branded",
+        "foodClass": "Branded",
+        "brandName": "Fixture Pantry Foods",
+        "gtinUpc": "00000000090309",
+        "servingSize": 126,
+        "marketCountry": "United States",
+        "publicationDate": "2023-06-14",
+        "labelNutrients": {
+          "fat": {
+            "value": 1
+          },
+          "carbohydrates": {
+            "value": 18
+          },
+          "protein": {
+            "value": 2
+          },
+          "calories": {
+            "value": 90
+          }
+        }
+      }
+    },
+    "detailNoServingFieldsServingTextNull": {
+      "note": "EDGE CASE. Neither householdServingFullText nor servingSize nor servingSizeUnit is present, so both serving-text branches fail and servingText is null. Distinct from the sample above, where servingSize exists but the unit does not: here Number(undefined) is NaN and the finite check is what fails. The record is still returned, because serving text is presentation and the macros are what the caller needs.",
+      "endpoint": "/food/{fdcId}",
+      "params": {
+        "format": "full"
+      },
+      "consumedBy": "getBrandedFood",
+      "expectedOutcome": "accepted",
+      "nutrientBasis": "per_serving",
+      "expectedServingTextSource": "none; servingText is null",
+      "expectedBrandedFood": {
+        "id": "9000310",
+        "name": "Fixture Seasoning Blend, Salt-free",
+        "brand": "Fixture Spice Works",
+        "servingText": null,
+        "calories": 5,
+        "protein": 1,
+        "carbs": 1,
+        "fat": 0
+      },
+      "expectedBrandedFoodWorking": "calories 5 is taken from labelNutrients and not derived; the 4/4/9 fallback would have produced 8, so this sample also pins that a present calories value wins over the fallback.",
+      "payload": {
+        "fdcId": 9000310,
+        "description": "Fixture seasoning blend, salt-free",
+        "dataType": "Branded",
+        "foodClass": "Branded",
+        "brandName": "Fixture Spice Works",
+        "gtinUpc": "00000000090310",
+        "marketCountry": "United States",
+        "publicationDate": "2023-06-14",
+        "labelNutrients": {
+          "fat": {
+            "value": 0
+          },
+          "carbohydrates": {
+            "value": 1
+          },
+          "protein": {
+            "value": 1
+          },
+          "calories": {
+            "value": 5
+          }
+        }
+      }
+    },
+    "detailMissingFdcIdReturnsNull": {
+      "note": "EDGE CASE at the envelope level. The response body has no fdcId, which is the shape an error body or a truncated response takes. The service returns null before touching labelNutrients. No fdcId is assigned to this sample for obvious reasons.",
+      "endpoint": "/food/{fdcId}",
+      "params": {
+        "format": "full"
+      },
+      "consumedBy": "getBrandedFood",
+      "expectedOutcome": "null",
+      "expectedNullReason": "fdcId is absent from the response",
+      "payload": {
+        "description": "Fixture food, no identifier",
+        "dataType": "Branded",
+        "labelNutrients": {
+          "fat": {
+            "value": 1
+          },
+          "carbohydrates": {
+            "value": 1
+          },
+          "protein": {
+            "value": 1
+          },
+          "calories": {
+            "value": 17
+          }
+        }
+      }
+    },
+    "detailNonStringDescriptionReturnsNull": {
+      "note": "EDGE CASE. fdcId is usable but description is a JSON number, so the typeof guard fails and the food resolves to null. Pairs with the search-path sample of the same shape, because the two paths each carry their own copy of this guard.",
+      "endpoint": "/food/{fdcId}",
+      "params": {
+        "format": "full"
+      },
+      "consumedBy": "getBrandedFood",
+      "expectedOutcome": "null",
+      "expectedNullReason": "description is not a string",
+      "payload": {
+        "fdcId": 9000311,
+        "description": 9000311,
+        "dataType": "Branded",
+        "labelNutrients": {
+          "fat": {
+            "value": 1
+          },
+          "carbohydrates": {
+            "value": 1
+          },
+          "protein": {
+            "value": 1
+          },
+          "calories": {
+            "value": 17
+          }
+        }
+      }
+    },
+    "genericDetailWithoutLabelNutrientsReturnsNull": {
+      "note": "EDGE CASE and a structural reference in one. Generic detail records (Foundation, SR Legacy, Survey (FNDDS)) carry NO labelNutrients key at all, because labelNutrients is a Branded-only field; asking getBrandedFood for a generic id therefore returns null. That is correct rather than a bug: a generic food has no label to read. This sample is also the clearest illustration of the detail foodNutrients shape the catalog import consumes, so read it alongside the portionSamples group: the selector is nutrient.number and the number lives in `amount`, NOT nutrientNumber and `value` as in search results. The first entry is a real-style nutrient label-group row with isNutrientLabel true and NO `amount` member, which an import must skip rather than coerce to zero.",
+      "endpoint": "/food/{fdcId}",
+      "params": {
+        "format": "full"
+      },
+      "consumedBy": "getBrandedFood returns null; getFoodDetail in catalog-import-usda.ts consumes the same payload successfully",
+      "expectedOutcome": "null",
+      "expectedNullReason": "labelNutrients is absent entirely, as it is on every generic record",
+      "expectedImportPer100g": {
+        "protein": 3.1,
+        "fat": 0.3,
+        "carbs": 3.3,
+        "calories": 22
+      },
+      "expectedImportPer100gNote": "Read from foodNutrients by nutrient.number and `amount`. These are per 100 g, not per serving; the import pairs them with a gram weight from foodPortions.",
+      "payload": {
+        "fdcId": 9000312,
+        "description": "Fixture vegetable, florets, raw",
+        "dataType": "SR Legacy",
+        "foodClass": "FinalFood",
+        "foodCategory": {
+          "id": 11,
+          "code": "1100",
+          "description": "Vegetables and Vegetable Products"
+        },
+        "ndbNumber": "99002",
+        "publicationDate": "2019-04-01",
+        "isHistoricalReference": true,
+        "foodNutrients": [
+          {
+            "type": "FoodNutrient",
+            "nutrient": {
+              "id": 2045,
+              "number": "951",
+              "name": "Proximates",
+              "rank": 50,
+              "isNutrientLabel": true,
+              "indentLevel": 0,
+              "numberOfDecimals": 3,
+              "unitName": "g"
+            }
+          },
+          {
+            "type": "FoodNutrient",
+            "nutrient": {
+              "id": 1003,
+              "number": "203",
+              "name": "Protein",
+              "rank": 600,
+              "unitName": "g"
+            },
+            "amount": 3.1
+          },
+          {
+            "type": "FoodNutrient",
+            "nutrient": {
+              "id": 1004,
+              "number": "204",
+              "name": "Total lipid (fat)",
+              "rank": 800,
+              "unitName": "g"
+            },
+            "amount": 0.3
+          },
+          {
+            "type": "FoodNutrient",
+            "nutrient": {
+              "id": 1005,
+              "number": "205",
+              "name": "Carbohydrate, by difference",
+              "rank": 1110,
+              "unitName": "g"
+            },
+            "amount": 3.3
+          },
+          {
+            "type": "FoodNutrient",
+            "nutrient": {
+              "id": 1008,
+              "number": "208",
+              "name": "Energy",
+              "rank": 300,
+              "unitName": "kcal"
+            },
+            "amount": 22
+          }
+        ],
+        "foodPortions": [
+          {
+            "id": 9100001,
+            "gramWeight": 91,
+            "sequenceNumber": 1,
+            "amount": 1,
+            "modifier": "cup, chopped",
+            "measureUnit": {
+              "id": 9999,
+              "name": "undetermined",
+              "abbreviation": "undetermined"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "portionSamples": {
+    "groupNote": "Detail-shaped samples whose point is foodPortions. No shipped function reads foodPortions today: the running API works from servingSize and labelNutrients. These exist for the new getFoodDetail and catalog-import-usda.ts path, which reads per-100 g values from foodNutrients and gram weights from here. The per-dataset label differences are load-bearing and are described in readingGuide.portionLabelByDataset; the resolution rules these samples are designed to exercise (amount must match, gram weight must be greater than zero, label equality beats containment, lowest gram weight breaks a tie) belong to usda-manifest.v1.json portionResolution, and the expected* fields below restate them per sample rather than inventing new ones.",
+    "fnddsPortions": {
+      "note": "Survey (FNDDS) portions. The label is `portionDescription` and the count is EMBEDDED at the start of that string, so an importer must parse the amount off the text; there is no `amount` field on an FNDDS portion at all. `modifier` here is a numeric measure code, never a label, which is the trap this sample exists to pin: an importer that reads `modifier` as the label for every dataset produces '10205' as a portion name. The last portion is a real-style 'Quantity not specified' row with no leading numeric amount, which the amount parser must handle without throwing.",
+      "endpoint": "/food/{fdcId}",
+      "params": {
+        "format": "full"
+      },
+      "consumedBy": "getFoodDetail in catalog-import-usda.ts",
+      "expectedOutcome": "portions resolved",
+      "labelField": "portionDescription",
+      "amountSource": "embedded at the start of portionDescription; there is no amount field",
+      "expectedPortionResolution": [
+        {
+          "selector": {
+            "amount": 1,
+            "portionDescription": "1 cup, sliced"
+          },
+          "expectedGramWeight": 70
+        },
+        {
+          "selector": {
+            "amount": 1,
+            "portionDescription": "1 piece"
+          },
+          "expectedGramWeight": 10
+        }
+      ],
+      "expectedUnparseableAmountPortions": [
+        "Quantity not specified"
+      ],
+      "payload": {
+        "fdcId": 9000401,
+        "description": "Fixture vegetable, cooked, from fresh",
+        "dataType": "Survey (FNDDS)",
+        "foodClass": "Survey",
+        "foodCode": "75000100",
+        "publicationDate": "2022-10-28",
+        "foodNutrients": [
+          {
+            "type": "FoodNutrient",
+            "nutrient": {
+              "id": 1003,
+              "number": "203",
+              "name": "Protein",
+              "rank": 600,
+              "unitName": "g"
+            },
+            "amount": 2.4
+          },
+          {
+            "type": "FoodNutrient",
+            "nutrient": {
+              "id": 1004,
+              "number": "204",
+              "name": "Total lipid (fat)",
+              "rank": 800,
+              "unitName": "g"
+            },
+            "amount": 0.4
+          },
+          {
+            "type": "FoodNutrient",
+            "nutrient": {
+              "id": 1005,
+              "number": "205",
+              "name": "Carbohydrate, by difference",
+              "rank": 1110,
+              "unitName": "g"
+            },
+            "amount": 7
+          },
+          {
+            "type": "FoodNutrient",
+            "nutrient": {
+              "id": 1008,
+              "number": "208",
+              "name": "Energy",
+              "rank": 300,
+              "unitName": "kcal"
+            },
+            "amount": 35
+          }
+        ],
+        "foodPortions": [
+          {
+            "id": 9100101,
+            "measureUnit": {
+              "id": 9999,
+              "name": "undetermined",
+              "abbreviation": "undetermined"
+            },
+            "modifier": "10205",
+            "gramWeight": 70,
+            "portionDescription": "1 cup, sliced",
+            "sequenceNumber": 1
+          },
+          {
+            "id": 9100102,
+            "measureUnit": {
+              "id": 9999,
+              "name": "undetermined",
+              "abbreviation": "undetermined"
+            },
+            "modifier": "61667",
+            "gramWeight": 10,
+            "portionDescription": "1 piece",
+            "sequenceNumber": 2
+          },
+          {
+            "id": 9100103,
+            "measureUnit": {
+              "id": 9999,
+              "name": "undetermined",
+              "abbreviation": "undetermined"
+            },
+            "modifier": "90000",
+            "gramWeight": 45,
+            "portionDescription": "Quantity not specified",
+            "sequenceNumber": 3
+          }
+        ]
+      }
+    },
+    "srLegacyPortions": {
+      "note": "SR Legacy portions. The label is `modifier` and the count is in its own `amount` field, so nothing has to be parsed out of text. measureUnit is USDA's 'undetermined' placeholder (id 9999) because this dataset keeps the unit inside the modifier text. The 0.5-amount row exists so the amount-must-match rule is exercised in both directions: it is excluded when resolving an amount of 1 and selected when resolving an amount of 0.5.",
+      "endpoint": "/food/{fdcId}",
+      "params": {
+        "format": "full"
+      },
+      "consumedBy": "getFoodDetail in catalog-import-usda.ts",
+      "expectedOutcome": "portions resolved",
+      "labelField": "modifier",
+      "amountSource": "the separate amount field",
+      "expectedPortionResolution": [
+        {
+          "selector": {
+            "amount": 1,
+            "modifier": "cup, pieces or slices"
+          },
+          "expectedGramWeight": 70
+        },
+        {
+          "selector": {
+            "amount": 1,
+            "modifier": "small"
+          },
+          "expectedGramWeight": 10
+        },
+        {
+          "selector": {
+            "amount": 0.5,
+            "modifier": "cup, pieces or slices"
+          },
+          "expectedGramWeight": 35
+        }
+      ],
+      "payload": {
+        "fdcId": 9000402,
+        "description": "Fixture vegetable, sliced, raw",
+        "dataType": "SR Legacy",
+        "foodClass": "FinalFood",
+        "ndbNumber": "99003",
+        "publicationDate": "2019-04-01",
+        "isHistoricalReference": true,
+        "foodNutrients": [
+          {
+            "type": "FoodNutrient",
+            "nutrient": {
+              "id": 1003,
+              "number": "203",
+              "name": "Protein",
+              "rank": 600,
+              "unitName": "g"
+            },
+            "amount": 3.1
+          },
+          {
+            "type": "FoodNutrient",
+            "nutrient": {
+              "id": 1004,
+              "number": "204",
+              "name": "Total lipid (fat)",
+              "rank": 800,
+              "unitName": "g"
+            },
+            "amount": 0.3
+          },
+          {
+            "type": "FoodNutrient",
+            "nutrient": {
+              "id": 1005,
+              "number": "205",
+              "name": "Carbohydrate, by difference",
+              "rank": 1110,
+              "unitName": "g"
+            },
+            "amount": 3.3
+          },
+          {
+            "type": "FoodNutrient",
+            "nutrient": {
+              "id": 1008,
+              "number": "208",
+              "name": "Energy",
+              "rank": 300,
+              "unitName": "kcal"
+            },
+            "amount": 22
+          }
+        ],
+        "foodPortions": [
+          {
+            "id": 9100201,
+            "gramWeight": 10,
+            "sequenceNumber": 6,
+            "amount": 1,
+            "modifier": "small",
+            "measureUnit": {
+              "id": 9999,
+              "name": "undetermined",
+              "abbreviation": "undetermined"
+            }
+          },
+          {
+            "id": 9100202,
+            "gramWeight": 70,
+            "sequenceNumber": 1,
+            "amount": 1,
+            "modifier": "cup, pieces or slices",
+            "measureUnit": {
+              "id": 9999,
+              "name": "undetermined",
+              "abbreviation": "undetermined"
+            }
+          },
+          {
+            "id": 9100203,
+            "gramWeight": 35,
+            "sequenceNumber": 2,
+            "amount": 0.5,
+            "modifier": "cup, pieces or slices",
+            "measureUnit": {
+              "id": 9999,
+              "name": "undetermined",
+              "abbreviation": "undetermined"
+            }
+          }
+        ]
+      }
+    },
+    "foundationPortions": {
+      "note": "Foundation portions, the third and most different shape. Here measureUnit.name is a REAL unit ('cup', 'RACC') rather than the 'undetermined' placeholder, the count is in `amount`, and any qualifier sits in `modifier` or `portionDescription`. The second row has a unit and amount but no qualifier at all, so a resolver must not require one. Both rows carry sequenceNumber 1, which is faithful to real Foundation records and is why sequenceNumber must never be used as a unique key or a sort tiebreaker.",
+      "endpoint": "/food/{fdcId}",
+      "params": {
+        "format": "full"
+      },
+      "consumedBy": "getFoodDetail in catalog-import-usda.ts",
+      "expectedOutcome": "portions resolved",
+      "labelField": "measureUnit.name plus any modifier or portionDescription qualifier",
+      "amountSource": "the separate amount field",
+      "expectedPortionResolution": [
+        {
+          "selector": {
+            "amount": 1,
+            "measureUnitName": "cup",
+            "qualifier": "chopped"
+          },
+          "expectedGramWeight": 76
+        },
+        {
+          "selector": {
+            "amount": 1,
+            "measureUnitName": "RACC",
+            "qualifier": null
+          },
+          "expectedGramWeight": 85
+        }
+      ],
+      "expectedDuplicateSequenceNumbers": true,
+      "payload": {
+        "fdcId": 9000403,
+        "description": "Fixture vegetable, reference sample, raw",
+        "dataType": "Foundation",
+        "foodClass": "FinalFood",
+        "publicationDate": "2024-04-18",
+        "foodNutrients": [
+          {
+            "type": "FoodNutrient",
+            "nutrient": {
+              "id": 1003,
+              "number": "203",
+              "name": "Protein",
+              "rank": 600,
+              "unitName": "g"
+            },
+            "amount": 2.8
+          },
+          {
+            "type": "FoodNutrient",
+            "nutrient": {
+              "id": 1004,
+              "number": "204",
+              "name": "Total lipid (fat)",
+              "rank": 800,
+              "unitName": "g"
+            },
+            "amount": 0.4
+          },
+          {
+            "type": "FoodNutrient",
+            "nutrient": {
+              "id": 1005,
+              "number": "205",
+              "name": "Carbohydrate, by difference",
+              "rank": 1110,
+              "unitName": "g"
+            },
+            "amount": 6.2
+          },
+          {
+            "type": "FoodNutrient",
+            "nutrient": {
+              "id": 1008,
+              "number": "208",
+              "name": "Energy",
+              "rank": 300,
+              "unitName": "kcal"
+            },
+            "amount": 34
+          }
+        ],
+        "foodPortions": [
+          {
+            "id": 9100301,
+            "dataPoints": 12,
+            "gramWeight": 76,
+            "sequenceNumber": 1,
+            "amount": 1,
+            "modifier": "chopped",
+            "minDateAcquired": "8/5/2001",
+            "minYearAcquired": 2001,
+            "measureUnit": {
+              "id": 1000,
+              "name": "cup",
+              "abbreviation": "cup"
+            }
+          },
+          {
+            "id": 9100302,
+            "dataPoints": 0,
+            "gramWeight": 85,
+            "sequenceNumber": 1,
+            "amount": 1,
+            "measureUnit": {
+              "id": 1121,
+              "name": "RACC",
+              "abbreviation": "RACC"
+            }
+          }
+        ]
+      }
+    },
+    "multiplePortionsAmbiguousLabel": {
+      "note": "The default-portion selector's hard case, and the reason the resolution rules are written down rather than assumed. Six portions on one food exercise every clause at once: two rows share the label 'oz' with different gram weights (the real 28 versus 28.35 situation), so the lowest-gram-weight tiebreaker decides; 'medium' and 'medium, sliced' both contain the string 'medium', so label EQUALITY must beat containment even though the containment match has a lower gram weight, which is what makes the tiebreaker safe; one row has the right label but the wrong amount; and one row has a zero gram weight and must be excluded before any label comparison happens. A resolver that is merely 'lowest gram weight wins' returns 62 for 'medium' and is wrong.",
+      "endpoint": "/food/{fdcId}",
+      "params": {
+        "format": "full"
+      },
+      "consumedBy": "getFoodDetail in catalog-import-usda.ts",
+      "expectedOutcome": "portions resolved",
+      "labelField": "modifier",
+      "amountSource": "the separate amount field",
+      "expectedPortionResolution": [
+        {
+          "selector": {
+            "amount": 1,
+            "modifier": "oz"
+          },
+          "expectedGramWeight": 28,
+          "expectedRule": "two equality matches at 28 and 28.35; the lowest gram weight wins"
+        },
+        {
+          "selector": {
+            "amount": 1,
+            "modifier": "medium"
+          },
+          "expectedGramWeight": 118,
+          "expectedRule": "equality beats containment, so 'medium' at 118 wins over 'medium, sliced' at 62 despite the lower weight"
+        },
+        {
+          "selector": {
+            "amount": 0.5,
+            "modifier": "oz"
+          },
+          "expectedGramWeight": 14,
+          "expectedRule": "only the portion whose amount equals 0.5 is considered"
+        },
+        {
+          "selector": {
+            "amount": 1,
+            "modifier": "cup"
+          },
+          "expectedGramWeight": null,
+          "expectedRule": "the only 'cup' row has a zero gram weight and is excluded, so the selector resolves to nothing",
+          "expectedValidationOutcome": {
+            "publicationStatus": "quarantined",
+            "check": "missing_gram_weight"
+          }
+        }
+      ],
+      "payload": {
+        "fdcId": 9000404,
+        "description": "Fixture produce, whole, raw",
+        "dataType": "SR Legacy",
+        "foodClass": "FinalFood",
+        "ndbNumber": "99004",
+        "publicationDate": "2019-04-01",
+        "foodNutrients": [
+          {
+            "type": "FoodNutrient",
+            "nutrient": {
+              "id": 1003,
+              "number": "203",
+              "name": "Protein",
+              "rank": 600,
+              "unitName": "g"
+            },
+            "amount": 0.9
+          },
+          {
+            "type": "FoodNutrient",
+            "nutrient": {
+              "id": 1004,
+              "number": "204",
+              "name": "Total lipid (fat)",
+              "rank": 800,
+              "unitName": "g"
+            },
+            "amount": 0.2
+          },
+          {
+            "type": "FoodNutrient",
+            "nutrient": {
+              "id": 1005,
+              "number": "205",
+              "name": "Carbohydrate, by difference",
+              "rank": 1110,
+              "unitName": "g"
+            },
+            "amount": 9.6
+          },
+          {
+            "type": "FoodNutrient",
+            "nutrient": {
+              "id": 1008,
+              "number": "208",
+              "name": "Energy",
+              "rank": 300,
+              "unitName": "kcal"
+            },
+            "amount": 41
+          }
+        ],
+        "foodPortions": [
+          {
+            "id": 9100401,
+            "gramWeight": 28.35,
+            "sequenceNumber": 1,
+            "amount": 1,
+            "modifier": "oz",
+            "measureUnit": {
+              "id": 9999,
+              "name": "undetermined",
+              "abbreviation": "undetermined"
+            }
+          },
+          {
+            "id": 9100402,
+            "gramWeight": 28,
+            "sequenceNumber": 2,
+            "amount": 1,
+            "modifier": "oz",
+            "measureUnit": {
+              "id": 9999,
+              "name": "undetermined",
+              "abbreviation": "undetermined"
+            }
+          },
+          {
+            "id": 9100403,
+            "gramWeight": 118,
+            "sequenceNumber": 3,
+            "amount": 1,
+            "modifier": "medium",
+            "measureUnit": {
+              "id": 9999,
+              "name": "undetermined",
+              "abbreviation": "undetermined"
+            }
+          },
+          {
+            "id": 9100404,
+            "gramWeight": 62,
+            "sequenceNumber": 4,
+            "amount": 1,
+            "modifier": "medium, sliced",
+            "measureUnit": {
+              "id": 9999,
+              "name": "undetermined",
+              "abbreviation": "undetermined"
+            }
+          },
+          {
+            "id": 9100405,
+            "gramWeight": 14,
+            "sequenceNumber": 5,
+            "amount": 0.5,
+            "modifier": "oz",
+            "measureUnit": {
+              "id": 9999,
+              "name": "undetermined",
+              "abbreviation": "undetermined"
+            }
+          },
+          {
+            "id": 9100406,
+            "gramWeight": 0,
+            "sequenceNumber": 6,
+            "amount": 1,
+            "modifier": "cup",
+            "measureUnit": {
+              "id": 9999,
+              "name": "undetermined",
+              "abbreviation": "undetermined"
+            }
+          }
+        ]
+      }
+    },
+    "portionsWithoutUsableGramWeight": {
+      "note": "MANDATORY EDGE CASE, and the only way the quarantine branch can be tested. Three portions are present and each is unusable in a different way: the first has no gramWeight member at all, the second has an explicit 0, and the third has a non-numeric string. None yields a gram weight, so no default portion can be resolved. The candidate must be QUARANTINED with check missing_gram_weight rather than published, because publishing it would require inventing a gram weight, and an invented gram weight is a fabricated number that would then propagate into recipe nutrition and grocery quantities. The three unusable shapes are separate on purpose: a guard written as `if (!p.gramWeight)` catches the first two and a guard written as `p.gramWeight > 0` on a string catches none of them.",
+      "endpoint": "/food/{fdcId}",
+      "params": {
+        "format": "full"
+      },
+      "consumedBy": "getFoodDetail in catalog-import-usda.ts",
+      "expectedOutcome": "quarantined",
+      "expectedPortionResolution": [],
+      "expectedValidationOutcome": {
+        "publicationStatus": "quarantined",
+        "check": "missing_gram_weight",
+        "checkTier": "quarantine",
+        "reason": "no foodPortions entry yields a numeric gram weight greater than zero, so the default portion cannot be sourced",
+        "contractSource": "coverage-plan.v1.json nutritionBasisRule.perServingOnlyWithoutGramWeightCheck and quarantineChecks; usda-manifest.v1.json portionResolution.selectorNotWeight"
+      },
+      "expectedNotPublished": true,
+      "payload": {
+        "fdcId": 9000405,
+        "description": "Fixture prepared dish, portion weights unavailable",
+        "dataType": "Survey (FNDDS)",
+        "foodClass": "Survey",
+        "foodCode": "27000100",
+        "publicationDate": "2022-10-28",
+        "foodNutrients": [
+          {
+            "type": "FoodNutrient",
+            "nutrient": {
+              "id": 1003,
+              "number": "203",
+              "name": "Protein",
+              "rank": 600,
+              "unitName": "g"
+            },
+            "amount": 11
+          },
+          {
+            "type": "FoodNutrient",
+            "nutrient": {
+              "id": 1004,
+              "number": "204",
+              "name": "Total lipid (fat)",
+              "rank": 800,
+              "unitName": "g"
+            },
+            "amount": 9
+          },
+          {
+            "type": "FoodNutrient",
+            "nutrient": {
+              "id": 1005,
+              "number": "205",
+              "name": "Carbohydrate, by difference",
+              "rank": 1110,
+              "unitName": "g"
+            },
+            "amount": 14
+          },
+          {
+            "type": "FoodNutrient",
+            "nutrient": {
+              "id": 1008,
+              "number": "208",
+              "name": "Energy",
+              "rank": 300,
+              "unitName": "kcal"
+            },
+            "amount": 181
+          }
+        ],
+        "foodPortions": [
+          {
+            "id": 9100501,
+            "measureUnit": {
+              "id": 9999,
+              "name": "undetermined",
+              "abbreviation": "undetermined"
+            },
+            "modifier": "10205",
+            "portionDescription": "1 cup",
+            "sequenceNumber": 1
+          },
+          {
+            "id": 9100502,
+            "measureUnit": {
+              "id": 9999,
+              "name": "undetermined",
+              "abbreviation": "undetermined"
+            },
+            "modifier": "90000",
+            "gramWeight": 0,
+            "portionDescription": "1 serving",
+            "sequenceNumber": 2
+          },
+          {
+            "id": 9100503,
+            "measureUnit": {
+              "id": 9999,
+              "name": "undetermined",
+              "abbreviation": "undetermined"
+            },
+            "modifier": "61667",
+            "gramWeight": "unknown",
+            "portionDescription": "1 piece",
+            "sequenceNumber": 3
+          }
+        ]
+      }
+    },
+    "noFoodPortionsKey": {
+      "note": "MANDATORY EDGE CASE, and a DISTINCT case from both an empty array and a weightless portion. The foodPortions key is absent entirely, so a resolver never reaches its iteration logic and must not throw on undefined. The outcome is the same quarantine as portionsWithoutUsableGramWeight, but the route there is different, which is why both exist: this one fails an existence check, that one fails a value check.",
+      "endpoint": "/food/{fdcId}",
+      "params": {
+        "format": "full"
+      },
+      "consumedBy": "getFoodDetail in catalog-import-usda.ts",
+      "expectedOutcome": "quarantined",
+      "expectedPortionResolution": [],
+      "expectedValidationOutcome": {
+        "publicationStatus": "quarantined",
+        "check": "missing_gram_weight",
+        "checkTier": "quarantine",
+        "reason": "foodPortions is absent, so there is no portion to source a gram weight from"
+      },
+      "expectedNotPublished": true,
+      "payload": {
+        "fdcId": 9000406,
+        "description": "Fixture spice, ground, no portions published",
+        "dataType": "SR Legacy",
+        "foodClass": "FinalFood",
+        "ndbNumber": "99005",
+        "publicationDate": "2019-04-01",
+        "foodNutrients": [
+          {
+            "type": "FoodNutrient",
+            "nutrient": {
+              "id": 1003,
+              "number": "203",
+              "name": "Protein",
+              "rank": 600,
+              "unitName": "g"
+            },
+            "amount": 12
+          },
+          {
+            "type": "FoodNutrient",
+            "nutrient": {
+              "id": 1004,
+              "number": "204",
+              "name": "Total lipid (fat)",
+              "rank": 800,
+              "unitName": "g"
+            },
+            "amount": 17
+          },
+          {
+            "type": "FoodNutrient",
+            "nutrient": {
+              "id": 1005,
+              "number": "205",
+              "name": "Carbohydrate, by difference",
+              "rank": 1110,
+              "unitName": "g"
+            },
+            "amount": 56
+          },
+          {
+            "type": "FoodNutrient",
+            "nutrient": {
+              "id": 1008,
+              "number": "208",
+              "name": "Energy",
+              "rank": 300,
+              "unitName": "kcal"
+            },
+            "amount": 375
+          }
+        ]
+      }
+    },
+    "emptyFoodPortionsArray": {
+      "note": "MANDATORY EDGE CASE, the third of the three distinct no-gram-weight shapes. foodPortions is present but empty, so an existence check PASSES and the resolver must still conclude that nothing resolves. Kept separate from the absent-key sample because a guard written as `if (data.foodPortions)` is satisfied by an empty array and would then select from nothing.",
+      "endpoint": "/food/{fdcId}",
+      "params": {
+        "format": "full"
+      },
+      "consumedBy": "getFoodDetail in catalog-import-usda.ts",
+      "expectedOutcome": "quarantined",
+      "expectedPortionResolution": [],
+      "expectedValidationOutcome": {
+        "publicationStatus": "quarantined",
+        "check": "missing_gram_weight",
+        "checkTier": "quarantine",
+        "reason": "foodPortions is present but empty, so no portion can be selected"
+      },
+      "expectedNotPublished": true,
+      "payload": {
+        "fdcId": 9000407,
+        "description": "Fixture beverage concentrate, no portions published",
+        "dataType": "SR Legacy",
+        "foodClass": "FinalFood",
+        "ndbNumber": "99006",
+        "publicationDate": "2019-04-01",
+        "foodNutrients": [
+          {
+            "type": "FoodNutrient",
+            "nutrient": {
+              "id": 1003,
+              "number": "203",
+              "name": "Protein",
+              "rank": 600,
+              "unitName": "g"
+            },
+            "amount": 0.4
+          },
+          {
+            "type": "FoodNutrient",
+            "nutrient": {
+              "id": 1004,
+              "number": "204",
+              "name": "Total lipid (fat)",
+              "rank": 800,
+              "unitName": "g"
+            },
+            "amount": 0.1
+          },
+          {
+            "type": "FoodNutrient",
+            "nutrient": {
+              "id": 1005,
+              "number": "205",
+              "name": "Carbohydrate, by difference",
+              "rank": 1110,
+              "unitName": "g"
+            },
+            "amount": 45
+          },
+          {
+            "type": "FoodNutrient",
+            "nutrient": {
+              "id": 1008,
+              "number": "208",
+              "name": "Energy",
+              "rank": 300,
+              "unitName": "kcal"
+            },
+            "amount": 180
+          }
+        ],
+        "foodPortions": []
+      }
+    }
+  }
+}

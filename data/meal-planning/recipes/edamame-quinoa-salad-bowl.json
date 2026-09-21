@@ -1,0 +1,103 @@
+{
+  "slug": "edamame-quinoa-salad-bowl",
+  "name": "Edamame and quinoa salad bowl",
+  "description": "Shelled edamame tossed cold with cooked quinoa, baby spinach, cucumber and tomato in a lemon dressing — no cooking, and the edamame supplies both protein and the fat the dressing would.",
+  "iconKey": "salad",
+  "instructions": [
+    "Toss the edamame with the cooked quinoa in a large bowl.",
+    "Add the spinach, the diced cucumber and the tomato and turn everything together gently.",
+    "Squeeze the lemon over the top, add the salt and toss once more.",
+    "Divide between two bowls and serve cold."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 bowl",
+  "prepMinutes": 12,
+  "cookMinutes": 0,
+  "mealSlots": [
+    "lunch",
+    "dinner"
+  ],
+  "dietTags": [
+    "gluten_free",
+    "pescatarian",
+    "vegan",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "soy"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "dairy_free",
+    "vegan",
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:169282",
+      "quantity": 1.33,
+      "unit": "cup",
+      "gramWeight": 340,
+      "displayText": "1⅓ cups, shelled",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168917",
+      "quantity": 0.67,
+      "unit": "cup",
+      "gramWeight": 124,
+      "displayText": "⅔ cup",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168462",
+      "quantity": 7,
+      "unit": "cup",
+      "gramWeight": 210,
+      "displayText": "7 cups",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168409",
+      "quantity": 1,
+      "unit": "cup",
+      "gramWeight": 104,
+      "displayText": "1 cup, sliced",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170457",
+      "quantity": 1.5,
+      "unit": "each",
+      "gramWeight": 184,
+      "displayText": "1½ tomatoes, diced",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:167746",
+      "quantity": 0.25,
+      "unit": "each",
+      "gramWeight": 21,
+      "displayText": "¼ lemon, juiced",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 3,
+      "displayText": "½ tsp",
+      "sortOrder": 6,
+      "isOptional": false
+    }
+  ]
+}

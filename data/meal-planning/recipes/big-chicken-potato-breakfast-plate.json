@@ -1,0 +1,106 @@
+{
+  "slug": "big-chicken-potato-breakfast-plate",
+  "name": "Big chicken and potato breakfast plate",
+  "description": "A large savoury breakfast plate: grated potato crisped in olive oil with mushrooms and spinach, finished with plenty of diced cooked chicken breast, in fifteen minutes.",
+  "iconKey": "fork_knife",
+  "instructions": [
+    "Coarsely grate the potatoes and squeeze them dry in a clean towel.",
+    "Warm the olive oil in a large skillet over medium-high heat, spread the grated potato in an even layer and cook it, covered, for 6 minutes, turning once, until it is tender and golden.",
+    "Push the potato to one side of the pan, add the mushrooms and the garlic and cook for 2 minutes.",
+    "Stir in the spinach and the diced cooked chicken breast with the salt and the black pepper and heat through for 2 minutes, until the spinach has wilted.",
+    "Slide everything onto one large plate."
+  ],
+  "yieldServings": 1,
+  "servingDescription": "1 large plate",
+  "prepMinutes": 5,
+  "cookMinutes": 10,
+  "mealSlots": [
+    "breakfast"
+  ],
+  "dietTags": [
+    "gluten_free"
+  ],
+  "allergenTags": [],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "dairy_free",
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:171477",
+      "quantity": 1.25,
+      "unit": "cup",
+      "gramWeight": 175.0,
+      "displayText": "1¼ cups, diced",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170027",
+      "quantity": 2,
+      "unit": "each",
+      "gramWeight": 400.0,
+      "displayText": "2 medium potatoes",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169251",
+      "quantity": 1,
+      "unit": "cup",
+      "gramWeight": 70.0,
+      "displayText": "1 cup, sliced",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168462",
+      "quantity": 2,
+      "unit": "cup",
+      "gramWeight": 60.0,
+      "displayText": "2 cups",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169230",
+      "quantity": 2,
+      "unit": "clove",
+      "gramWeight": 6.0,
+      "displayText": "2 cloves",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 1.25,
+      "unit": "tbsp",
+      "gramWeight": 16.875,
+      "displayText": "1¼ tbsp",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170931",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 1.15,
+      "displayText": "½ tsp",
+      "sortOrder": 6,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 3.0,
+      "displayText": "½ tsp",
+      "sortOrder": 7,
+      "isOptional": false
+    }
+  ]
+}

@@ -7,6 +7,35 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
+
+    # A throwaway PostgreSQL for the checks that need a real database: applying
+    # the migration ledger, the meal-planning schema-drift gate, and the API
+    # test suite. Nothing here can reach data that matters.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ci
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: ci
+        # Published, because the job runs on the runner VM and DATABASE_URL
+        # below resolves localhost:5432.
+        ports:
+          - 5432:5432
+        # No step runs before the server accepts connections.
+        options: >-
+          --health-cmd "pg_isready -U ci -d ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql://ci:ci@localhost:5432/ci
+      NODE_ENV: test
+      # The test setup refuses to truncate without it, and refuses regardless
+      # unless the database name says test or ci.
+      ALLOW_DB_TRUNCATE: 'true'
+
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -16,9 +45,440 @@ jobs:
       - run: npm ci
       - run: npx prisma generate
       - run: npx prisma validate
-        env:
-          # validate resolves the datasource env var but never connects
-          DATABASE_URL: postgresql://ci:ci@localhost:5432/ci
+      # Named, because prisma/manual-migrations/meal-planning/README.md and the
+      # header of that folder's up script both point an operator at this step as
+      # the proof that the ledger is applied automatically.
+      - name: Apply the migration ledger
+        run: npx prisma migrate deploy
       - run: npm run typecheck
+      - run: npm run typecheck:test
+      - run: npm run typecheck:scripts
+
+      # Two committed artefacts carry the reviewed evidence of what the
+      # migration ledger holds that prisma/schema.prisma cannot express, and
+      # this step polices both of them.
+      #
+      # docs/meal-planning/expected-schema-diff.sql is the captured
+      # `prisma migrate diff --script` output between the ledger and the
+      # datamodel, and nothing else. The step re-runs that command against a
+      # throwaway shadow database, requires the same exit code, and compares the
+      # WHOLE file with the output after deleting comment and blank lines from
+      # both sides - the comparison AAP 0.9.1 prescribes, which is why that file
+      # carries no section markers and every header line of it is a `--` line
+      # comment.
+      #
+      # docs/meal-planning/schema-catalog-evidence.sql is the second capture
+      # that command cannot make, in two marker-delimited sections. The step
+      # executes its committed `pg-catalog-query` section, read-only, against
+      # the database the previous step applied the ledger to, and compares the
+      # result with `pg-catalog-expected`. That comparison is not redundant:
+      # Prisma's schema describer leaves expression indexes, index predicates
+      # and scalar-list NOT NULL out of both sides of its diff, so the three
+      # ASCII-fold expression indexes the search prefix branches read, the
+      # partial-index predicates and the required array nullability are
+      # invisible to the first one.
+      #
+      # Both comparisons fail on any difference in either direction, and each
+      # file's header documents its own command for local use.
+      #
+      # The two helpers below are node + `pg` rather than psql, and not for want
+      # of a client: `ubuntu-latest` ships the PostgreSQL 16 client tools. They
+      # are written this way because they depend on no image-provided tooling -
+      # only the `pg` package `npm ci` above already installs, so this gate
+      # cannot break on a runner image that drops or moves a binary - and
+      # because the second one ASSERTS ON THE SHAPE of what it reads, which
+      # `psql -tA` cannot. It runs the committed section inside `BEGIN
+      # TRANSACTION READ ONLY`, so a write introduced into that section fails
+      # instead of reaching the database, and it refuses the section unless all
+      # four of these hold: it is ONE statement (`pg` answers several with an
+      # array of results); the result carries EXACTLY ONE field descriptor; that
+      # descriptor is NAMED `line`; and its `dataTypeID` is PostgreSQL's `text`
+      # (OID 25). The last three are read off the result's own descriptors
+      # rather than inferred from the values, which is what makes them assertions
+      # about the query: `line` selected beside a second column is refused
+      # instead of rendered. The values are then checked too - a text column
+      # still yields null for a NULL - and every refusal names the condition it
+      # failed and what it found. The output is byte-identical to `psql -tA`, so
+      # the local command in each file's header and this gate compare the same
+      # bytes.
+      - name: Schema-drift evidence gate
+        run: |
+          # Actions runs this under `bash -e`; set it here too so the script
+          # behaves the same when it is run by hand. errexit is lifted only
+          # around the one command whose non-zero exit is expected.
+          set -euo pipefail
+
+          DIFF_EVIDENCE=docs/meal-planning/expected-schema-diff.sql
+          CATALOG_EVIDENCE=docs/meal-planning/schema-catalog-evidence.sql
+          WORK="${RUNNER_TEMP:-/tmp}/schema-evidence"
+          mkdir -p "$WORK"
+
+          BASE="${DATABASE_URL%%\?*}"
+          ADMIN_URL="${BASE%/*}/postgres"
+          # The name must END in `_shadow` (a clone index after it is allowed):
+          # scripts/schema-diff.ts classifies this URL with
+          # scripts/lib/dbGuard.ts, which recognises a shadow database by that
+          # suffix on a local host and refuses everything else. The older
+          # `_schema_evidence` name was refused with `shadow_required`.
+          SHADOW_URL="${BASE}_shadow"
+
+          for evidence in "$DIFF_EVIDENCE" "$CATALOG_EVIDENCE"; do
+            if [ ! -f "$evidence" ]; then
+              echo "$evidence is missing; the gate has nothing to compare against."
+              exit 1
+            fi
+          done
+
+          # The migrate-diff artefact is compared as a whole, so the strip runs
+          # over the entire file: everything in it that is neither a line
+          # comment starting at column 0 nor an empty line is captured payload.
+          # An emptied file is drift in its own right - without this check,
+          # deleting the payload would pass silently against a command that had
+          # also stopped emitting it.
+          sed '/^--/d;/^$/d' "$DIFF_EVIDENCE" > "$WORK/expected-diff.txt"
+          if [ ! -s "$WORK/expected-diff.txt" ]; then
+            echo "$DIFF_EVIDENCE is empty once comment lines and blank lines are stripped; the captured statements are gone."
+            exit 1
+          fi
+
+          # Each section of the catalog artefact is delimited by a marker line
+          # starting at column 0, so that file stays SQL-commented and every
+          # section can still be comment-stripped before it is compared. A
+          # missing, duplicated, reordered or empty section is drift in its own
+          # right: without this check, deleting a whole section would pass
+          # silently.
+          section_end=0
+          for section in pg-catalog-query pg-catalog-expected; do
+            begins=$(grep -c "^-- >>> BEGIN $section\$" "$CATALOG_EVIDENCE" || true)
+            ends=$(grep -c "^-- >>> END $section\$" "$CATALOG_EVIDENCE" || true)
+            if [ "$begins" -ne 1 ] || [ "$ends" -ne 1 ]; then
+              echo "$CATALOG_EVIDENCE must carry exactly one '-- >>> BEGIN $section' line and one '-- >>> END $section' line, each starting at column 0 (found $begins and $ends)."
+              exit 1
+            fi
+
+            section_begin=$(grep -n "^-- >>> BEGIN $section\$" "$CATALOG_EVIDENCE" | cut -d: -f1)
+            next_end=$(grep -n "^-- >>> END $section\$" "$CATALOG_EVIDENCE" | cut -d: -f1)
+            if [ "$section_begin" -le "$section_end" ] || [ "$next_end" -le "$section_begin" ]; then
+              echo "$CATALOG_EVIDENCE must open and close its sections in the order pg-catalog-query, pg-catalog-expected; $section spans lines $section_begin-$next_end."
+              exit 1
+            fi
+            section_end=$next_end
+
+            sed -n "$((section_begin + 1)),$((next_end - 1))p" "$CATALOG_EVIDENCE" \
+              | sed '/^--/d;/^$/d' > "$WORK/$section.txt"
+            if [ ! -s "$WORK/$section.txt" ]; then
+              echo "The $section section of $CATALOG_EVIDENCE is empty once comment lines and blank lines are stripped."
+              exit 1
+            fi
+          done
+
+          # Floors, not exact counts. The schema only grows additively, and
+          # these three numbers are the three classes
+          # prisma/migrations/20260908000000_meal_planning/migration.sql names as
+          # hand-edited in its own header: the STORED search_vector expression,
+          # the block of expression, GIN and partial indexes, and NOT NULL on
+          # the twelve required TEXT[]/UUID[] columns. A floor survives a column
+          # added later; it does not survive a construct being dropped from the
+          # ledgers and from the evidence together, which is the case no
+          # ledger-against-ledger check can see.
+          generated_columns=$(grep -c '^generated_column ' "$WORK/pg-catalog-expected.txt" || true)
+          hand_managed_indexes=$(grep -c '^index ' "$WORK/pg-catalog-expected.txt" || true)
+          not_null_arrays=$(grep '^array_column ' "$WORK/pg-catalog-expected.txt" | grep -c ' not_null=true' || true)
+
+          if [ "$generated_columns" -lt 1 ] || [ "$hand_managed_indexes" -lt 7 ] || [ "$not_null_arrays" -lt 12 ]; then
+            echo "The pg-catalog-expected section of $CATALOG_EVIDENCE no longer carries the evidence it must:"
+            echo "  generated columns:      $generated_columns (at least 1)"
+            echo "  hand-managed indexes:   $hand_managed_indexes (at least 7)"
+            echo "  NOT NULL array columns: $not_null_arrays (at least 12)"
+            echo "Those are the classes the meal-planning migration hand-edits; their evidence cannot be deleted."
+            exit 1
+          fi
+
+          cat > "$WORK/run-sql.js" <<'JS'
+          // Resolved from the checkout, not from this script's directory: the
+          // script lives in the runner's temp directory, which has no
+          // node_modules above it.
+          const { Client } = require(require('path').join(process.cwd(), 'node_modules', 'pg'));
+
+          const sql = require('fs').readFileSync(0, 'utf8');
+          const client = new Client({ connectionString: process.env.PGURL });
+
+          client
+            .connect()
+            .then(() => client.query(sql))
+            .then(() => client.end())
+            .catch((error) => {
+              console.error(error.message || error);
+              process.exit(1);
+            });
+          JS
+
+          # `migrate diff --from-migrations` resets the database it is given, so
+          # it gets its own, never the one holding the applied ledger.
+          PGURL="$ADMIN_URL" node "$WORK/run-sql.js" <<< "DROP DATABASE IF EXISTS ${SHADOW_URL##*/}" || exit 1
+          PGURL="$ADMIN_URL" node "$WORK/run-sql.js" <<< "CREATE DATABASE ${SHADOW_URL##*/}" || exit 1
+
+          # Through scripts/schema-diff.ts rather than as a raw `npx prisma
+          # migrate diff`, because that command RESETS the database it is given
+          # and this step hands it a URL derived from an environment variable.
+          # The wrapper classifies that URL with scripts/lib/dbGuard.ts, reads
+          # the target back over a connection - the database and schema reached
+          # must be the ones the URL names, and no ordinary or partitioned base
+          # table in the reached `public` schema may hold a row, which is an
+          # occupancy statement about the tables of that one schema rather than
+          # a guarantee that the database is empty - and only then spawns Prisma
+          # with the argument list above fixed in code. Its own diagnostics go
+          # to stderr, so stdout is the SQL and nothing else; it deletes
+          # DATABASE_URL from the child environment, which the diff does not
+          # need; and it passes Prisma's exit code through unchanged, so the
+          # requirement below is the same requirement.
+          #
+          # --exit-code makes 2 the success case here: it means the datamodel
+          # and the ledger differ, which is exactly what the evidence records.
+          set +e
+          SHADOW_DATABASE_URL="$SHADOW_URL" \
+            npx ts-node --project tsconfig.scripts.json scripts/schema-diff.ts diff \
+            > "$WORK/actual.sql"
+          diff_exit=$?
+          set -e
+          if [ "$diff_exit" -ne 2 ]; then
+            echo "scripts/schema-diff.ts diff exited $diff_exit; the gate expects 2 - Prisma ran and found"
+            echo "differences, which is what the committed evidence records."
+            echo "0 means Prisma ran and found none, so $DIFF_EVIDENCE is stale, or the construct it records"
+            echo "is gone from the migration."
+            echo "1 means Prisma itself failed AFTER the read-back had already succeeded: a migration that does"
+            echo "not replay onto the shadow database (P3006), or the target changing between the read-back and"
+            echo "the run."
+            echo "3 means the wrapper stopped the run and Prisma produced no verdict at all - EVERY refusal it"
+            echo "makes exits 3: SHADOW_DATABASE_URL refused by the guard; a read-back that could not connect,"
+            echo "authenticate or find the database; a database or schema that was not the one the URL names; a"
+            echo "reached schema this session cannot certify empty; or a Prisma CLI that could not be started."
+            echo "The reason is on stderr above."
+            cat "$WORK/actual.sql"
+            exit 1
+          fi
+
+          # Comment lines and empty lines only, on both sides. Whitespace inside
+          # or around a statement is compared as content.
+          sed '/^--/d;/^$/d' "$WORK/actual.sql" > "$WORK/normalised.sql"
+
+          if ! diff -u "$WORK/expected-diff.txt" "$WORK/normalised.sql"; then
+            echo "$DIFF_EVIDENCE no longer matches what the command reports."
+            echo "Fix prisma/schema.prisma and prisma/migrations, or regenerate the capture if the change was intended."
+            exit 1
+          fi
+
+          # The committed extraction, run against the database the `Apply the
+          # migration ledger` step migrated, so what it measures is the ledger
+          # as applied rather than either ledger as written.
+          cat > "$WORK/render-evidence.js" <<'JS'
+          // Resolved from the checkout, for the same reason as run-sql.js above.
+          const { Client } = require(require('path').join(process.cwd(), 'node_modules', 'pg'));
+
+          // PostgreSQL's own OID for `text`, from pg_type: the value `pg`
+          // reports in each field descriptor's dataTypeID. Fixed by the catalog,
+          // so it is safe to compare against a literal.
+          const TEXT_TYPE_OID = 25;
+          const EVIDENCE_COLUMN = 'line';
+
+          const sql = require('fs').readFileSync(0, 'utf8');
+          const client = new Client({ connectionString: process.env.PGURL });
+
+          const render = async () => {
+            await client.connect();
+            // The committed query is data this script executes, so it runs in a
+            // read-only transaction: a write introduced into that section fails
+            // here instead of reaching the database.
+            await client.query('BEGIN TRANSACTION READ ONLY');
+            const result = await client.query(sql);
+            await client.query('ROLLBACK');
+
+            if (Array.isArray(result)) {
+              throw new Error('the extraction must be one SELECT, not several statements');
+            }
+
+            // THE SHAPE, off the result's own field descriptors rather than off
+            // the values. `pg` returns one descriptor per selected column with
+            // the column's name and PostgreSQL type OID, and reading them is
+            // what makes this an assertion about the QUERY: a section that
+            // selects `line` beside a second column, or renames the column, or
+            // returns something other than text under that name, would render
+            // rows that compare against the committed expectation while
+            // measuring something else. Each refusal names the condition that
+            // failed and what it found.
+            const fields = Array.isArray(result.fields) ? result.fields : [];
+            if (fields.length !== 1) {
+              throw new Error(
+                'the extraction must select exactly one column; this one returned ' +
+                  fields.length +
+                  ' (' +
+                  (fields.map((field) => field.name).join(', ') || 'no columns at all') +
+                  ')',
+              );
+            }
+            if (fields[0].name !== EVIDENCE_COLUMN) {
+              throw new Error(
+                'the extraction must name its single column "' +
+                  EVIDENCE_COLUMN +
+                  '"; this one named it "' +
+                  fields[0].name +
+                  '"',
+              );
+            }
+            if (fields[0].dataTypeID !== TEXT_TYPE_OID) {
+              throw new Error(
+                'the extraction must select "' +
+                  EVIDENCE_COLUMN +
+                  '" as PostgreSQL text (type OID ' +
+                  TEXT_TYPE_OID +
+                  '); this one selected type OID ' +
+                  fields[0].dataTypeID,
+              );
+            }
+
+            // And the values under that descriptor, which the shape check above
+            // does not cover: a text column still yields null for a NULL, and
+            // rendering that as the empty string would compare an absence as
+            // content.
+            const lines = result.rows.map((row) => row[EVIDENCE_COLUMN]);
+            const nullRow = lines.findIndex((line) => typeof line !== 'string');
+            if (nullRow !== -1) {
+              throw new Error(
+                'the extraction returned a non-string value in "' +
+                  EVIDENCE_COLUMN +
+                  '" at row ' +
+                  (nullRow + 1) +
+                  ' (' +
+                  (lines[nullRow] === null ? 'SQL NULL' : typeof lines[nullRow]) +
+                  '); every evidence line must be text the database really holds',
+              );
+            }
+
+            process.stdout.write(lines.join('\n') + '\n');
+            await client.end();
+          };
+
+          render().catch((error) => {
+            console.error(error.message || error);
+            process.exit(1);
+          });
+          JS
+
+          PGURL="$DATABASE_URL" node "$WORK/render-evidence.js" \
+            < "$WORK/pg-catalog-query.txt" > "$WORK/pg-catalog-actual.txt" || exit 1
+
+          if ! diff -u "$WORK/pg-catalog-expected.txt" "$WORK/pg-catalog-actual.txt"; then
+            echo "The applied ledger no longer matches the pg-catalog-expected section of $CATALOG_EVIDENCE."
+            echo "Fix prisma/schema.prisma and prisma/migrations, or regenerate the section if the change was intended."
+            exit 1
+          fi
+
+          echo "schema-drift evidence gate: PASS"
+          echo "  $DIFF_EVIDENCE: whole file compared against the command's output, which exited 2 - $(wc -l < "$WORK/expected-diff.txt") statement line(s) after stripping comment and blank lines from both sides"
+          echo "  $CATALOG_EVIDENCE: pg-catalog-query executed read-only against the migrated database, $(wc -l < "$WORK/pg-catalog-actual.txt") line(s) compared with pg-catalog-expected - $generated_columns generated column(s), $hand_managed_indexes hand-managed index(es), $not_null_arrays NOT NULL array column(s)"
+
+      # The dual-ledger equivalence gate in src/__tests__/api/compat.test.ts
+      # compares the two migration ledgers on a NORMALISED `pg_dump
+      # --schema-only`, which the Agent Action Plan (0.9.1) makes mandatory
+      # evidence: that suite fails rather than skipping when no usable pg_dump
+      # can be resolved. "Usable" is a version statement — pg_dump refuses to
+      # dump a server newer than itself — and the runner image does not
+      # necessarily carry a client of the service's major. So the choice is
+      # made here, before the tests run, for two reasons: a runner with no
+      # matching client fails at this step with an actionable message instead
+      # of inside Jest, and the resolved runner is exported so the test step
+      # uses the one this step printed. PG_DUMP_BIN names a local executable
+      # (including the versioned install directories a `pg_dump` on PATH may
+      # not point at); PG_DUMP_CONTAINER tells the suite to dump through the
+      # matching client the postgres service image already ships, over that
+      # container's own local socket, which needs no password anywhere.
+      - name: Resolve a PostgreSQL 16 pg_dump for the migration-ledger gate
+        run: |
+          set -euo pipefail
+
+          # The major of the `postgres:16-alpine` service declared above.
+          SERVER_MAJOR=16
+
+          resolved=''
+          resolved_major=''
+          echo "Looking for a pg_dump of major $SERVER_MAJOR or newer:"
+
+          # PATH first, then the versioned client directories a Debian/Ubuntu
+          # install keeps other majors in, newest first.
+          for candidate in pg_dump $(ls /usr/lib/postgresql/*/bin/pg_dump 2>/dev/null | sort -rV || true); do
+            found=$(command -v "$candidate" || true)
+            if [ -z "$found" ]; then
+              continue
+            fi
+            major=$("$found" --version 2>/dev/null | sed -n 's/^pg_dump (PostgreSQL) \([0-9][0-9]*\).*/\1/p' || true)
+            if [ -n "$major" ] && [ "$major" -ge "$SERVER_MAJOR" ]; then
+              resolved="$found"
+              resolved_major="$major"
+              break
+            fi
+            echo "  - $found: pg_dump ${major:-unidentified}, too old for a PostgreSQL $SERVER_MAJOR server"
+          done
+
+          if [ -n "$resolved" ]; then
+            echo "  - $resolved: pg_dump $resolved_major — using this one."
+            echo "PG_DUMP_BIN=$resolved" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          # No local client of a usable major. The service container runs
+          # postgres:16-alpine, which ships a matching pg_dump, so the gate can
+          # dump through `docker exec` instead.
+          PORT="${DATABASE_URL##*:}"
+          PORT="${PORT%%/*}"
+          container=$(docker ps --filter "publish=$PORT" --format '{{.Names}}' | head -n 1 || true)
+          if [ -n "$container" ] && docker exec "$container" pg_dump --version >/dev/null 2>&1; then
+            echo "  - container $container publishes port $PORT and ships $(docker exec "$container" pg_dump --version) — using this one."
+            echo "PG_DUMP_CONTAINER=$container" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          echo "No pg_dump able to dump a PostgreSQL $SERVER_MAJOR server is available to this job, and no"
+          echo "container publishing port $PORT ships one. The migration-ledger gate in"
+          echo "src/__tests__/api/compat.test.ts compares both ledgers on a normalised pg_dump --schema-only"
+          echo "and fails without it, because that comparison is the gate's required evidence (0.9.1)."
+          echo "Fix either by installing the client (sudo apt-get update && sudo apt-get install -y"
+          echo "postgresql-client-$SERVER_MAJOR) or by keeping the postgres service container reachable to"
+          echo "docker exec, then re-run."
+          exit 1
+
+      # The supply-chain gate, and it is BASELINED rather than absolute.
+      #
+      # `npm audit --omit=dev` reports 21 advisories in this production tree —
+      # 4 critical and 5 high — every one of them reachable only through
+      # firebase-admin, and the whole cluster clears only with
+      # firebase-admin@14.4.0: a semver-major that removes the namespaced API
+      # this application uses at five call sites. A plain
+      # `npm audit --audit-level=high` would therefore fail every build from
+      # the first one, with no fix available that this repository is allowed to
+      # make, and a gate that can only be satisfied by switching it off is not
+      # a control. So the reviewed, dated baseline at
+      # docs/meal-planning/dependency-audit-baseline.json records each of those
+      # findings with the reachability determination behind accepting it, and
+      # the comparator fails the build on any finding the baseline does not
+      # carry — which is the thing that was actually missing: detection of the
+      # NEXT advisory.
+      #
+      # This mirrors the mobile repository's lint baseline
+      # (scripts/lint-baseline-compare.mjs), deliberately: one shape for both
+      # "accepted today, fail on anything new" gates.
+      #
+      # Two properties of the comparator matter to this step. `npm audit`
+      # itself exits non-zero whenever any advisory exists, so the comparator
+      # captures the report and ignores that status — while still failing when
+      # no report can be produced at all, because a gate that cannot see the
+      # advisories must not report that there are none. And it never writes the
+      # baseline: a refresh is a human pasting the entry it prints, with a
+      # reason, in a reviewed commit.
+      #
+      # Placed before `npm test` so a supply-chain regression is reported
+      # before the long test run rather than after it.
+      - name: Dependency audit gate
+        run: npm run audit:gate
+
       - run: npm test
       - run: docker build -t soh-be-ci .

@@ -1,0 +1,118 @@
+{
+  "slug": "big-egg-white-potato-breakfast-plate",
+  "name": "Big egg white and potato breakfast plate",
+  "description": "A large plate for a big morning: coarsely grated russet potato crisped with onion and mushrooms, topped with a soft egg white scramble enriched with a few whole eggs and finished with wilted spinach.",
+  "iconKey": "crosshair",
+  "instructions": [
+    "Coarsely grate the potato, press it dry in a clean towel and spread it into a wide skillet with half the olive oil over medium-high heat.",
+    "Scatter the onion and the mushrooms over the top, season with half the salt and all of the black pepper, and cook for 8 minutes, turning once, until the edges crisp.",
+    "Meanwhile beat the egg white with the egg and the remaining salt, then scramble them in a second skillet with the rest of the olive oil over medium heat until only just set, about 4 minutes.",
+    "Fold the spinach through the scramble until it wilts, then divide the hash and the scramble between two plates."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 plate",
+  "prepMinutes": 6,
+  "cookMinutes": 9,
+  "mealSlots": [
+    "breakfast"
+  ],
+  "dietTags": [
+    "gluten_free",
+    "pescatarian",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "eggs"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "dairy_free",
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:172183",
+      "quantity": 21,
+      "unit": "each",
+      "gramWeight": 693,
+      "displayText": "21 large",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171287",
+      "quantity": 3,
+      "unit": "each",
+      "gramWeight": 150,
+      "displayText": "3 large",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170027",
+      "quantity": 3.25,
+      "unit": "each",
+      "gramWeight": 692.25,
+      "displayText": "3¼ medium, grated",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169251",
+      "quantity": 5,
+      "unit": "cup",
+      "gramWeight": 350,
+      "displayText": "5 cups, sliced",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168462",
+      "quantity": 5,
+      "unit": "cup",
+      "gramWeight": 150,
+      "displayText": "5 cups",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170000",
+      "quantity": 1,
+      "unit": "cup",
+      "gramWeight": 160,
+      "displayText": "1 cup, chopped",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 2.5,
+      "unit": "tbsp",
+      "gramWeight": 33.75,
+      "displayText": "2½ tbsp",
+      "sortOrder": 6,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 1,
+      "unit": "tsp",
+      "gramWeight": 6,
+      "displayText": "1 tsp",
+      "sortOrder": 7,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170931",
+      "quantity": 1,
+      "unit": "tsp",
+      "gramWeight": 2.3,
+      "displayText": "1 tsp",
+      "sortOrder": 8,
+      "isOptional": false
+    }
+  ]
+}

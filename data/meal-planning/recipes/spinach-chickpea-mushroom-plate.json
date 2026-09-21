@@ -1,0 +1,102 @@
+{
+  "slug": "spinach-chickpea-mushroom-plate",
+  "name": "Spinach, chickpea and mushroom plate",
+  "description": "A soy-free plate for lunch or dinner: mushrooms browned in dry pans with chickpeas and cooked lentils, a large amount of spinach wilted in at the end, finished with sunflower seeds and basil.",
+  "iconKey": "fork_knife",
+  "instructions": [
+    "Set two wide non-stick pans over high heat, divide the mushrooms between them in a single layer and leave them undisturbed for 3 minutes.",
+    "Stir once, add the salt, and cook for 3 minutes more until the pans are dry again.",
+    "Divide the chickpeas and the lentils between the pans and warm them through for 2 minutes, pressing the chickpeas lightly so they take on colour.",
+    "Fold in the spinach a large handful at a time and cook for 2 minutes, just until it collapses.",
+    "Divide between two plates, then scatter the sunflower seeds and the torn basil over the top."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 large plate",
+  "prepMinutes": 5,
+  "cookMinutes": 10,
+  "mealSlots": [
+    "lunch",
+    "dinner"
+  ],
+  "dietTags": [
+    "gluten_free",
+    "pescatarian",
+    "vegan",
+    "vegetarian"
+  ],
+  "allergenTags": [],
+  "allergenStatus": "known",
+  "budgetTier": 2,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "dairy_free",
+    "vegan",
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:169251",
+      "quantity": 15,
+      "unit": "cup",
+      "gramWeight": 1050,
+      "displayText": "15 cups, sliced",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168462",
+      "quantity": 12.5,
+      "unit": "cup",
+      "gramWeight": 375,
+      "displayText": "12½ cups",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:172421",
+      "quantity": 175,
+      "unit": "g",
+      "gramWeight": 175,
+      "displayText": "175 g, warm",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173800",
+      "quantity": 0.5,
+      "unit": "cup",
+      "gramWeight": 80,
+      "displayText": "½ cup, drained",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170562",
+      "quantity": 65,
+      "unit": "g",
+      "gramWeight": 65,
+      "displayText": "65 g",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:172232",
+      "quantity": 1,
+      "unit": "cup",
+      "gramWeight": 24,
+      "displayText": "1 cup, leaves",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 1,
+      "unit": "tsp",
+      "gramWeight": 6,
+      "displayText": "1 tsp",
+      "sortOrder": 6,
+      "isOptional": false
+    }
+  ]
+}

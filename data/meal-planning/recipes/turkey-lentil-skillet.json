@@ -1,0 +1,106 @@
+{
+  "slug": "turkey-lentil-skillet",
+  "name": "Turkey and lentil skillet",
+  "description": "Ground turkey breast browned with onion and cumin, simmered with cooked lentils and tomato and finished with wilted spinach.",
+  "iconKey": "pot",
+  "instructions": [
+    "Dice the onion and the tomato, then season the ground turkey breast with the ground cumin and the salt.",
+    "Warm the olive oil in a large skillet over medium heat, add the onion and cook for 4 minutes, until it softens.",
+    "Add the turkey breast and cook for 6 minutes, breaking it up with a spoon, until no pink remains.",
+    "Stir in the cooked lentils and the tomato and simmer for 5 minutes, until the pan is thick and glossy.",
+    "Fold the spinach through the skillet off the heat until it just wilts, then divide it between two plates."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 plate",
+  "prepMinutes": 10,
+  "cookMinutes": 15,
+  "mealSlots": [
+    "lunch",
+    "dinner"
+  ],
+  "dietTags": [
+    "gluten_free"
+  ],
+  "allergenTags": [],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "dairy_free"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:171098",
+      "quantity": 6,
+      "unit": "oz",
+      "gramWeight": 169.5,
+      "displayText": "6 oz",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:172421",
+      "quantity": 2.25,
+      "unit": "cup",
+      "gramWeight": 445.5,
+      "displayText": "2¼ cups",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168462",
+      "quantity": 2,
+      "unit": "cup",
+      "gramWeight": 60.0,
+      "displayText": "2 cups",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170000",
+      "quantity": 0.5,
+      "unit": "cup",
+      "gramWeight": 80.0,
+      "displayText": "½ cup",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170457",
+      "quantity": 1,
+      "unit": "each",
+      "gramWeight": 123.0,
+      "displayText": "1",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 1.75,
+      "unit": "tbsp",
+      "gramWeight": 23.625,
+      "displayText": "1¾ tbsp",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170923",
+      "quantity": 1,
+      "unit": "tsp",
+      "gramWeight": 2.1,
+      "displayText": "1 tsp",
+      "sortOrder": 6,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 3.0,
+      "displayText": "½ tsp",
+      "sortOrder": 7,
+      "isOptional": false
+    }
+  ]
+}

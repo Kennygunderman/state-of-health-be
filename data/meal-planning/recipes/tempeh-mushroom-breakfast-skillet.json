@@ -1,0 +1,100 @@
+{
+  "slug": "tempeh-mushroom-breakfast-skillet",
+  "name": "Tempeh and mushroom breakfast skillet",
+  "description": "Crumbled tempeh dry-fried with mushrooms, diced potato and spinach in one pan — the tempeh brings enough of its own fat that no cooking oil is needed.",
+  "iconKey": "pot",
+  "instructions": [
+    "Dice the potato small and cook it in a dry nonstick pan over medium heat, covered, for 8 minutes, turning twice.",
+    "Crumble the tempeh into the pan, add the onion and cook uncovered for 4 minutes, until both are lightly browned.",
+    "Add the mushrooms, the salt and the black pepper and cook for 5 minutes, until the mushrooms are golden.",
+    "Fold in the spinach and cook for 1 minute, just until it wilts.",
+    "Divide between two plates and serve hot."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 plate",
+  "prepMinutes": 8,
+  "cookMinutes": 18,
+  "mealSlots": [
+    "breakfast"
+  ],
+  "dietTags": [
+    "pescatarian",
+    "vegan",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "soy"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 2,
+  "badges": [
+    "high_protein",
+    "dairy_free",
+    "vegan"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:174272",
+      "quantity": 220,
+      "unit": "g",
+      "gramWeight": 220,
+      "displayText": "220 g",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169251",
+      "quantity": 4.5,
+      "unit": "cup",
+      "gramWeight": 315,
+      "displayText": "4½ cups, sliced",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170027",
+      "quantity": 1,
+      "unit": "each",
+      "gramWeight": 213,
+      "displayText": "1 medium potato",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168462",
+      "quantity": 4,
+      "unit": "cup",
+      "gramWeight": 120,
+      "displayText": "4 cups",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170000",
+      "quantity": 0.5,
+      "unit": "cup",
+      "gramWeight": 80,
+      "displayText": "½ cup, chopped",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 3,
+      "displayText": "½ tsp",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170931",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 1.15,
+      "displayText": "½ tsp",
+      "sortOrder": 6,
+      "isOptional": false
+    }
+  ]
+}

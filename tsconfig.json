@@ -109,5 +109,12 @@
     /* Completeness */
     // "skipDefaultLibCheck": true,                      /* Skip type checking .d.ts files that are included with TypeScript. */
     "skipLibCheck": true                                 /* Skip type checking all .d.ts files. */
-  }
+  },
+  /* The production build owns src/ only. Without an explicit include,
+     TypeScript's default recursive include pulls scripts/ into the program and
+     rejects it for sitting outside rootDir, and tests would be emitted into
+     dist/. The CLI scripts and the test suite are typechecked separately, by
+     tsconfig.scripts.json and tsconfig.test.json. */
+  "include": ["src"],
+  "exclude": ["src/**/__tests__/**", "src/**/*.test.ts"]
 }

@@ -1,0 +1,937 @@
+{
+  "coveragePlanVersion": "v1",
+  "promptVersion": "catalog-generation-2026-09-08",
+  "reviewPromptVersion": "catalog-review-2026-09-08",
+  "batchKeyFormat": "<coveragePlanVersion>:<category>:<batchIndex>",
+  "batchIndexPadWidth": 4,
+  "modelCallsPerBatch": 2,
+  "defaultBatchSize": 25,
+  "batchSizeEnvVar": "CATALOG_BATCH_SIZE",
+  "modelCallBudgetEnvVar": "CATALOG_MODEL_CALL_BUDGET",
+  "generationModel": {
+    "envVar": "CATALOG_GENERATION_MODEL",
+    "fallbackEnvVar": "OPENROUTER_MODEL",
+    "fallbackModel": "google/gemini-2.5-flash"
+  },
+  "reviewModel": {
+    "envVar": "CATALOG_REVIEW_MODEL",
+    "fallbackEnvVar": "ESTIMATE_JUDGE_MODEL",
+    "fallbackModel": "openai/gpt-4o-mini"
+  },
+  "candidateVolumeMultiplier": 1.25,
+  "candidateVolumeRounding": "ceil",
+  "aiCandidateFormula": "max(0, candidateVolume - usdaCandidatesImported)",
+  "aiRouteMeasurement": {
+    "measuredOn": "2026-09-18",
+    "verdict": "The AI expansion route contributes nothing publishable to this coverage-plan version, and the cause is NOT an environmental fault in this sandbox: it is that every evidence URL the generation model proposes is an FDC per-food page that fdc.nal.usda.gov no longer serves. Recorded here, beside the formula that sizes the route, so a curator reads the measurement before spending model budget on it again.",
+    "evidencePathIsHealthy": "The identity-evidence fetch path was exercised directly against the committed allowlist (src/services/evidence.service.ts, data/meal-planning/evidence-allowlist.v1.json) over 14 reference URLs of the kind the generation prompt asks for. Ten answered 200 and were read under the content-type and body caps, two of those matching the candidate name in the body (ods.od.nih.gov Iron factsheet for 'lentils', extension.psu.edu tomato-preserving page for 'stewed tomatoes'), so egress, DNS pinning, TLS, redirect handling, decoding and name matching all work from here. A run refusing every URL is therefore refusing what it was given, not failing to reach the network.",
+    "whatTheModelProposes": "One metered batch was run through scripts/catalog-generate-ai.ts itself with the model this plan version's recorded spend was made on (openai/gpt-4o-mini, 12 candidates, category legume, against a throwaway database and never the release catalog). It answered the schema completely - 12 usable candidates with names, macros, portions and aliases - and proposed exactly ONE evidence URL per candidate, every one of the form https://fdc.nal.usda.gov/fdc-app.html#/food-details/<fdcId>/nutrients. All 12 were refused fetch_failed on the host answering 404. That is the same single reason, the same host and the same one-URL-per-candidate ratio as the 528 refusals recorded for this plan version (evidenceUnsourced 528 = evidenceRefusals 528), so those 528 are explained by this measurement rather than inferred.",
+    "whyThoseUrlsCannotWork": "fdc.nal.usda.gov is a client-rendered application: the fragment in the URL above is browser-side routing, so the path actually requested is /fdc-app.html. Measured 2026-09-18, that path and every other per-food shape answer 404 - /fdc-app.html, /food-details/<id>/nutrients, /food-details/<id> and /foods/<id> - while the site root answers 200. No per-food FDC page is served to a non-browser client, so an FDC food-detail URL can never be verified by this fetcher however the model spells it. Pages that DO answer 200 on allowlisted hosts are narrative reference pages (www.ars.usda.gov FNDDS documentation, www.nal.usda.gov, ods.od.nih.gov factsheets, nutritionsource.hsph.harvard.edu, nchfp.uga.edu, extension.psu.edu), which is the class of URL an identity claim can actually be verified against.",
+    "fetchFailedHidesTheStatus": "src/services/evidence.service.ts maps a transport error, ANY non-2xx status and an unsupported content encoding to the single reason fetch_failed, and the generation stage logs a refusal at debug level with the host and the reason only, while the CLI logger runs at info. That is why the committed artefact carries a bare count with no cause, and why this block states the cause instead: of the same 14 reference URLs, five answered 404 (plausible deep paths an allowlisted host does not serve) and three answered 403 (hosts that refuse a non-browser client: www.britannica.com, www.oxfordreference.com, www.myplate.gov). No policy refusal and no allowlist-resolution fault was involved in the 528.",
+    "defaultModelCannotEvenPropose": "Two further metered batches were run the same way with this document's own declared fallback - the model an operator gets when CATALOG_GENERATION_MODEL is unset and OPENROUTER_MODEL is inherited, generationModel.fallbackModel google/gemini-2.5-flash, which is NOT the model the recorded 159 calls were made on (12 candidates each, categories prepared_meal and produce_fruit). Both answered {\"foods\":[{},{},...]} - the exact number of empty objects the batch asked for - so all 24 proposals were refused at parse as payload_missing_name before any evidence fetch, and both batches ended as cardinality mismatches that inserted nothing. So the route has two independent faults today: with the recorded model it proposes unverifiable URLs, and with the inherited default it proposes no content at all.",
+    "classification": "Model-proposed URLs that the allowlisted host does not serve. Not an environmental fault (the fetch path answers 200 on the same hosts), not a policy refusal (no candidate was refused for provenance class, scheme, content type or an unallowlisted host), and not an absence of evidence in the world (verifiable reference pages exist and match - they are simply not what the model proposes). Closing it means changing what the prompt asks the model to cite, which is a prompt and schema change against measured hosts rather than anything this document or the allowlist can fix.",
+    "consequence": "The per-category gaps this route was planned to fill are closed from the vendor's own generic datasets instead, under usda-manifest.v1.json requirementHeadroom, and the thirteen categories the vendor cannot fill stay short and are reported exactly. Nothing here relaxes a validation tier, widens the evidence allowlist or publishes an unsourced row.",
+    "staleAllowlistHostFound": "Beside the above, and reported rather than changed here because data/meal-planning/evidence-allowlist.v1.json is not this document: www.fns.usda.gov - an allowlisted government_nutrition_reference host - now answers 301 to www.fna.usda.gov, which the allowlist does not carry, so every FNS evidence URL is refused at the redirect hop with host_not_allowlisted. It cost this plan version nothing (no refusal under that reason was recorded), and it will silently refuse a correct URL until the allowlist follows the rename."
+  },
+  "publishedTargetTotal": 11010,
+  "candidateVolumeTotal": 13765,
+  "categories": [
+    {
+      "category": "produce_vegetable",
+      "publishedTarget": 1200,
+      "candidateVolume": 1500,
+      "kcalReviewRange": {
+        "min": 5,
+        "max": 150
+      },
+      "energyMacroTolerancePercent": 30
+    },
+    {
+      "category": "produce_fruit",
+      "publishedTarget": 700,
+      "candidateVolume": 875,
+      "kcalReviewRange": {
+        "min": 15,
+        "max": 350
+      },
+      "energyMacroTolerancePercent": 30
+    },
+    {
+      "category": "protein_meat",
+      "publishedTarget": 700,
+      "candidateVolume": 875,
+      "kcalReviewRange": {
+        "min": 80,
+        "max": 450
+      },
+      "energyMacroTolerancePercent": 15
+    },
+    {
+      "category": "protein_poultry",
+      "publishedTarget": 400,
+      "candidateVolume": 500,
+      "kcalReviewRange": {
+        "min": 80,
+        "max": 350
+      },
+      "energyMacroTolerancePercent": 15
+    },
+    {
+      "category": "protein_seafood",
+      "publishedTarget": 600,
+      "candidateVolume": 750,
+      "kcalReviewRange": {
+        "min": 50,
+        "max": 350
+      },
+      "energyMacroTolerancePercent": 15
+    },
+    {
+      "category": "protein_egg",
+      "publishedTarget": 60,
+      "candidateVolume": 75,
+      "kcalReviewRange": {
+        "min": 40,
+        "max": 350
+      },
+      "energyMacroTolerancePercent": 15
+    },
+    {
+      "category": "protein_plant",
+      "publishedTarget": 350,
+      "candidateVolume": 438,
+      "kcalReviewRange": {
+        "min": 50,
+        "max": 500
+      },
+      "energyMacroTolerancePercent": 20
+    },
+    {
+      "category": "dairy",
+      "publishedTarget": 600,
+      "candidateVolume": 750,
+      "kcalReviewRange": {
+        "min": 30,
+        "max": 450
+      },
+      "energyMacroTolerancePercent": 15
+    },
+    {
+      "category": "dairy_alternative",
+      "publishedTarget": 250,
+      "candidateVolume": 313,
+      "kcalReviewRange": {
+        "min": 10,
+        "max": 300
+      },
+      "energyMacroTolerancePercent": 25
+    },
+    {
+      "category": "grain",
+      "publishedTarget": 600,
+      "candidateVolume": 750,
+      "kcalReviewRange": {
+        "min": 80,
+        "max": 400
+      },
+      "kcalReviewRangeByFoodState": {
+        "dry": {
+          "min": 300,
+          "max": 400
+        },
+        "cooked": {
+          "min": 80,
+          "max": 200
+        }
+      },
+      "energyMacroTolerancePercent": 15
+    },
+    {
+      "category": "bread_bakery",
+      "publishedTarget": 500,
+      "candidateVolume": 625,
+      "kcalReviewRange": {
+        "min": 200,
+        "max": 450
+      },
+      "energyMacroTolerancePercent": 15
+    },
+    {
+      "category": "legume",
+      "publishedTarget": 250,
+      "candidateVolume": 313,
+      "kcalReviewRange": {
+        "min": 60,
+        "max": 400
+      },
+      "kcalReviewRangeByFoodState": {
+        "dry": {
+          "min": 300,
+          "max": 400
+        },
+        "cooked": {
+          "min": 60,
+          "max": 200
+        }
+      },
+      "energyMacroTolerancePercent": 20
+    },
+    {
+      "category": "nut_seed",
+      "publishedTarget": 350,
+      "candidateVolume": 438,
+      "kcalReviewRange": {
+        "min": 450,
+        "max": 700
+      },
+      "energyMacroTolerancePercent": 12
+    },
+    {
+      "category": "oil_fat",
+      "publishedTarget": 150,
+      "candidateVolume": 188,
+      "kcalReviewRange": {
+        "min": 700,
+        "max": 900
+      },
+      "energyMacroTolerancePercent": 8
+    },
+    {
+      "category": "condiment_sauce",
+      "publishedTarget": 700,
+      "candidateVolume": 875,
+      "kcalReviewRange": {
+        "min": 0,
+        "max": 600
+      },
+      "energyMacroTolerancePercent": 30
+    },
+    {
+      "category": "spice_herb",
+      "publishedTarget": 300,
+      "candidateVolume": 375,
+      "kcalReviewRange": {
+        "min": 0,
+        "max": 400
+      },
+      "energyMacroTolerancePercent": 40
+    },
+    {
+      "category": "beverage",
+      "publishedTarget": 600,
+      "candidateVolume": 750,
+      "kcalReviewRange": {
+        "min": 0,
+        "max": 120
+      },
+      "energyMacroTolerancePercent": 40
+    },
+    {
+      "category": "snack",
+      "publishedTarget": 600,
+      "candidateVolume": 750,
+      "kcalReviewRange": {
+        "min": 200,
+        "max": 600
+      },
+      "energyMacroTolerancePercent": 15
+    },
+    {
+      "category": "sweet",
+      "publishedTarget": 500,
+      "candidateVolume": 625,
+      "kcalReviewRange": {
+        "min": 150,
+        "max": 600
+      },
+      "energyMacroTolerancePercent": 20
+    },
+    {
+      "category": "prepared_meal",
+      "publishedTarget": 1400,
+      "candidateVolume": 1750,
+      "kcalReviewRange": {
+        "min": 50,
+        "max": 400
+      },
+      "energyMacroTolerancePercent": 20
+    },
+    {
+      "category": "other",
+      "publishedTarget": 200,
+      "candidateVolume": 250,
+      "kcalReviewRange": {
+        "min": 0,
+        "max": 900
+      },
+      "energyMacroTolerancePercent": 30
+    }
+  ],
+  "validationBounds": {
+    "tier": "reject",
+    "maxKcalPer100g": 900,
+    "macroMassToleranceFactor": 1.02,
+    "energyMacroAbsoluteToleranceKcal": 30,
+    "portionConversionTolerancePercent": 5
+  },
+  "nutritionBasisRule": {
+    "publishableBases": [
+      "per_100g",
+      "per_100ml"
+    ],
+    "volumeBasisRequiresDensity": true,
+    "requiredDefaultPortionCount": 1,
+    "defaultPortionRequiresSourcedGramWeight": true,
+    "retainedPortionsRequireSourcedGramWeight": true,
+    "perServingOnlyWithoutGramWeightCheck": "missing_gram_weight",
+    "defaultPortionCountCheck": "default_portion_count",
+    "requiredNutrients": [
+      "calories",
+      "protein_g",
+      "carbs_g",
+      "fat_g"
+    ],
+    "nullNutrientMeansUnknown": true
+  },
+  "quarantineChecks": [
+    "missing_gram_weight",
+    "missing_density",
+    "missing_core_nutrient",
+    "unsupported_portion",
+    "default_portion_count",
+    "unsourced",
+    "duplicate_identity"
+  ],
+  "foodGroupCount": 123,
+  "foodGroups": [
+    {
+      "foodGroup": "mushroom",
+      "category": "produce_vegetable",
+      "isCommonDislikeGroup": true
+    },
+    {
+      "foodGroup": "onion",
+      "category": "produce_vegetable",
+      "isCommonDislikeGroup": true
+    },
+    {
+      "foodGroup": "garlic",
+      "category": "produce_vegetable",
+      "isCommonDislikeGroup": true
+    },
+    {
+      "foodGroup": "tomato",
+      "category": "produce_vegetable",
+      "isCommonDislikeGroup": true
+    },
+    {
+      "foodGroup": "bell_pepper",
+      "category": "produce_vegetable",
+      "isCommonDislikeGroup": true
+    },
+    {
+      "foodGroup": "chili_pepper",
+      "category": "produce_vegetable",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "broccoli",
+      "category": "produce_vegetable",
+      "isCommonDislikeGroup": true
+    },
+    {
+      "foodGroup": "cauliflower",
+      "category": "produce_vegetable",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "cabbage",
+      "category": "produce_vegetable",
+      "isCommonDislikeGroup": true
+    },
+    {
+      "foodGroup": "leafy_green",
+      "category": "produce_vegetable",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "carrot",
+      "category": "produce_vegetable",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "root_vegetable",
+      "category": "produce_vegetable",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "potato",
+      "category": "produce_vegetable",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "squash",
+      "category": "produce_vegetable",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "celery",
+      "category": "produce_vegetable",
+      "isCommonDislikeGroup": true
+    },
+    {
+      "foodGroup": "eggplant",
+      "category": "produce_vegetable",
+      "isCommonDislikeGroup": true
+    },
+    {
+      "foodGroup": "olive",
+      "category": "produce_vegetable",
+      "isCommonDislikeGroup": true
+    },
+    {
+      "foodGroup": "vegetable_other",
+      "category": "produce_vegetable",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "apple",
+      "category": "produce_fruit",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "banana",
+      "category": "produce_fruit",
+      "isCommonDislikeGroup": true
+    },
+    {
+      "foodGroup": "citrus",
+      "category": "produce_fruit",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "berry",
+      "category": "produce_fruit",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "stone_fruit",
+      "category": "produce_fruit",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "tropical_fruit",
+      "category": "produce_fruit",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "avocado",
+      "category": "produce_fruit",
+      "isCommonDislikeGroup": true
+    },
+    {
+      "foodGroup": "dried_fruit",
+      "category": "produce_fruit",
+      "isCommonDislikeGroup": true
+    },
+    {
+      "foodGroup": "fruit_other",
+      "category": "produce_fruit",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "beef",
+      "category": "protein_meat",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "pork",
+      "category": "protein_meat",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "lamb",
+      "category": "protein_meat",
+      "isCommonDislikeGroup": true
+    },
+    {
+      "foodGroup": "game_meat",
+      "category": "protein_meat",
+      "isCommonDislikeGroup": true
+    },
+    {
+      "foodGroup": "cured_meat",
+      "category": "protein_meat",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "organ_meat",
+      "category": "protein_meat",
+      "isCommonDislikeGroup": true
+    },
+    {
+      "foodGroup": "chicken",
+      "category": "protein_poultry",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "turkey",
+      "category": "protein_poultry",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "duck",
+      "category": "protein_poultry",
+      "isCommonDislikeGroup": true
+    },
+    {
+      "foodGroup": "processed_poultry",
+      "category": "protein_poultry",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "salmon",
+      "category": "protein_seafood",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "tuna",
+      "category": "protein_seafood",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "white_fish",
+      "category": "protein_seafood",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "anchovy",
+      "category": "protein_seafood",
+      "isCommonDislikeGroup": true
+    },
+    {
+      "foodGroup": "crustacean",
+      "category": "protein_seafood",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "mollusk",
+      "category": "protein_seafood",
+      "isCommonDislikeGroup": true
+    },
+    {
+      "foodGroup": "seafood_other",
+      "category": "protein_seafood",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "chicken_egg",
+      "category": "protein_egg",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "egg_product",
+      "category": "protein_egg",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "tofu",
+      "category": "protein_plant",
+      "isCommonDislikeGroup": true
+    },
+    {
+      "foodGroup": "tempeh",
+      "category": "protein_plant",
+      "isCommonDislikeGroup": true
+    },
+    {
+      "foodGroup": "seitan",
+      "category": "protein_plant",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "plant_based_meat",
+      "category": "protein_plant",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "milk",
+      "category": "dairy",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "cream",
+      "category": "dairy",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "butter",
+      "category": "dairy",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "yogurt",
+      "category": "dairy",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "cheese",
+      "category": "dairy",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "blue_cheese",
+      "category": "dairy",
+      "isCommonDislikeGroup": true
+    },
+    {
+      "foodGroup": "soy_milk",
+      "category": "dairy_alternative",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "nut_milk",
+      "category": "dairy_alternative",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "coconut_milk",
+      "category": "dairy_alternative",
+      "isCommonDislikeGroup": true
+    },
+    {
+      "foodGroup": "plant_dairy_other",
+      "category": "dairy_alternative",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "rice",
+      "category": "grain",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "wheat_grain",
+      "category": "grain",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "oat",
+      "category": "grain",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "quinoa",
+      "category": "grain",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "pasta",
+      "category": "grain",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "grain_other",
+      "category": "grain",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "bread_leavened",
+      "category": "bread_bakery",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "flatbread",
+      "category": "bread_bakery",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "tortilla",
+      "category": "bread_bakery",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "cracker",
+      "category": "bread_bakery",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "pastry",
+      "category": "bread_bakery",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "lentil",
+      "category": "legume",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "chickpea",
+      "category": "legume",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "black_bean",
+      "category": "legume",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "soybean",
+      "category": "legume",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "bean_other",
+      "category": "legume",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "peanut",
+      "category": "nut_seed",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "almond",
+      "category": "nut_seed",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "cashew",
+      "category": "nut_seed",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "walnut",
+      "category": "nut_seed",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "coconut",
+      "category": "nut_seed",
+      "isCommonDislikeGroup": true
+    },
+    {
+      "foodGroup": "sesame",
+      "category": "nut_seed",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "sunflower_seed",
+      "category": "nut_seed",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "nut_other",
+      "category": "nut_seed",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "olive_oil",
+      "category": "oil_fat",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "vegetable_oil",
+      "category": "oil_fat",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "coconut_oil",
+      "category": "oil_fat",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "animal_fat",
+      "category": "oil_fat",
+      "isCommonDislikeGroup": true
+    },
+    {
+      "foodGroup": "mayonnaise",
+      "category": "condiment_sauce",
+      "isCommonDislikeGroup": true
+    },
+    {
+      "foodGroup": "mustard",
+      "category": "condiment_sauce",
+      "isCommonDislikeGroup": true
+    },
+    {
+      "foodGroup": "hot_sauce",
+      "category": "condiment_sauce",
+      "isCommonDislikeGroup": true
+    },
+    {
+      "foodGroup": "soy_sauce",
+      "category": "condiment_sauce",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "vinegar",
+      "category": "condiment_sauce",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "salad_dressing",
+      "category": "condiment_sauce",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "condiment_other",
+      "category": "condiment_sauce",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "cilantro",
+      "category": "spice_herb",
+      "isCommonDislikeGroup": true
+    },
+    {
+      "foodGroup": "basil",
+      "category": "spice_herb",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "mint",
+      "category": "spice_herb",
+      "isCommonDislikeGroup": true
+    },
+    {
+      "foodGroup": "dill",
+      "category": "spice_herb",
+      "isCommonDislikeGroup": true
+    },
+    {
+      "foodGroup": "chili_spice",
+      "category": "spice_herb",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "spice_other",
+      "category": "spice_herb",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "coffee",
+      "category": "beverage",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "tea",
+      "category": "beverage",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "juice",
+      "category": "beverage",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "beverage_other",
+      "category": "beverage",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "potato_chip",
+      "category": "snack",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "popcorn",
+      "category": "snack",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "snack_bar",
+      "category": "snack",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "snack_other",
+      "category": "snack",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "chocolate",
+      "category": "sweet",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "candy",
+      "category": "sweet",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "sweetener",
+      "category": "sweet",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "sweet_other",
+      "category": "sweet",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "sandwich",
+      "category": "prepared_meal",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "wrap",
+      "category": "prepared_meal",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "pizza",
+      "category": "prepared_meal",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "pasta_dish",
+      "category": "prepared_meal",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "soup",
+      "category": "prepared_meal",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "salad_dish",
+      "category": "prepared_meal",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "prepared_dish_other",
+      "category": "prepared_meal",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "meal_replacement",
+      "category": "other",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "nutritional_supplement",
+      "category": "other",
+      "isCommonDislikeGroup": false
+    },
+    {
+      "foodGroup": "food_ingredient_other",
+      "category": "other",
+      "isCommonDislikeGroup": false
+    }
+  ],
+  "costClassScale": [
+    {
+      "costClass": 1,
+      "label": "inexpensive staple"
+    },
+    {
+      "costClass": 2,
+      "label": "moderately priced"
+    },
+    {
+      "costClass": 3,
+      "label": "premium or specialty"
+    }
+  ]
+}
