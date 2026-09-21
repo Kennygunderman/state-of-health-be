@@ -133,11 +133,12 @@
 -- least one generated column, seven hand-managed indexes and twelve NOT NULL
 -- array columns - the three classes the migration's own header names as
 -- hand-edited - so deleting evidence lines cannot buy a pass either. Those
--- three counts are FLOORS: the section carries nine indexes since the prefix
--- fold indexes landed, and a larger set passes while a smaller one cannot.
+-- three counts are FLOORS: the section carries two generated columns and ten
+-- hand-managed indexes since the alias search-vector migration landed, and a
+-- larger set passes while a smaller one cannot.
 --
 -- Captured against prisma and @prisma/client 6.9.0 on PostgreSQL 16.15, ledger
--- prisma/migrations through 20260910000000_catalog_prefix_fold_indexes.
+-- prisma/migrations through 20260911000000_catalog_alias_search_vector_and_read_stats.
 
 -- >>> BEGIN pg-catalog-query
 WITH generated_columns AS (
